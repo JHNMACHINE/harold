@@ -75,21 +75,42 @@ def get_distributed_latest_weights_file_path(config: DistributedConfig) -> str |
 
 @dataclass
 class ModelConfig:
-    vocab_size:                 int   = 0       # impostato dal tokenizer prima del training
-    d_model:                    int   = 256
-    n_heads:                    int   = 4
-    n_layers:                   int   = 6
-    d_ff:                       int   = 512
-    max_seq_len:                int   = 256
-    dropout:                    float = 0.1
-    bias:                       bool  = False
-    moe_n_routed_experts:       int   = 8
-    moe_top_k:                  int   = 2
-    ds_moe_n_shared_experts:    int   = 1
-    top_k:                      int   = 2
-    gqa_n_groups:               int   = 2
-    diffusion_T:                int   = 1000
-    mask_token_id:              int   = 103     # [MASK] id in bert-base-uncased
+    # ── Vocabolario ───────────────────────────────────────────────────────
+    vocab_size:     int   = 128256
+    mask_token_id:  int   = 128256   # [MASK] token (fuori dal vocabolario)
+
+    # ── Architettura ──────────────────────────────────────────────────────
+    d_model:        int   = 4096
+    n_layers:       int   = 32
+    n_heads:        int   = 32
+    n_kv_heads:     int   = 8       # GQA: key/value heads (< n_heads)
+    d_ff:           int   = 14336    # FFN hidden dim base
+
+    # ── MoE ───────────────────────────────────────────────────────────────
+    moe_n_routed_experts:   int = 8
+    moe_top_k:              int = 2
+    ds_moe_n_shared_experts: int = 1
+
+    # ── Sequenza & Positional ─────────────────────────────────────────────
+    max_seq_len:    int   = 4096
+    block_size:     int   = 512     # Block-causal: dimensione del blocco
+
+    # ── Diffusion ─────────────────────────────────────────────────────────
+    diffusion_T:    int   = 128     # Timestep massimo
+
+    # ── Decoding ──────────────────────────────────────────────────────────
+    mask_threshold: float = 0.7     # τ_mask default (Q mode)
+    edit_threshold: float = 0.9     # τ_edit default (Q mode)
+
+    # ── Training ──────────────────────────────────────────────────────────
+    dropout:        float = 0.0
+    bias:           bool  = False
+    m2t_weight:     float = 0.5
+    t2t_weight:     float = 0.5
+    noise_ratio:    float = 0.3
+
+    # ── RoPE ──────────────────────────────────────────────────────────────
+    rope_theta:     float = 500000.0 
 
 
 def get_model_config() -> ModelConfig:
@@ -104,7 +125,7 @@ def get_model_config() -> ModelConfig:
 class TrainConfig:
     # ── Training ──────────────────────────────
     batch_size:    int   = 8
-    max_iters:     int   = 500
+    max_iters:     int   = 10
     lr:            float = 3e-4
     seq_len:       int   = 128
     warmup_iters:  int   = 20
@@ -122,10 +143,6 @@ class TrainConfig:
     checkpoint_dir:    str = "checkpoints"
     checkpoint_prefix: str = "diffusion_moe"
     preload:           str = ""     # "" | "latest" | "<path esplicito>"
-
-    # ── Distributed (impostati da finalize_distributed) ───────────────
-    local_rank:  int = 0
-    global_rank: int = 0
 
     # ── Campi runtime (non editare direttamente) ───────────────────────
     device:  str                      = field(init=False)
