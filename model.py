@@ -305,7 +305,7 @@ class BlockCausalAttention(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AdaLN  (dal tuo originale, invariato)
+# AdaLN
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AdaLN(nn.Module):
@@ -335,10 +335,10 @@ class AdaLN(nn.Module):
 class Block(nn.Module):
     """
     Transformer block v2:
-      - AdaLN per timestep conditioning (tuo originale)
+      - AdaLN per timestep conditioning
       - BlockCausalAttention + GQA + RoPE (LLaDA2.1 corretto)
-      - DeepSeekMoELayer (tuo originale)
-      - Gated residuals (tuo originale)
+      - DeepSeekMoELayer
+      - Gated residuals
     """
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -346,8 +346,8 @@ class Block(nn.Module):
         self.ada_ln_2  = AdaLN(config.d_model)
         self.attn      = BlockCausalAttention(config)
         self.moe       = DeepSeekMoELayer(config)
-        self.attn_gate = nn.Parameter(torch.zeros(1))
-        self.moe_gate  = nn.Parameter(torch.zeros(1))
+        self.attn_gate = nn.Parameter(torch.ones(1))
+        self.moe_gate  = nn.Parameter(torch.ones(1))
 
     def forward(
         self,
@@ -372,26 +372,27 @@ class Block(nn.Module):
 # Noise schedule  (dal tuo originale, invariato)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class MaskDiffusionSchedule:
+class MaskDiffusionSchedule(nn.Module):
     """
     Cosine noise schedule per masked diffusion.
     alpha_t = probabilità che un token NON sia mascherato al tempo t.
     alpha: 1 (t=0, nessun mask) → 0 (t=T, tutto mascherato).
     """
     def __init__(self, config: ModelConfig):
+        super().__init__()
         self.T             = config.diffusion_T
         self.mask_token_id = config.mask_token_id
 
         t       = torch.linspace(0, self.T, self.T + 1)
         alphas  = torch.cos((t / self.T) * math.pi / 2) ** 2
-        self.alphas = alphas / alphas[0]
+        self.register_buffer("alphas", alphas)
 
     def q_sample(
         self,
         x0: torch.Tensor,
         t:  torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        alpha_t   = self.alphas[t].to(x0.device)
+        alpha_t   = self.alphas[t] # type: ignore
         mask_prob = 1.0 - alpha_t.unsqueeze(1)
         mask      = torch.bernoulli(mask_prob.expand_as(x0.float())).bool()
         xt        = x0.clone()
@@ -399,21 +400,21 @@ class MaskDiffusionSchedule:
         return xt, mask
 
     def get_alpha(self, t: torch.Tensor) -> torch.Tensor:
-        return self.alphas[t]
+        return self.alphas[t] # type: ignore
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DiffusionMoE v2  (modello principale)
+# DiffusionMoE -> Harold
 # ─────────────────────────────────────────────────────────────────────────────
 
-class DiffusionMoE(nn.Module):
+class Harold(nn.Module):
     """
-    DiffusionMoE v2 — predice x0 dato (xt, t).
+    DiffusionMoE — predice x0 dato (xt, t).
 
     Architettura:
-      token_emb  + pos_emb (apprendibili)
+      token_emb + pos_emb (apprendibili)
       timestep MLP → t_emb (condiziona AdaLN in ogni block)
-      N × Block(BlockCausalAttention + DeepSeekMoE + AdaLN)
+      N x Block(BlockCausalAttention + DeepSeekMoE + AdaLN)
       LayerNorm + lm_head (weight-tied con token_emb)
     """
     def __init__(self, config: ModelConfig):
@@ -514,5 +515,5 @@ class DiffusionMoE(nn.Module):
         for block in self.blocks:
             block.moe.update_bias() # type: ignore
 
-def build_model(model_cfg: ModelConfig) -> DiffusionMoE:
-    return DiffusionMoE(model_cfg)
+def build_model(model_cfg: ModelConfig) -> Harold:
+    return Harold(model_cfg)

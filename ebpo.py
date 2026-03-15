@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional
 from config import ModelConfig
-from model import DiffusionMoE
+from model import Harold
 
 
 class ValueHead(nn.Module):
@@ -50,7 +50,7 @@ class EBPOTrainer:
     """
     def __init__(
         self,
-        model:              "DiffusionMoE",
+        model:              "Harold",
         config:             ModelConfig,
         learning_rate:      float = 1e-6,
         clip_epsilon_low:   float = 0.2,
@@ -72,7 +72,7 @@ class EBPOTrainer:
         )
 
         all_params         = list(model.parameters()) + list(self.value_head.parameters())
-        self.optimizer     = torch.optim.Adam(all_params, lr=learning_rate)
+        self.optimizer     = torch.optim.AdamW(all_params, lr=learning_rate)
 
     # ── Corruption ──────────────────────────────────────────────────────────
 
@@ -86,7 +86,7 @@ class EBPOTrainer:
 
     def _compute_log_probs(
         self,
-        model:     "DiffusionMoE",
+        model:     "Harold",
         responses: torch.Tensor,   # (B, L)
         prompts:   torch.Tensor,   # (B, L)
     ) -> torch.Tensor:
@@ -160,7 +160,7 @@ class EBPOTrainer:
         prompts:   torch.Tensor,   # (B, L)
         responses: torch.Tensor,   # (B, L)
         rewards:   torch.Tensor,   # (B,)
-        old_model: "DiffusionMoE",
+        old_model: "Harold",
     ) -> Dict[str, float]:
         # 1. Log prob old model (frozen, no grad)
         with torch.no_grad():

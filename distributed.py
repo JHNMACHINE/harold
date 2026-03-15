@@ -15,7 +15,7 @@ import argparse
 from datasets import load_dataset
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from model import DiffusionMoE, MaskDiffusionSchedule, build_model
+from model import Harold, MaskDiffusionSchedule, build_model
 from dataset import DistributedDataset
 from config import (
     DistributedConfig, ModelConfig,
@@ -119,7 +119,7 @@ def get_ds(config: DistributedConfig):
 # Model
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_model(model_cfg: ModelConfig, tokenizer: PreTrainedTokenizerBase) -> DiffusionMoE:
+def get_model(model_cfg: ModelConfig, tokenizer: PreTrainedTokenizerBase) -> Harold:
     model_cfg.vocab_size    = tokenizer.vocab_size      # type: ignore
     model_cfg.mask_token_id = tokenizer.mask_token_id   # type: ignore
     return build_model(model_cfg)

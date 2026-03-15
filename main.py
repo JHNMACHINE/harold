@@ -6,20 +6,20 @@ Esempio di utilizzo completo: build, training step, e generazione.
 
 import torch
 from config import ModelConfig
-from model import DiffusionMoE
+from model import Harold
 from decoding import ThresholdDecoding
 from ebpo import EBPOTrainer
 from train import DiffusionMoETrainer
 
 
-def build_model(config: ModelConfig) -> DiffusionMoE:
-    model = DiffusionMoE(config)
+def build_model(config: ModelConfig) -> Harold:
+    model = Harold(config)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"DiffusionMoE v2 — parametri: {n_params / 1e6:.1f}M")
     return model
 
 
-def demo_training_step(config: ModelConfig, model: DiffusionMoE):
+def demo_training_step(config: ModelConfig, model: Harold):
     """Training con dati che coprono TUTTO il vocabolario."""
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     trainer = DiffusionMoETrainer(model, config, optimizer)
@@ -44,7 +44,7 @@ def demo_training_step(config: ModelConfig, model: DiffusionMoE):
     return model
 
 
-def demo_generation(config: ModelConfig, model: DiffusionMoE):
+def demo_generation(config: ModelConfig, model: Harold):
     """Mostra generazione con S Mode e Q Mode + MBE."""
     decoder = ThresholdDecoding(config)
 
@@ -69,7 +69,7 @@ def demo_generation(config: ModelConfig, model: DiffusionMoE):
     print("token unici in out_q:", out_q.unique())
 
 
-def demo_ebpo_step(config: ModelConfig, model: DiffusionMoE):
+def demo_ebpo_step(config: ModelConfig, model: Harold):
     """Mostra un singolo step EBPO."""
     import copy
     old_model = copy.deepcopy(model)

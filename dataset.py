@@ -1,84 +1,135 @@
+"""
+dataset.py — loader per FineWeb-Edu (streaming) e dataset locali (.bin)
+=======================================================================
+Fix rispetto alla versione precedente:
+  - Buffer shuffle sostituito con HF .shuffle() nativo: niente overlap
+  - num_workers=0 per streaming (fix core dump con multiprocessing)
+  - Separazione train/val interleaved (1 doc ogni VAL_EVERY)
+  - tokenizer verbose=False per silenziare warning sul seq_len
+"""
+
 import os
+from typing import Iterator
 
 import numpy as np
 import torch
-from datasets import load_dataset
-from torch.utils.data import Dataset
-from tqdm import tqdm
-from transformers import AutoTokenizer
-
-from config import DistributedConfig, TrainConfig
+from torch.utils.data import Dataset, IterableDataset
+from transformers import PreTrainedTokenizer
 
 
-def download_dataset(config: TrainConfig) -> None:
+# ─────────────────────────────────────────────────────────────────────────────
+# Streaming dataset per FineWeb-Edu
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StreamingTextDataset(IterableDataset):
     """
-    Scarica e tokenizza il dataset in due file .bin (train / val).
-    Se i file esistono già, salta la preparazione.
+    Legge FineWeb-Edu in streaming, tokenizza on-the-fly, produce
+    chunk di lunghezza fissa seq_len senza overlap e senza padding.
+
+    Fix chiave rispetto alla versione precedente:
+      - usa HF .shuffle(buffer_size, seed) invece del buffer manuale
+        → nessuna sequenza sovrapposta, distribuzione uniforme
+      - num_workers=0 nel DataLoader per evitare il core dump con
+        multiprocessing e file descriptor del dataset streaming
+      - split interleaved: 1 doc ogni val_every va in val
+      - stream lineare dei token: carry buffer senza indici casuali
     """
-    if os.path.exists(config.train_bin_file) and os.path.exists(config.val_bin_file):
-        print("Found existing .bin files. Skipping data preparation.")
-        return
 
-    print("Binary data files not found. Starting data download and tokenization...")
+    def __init__(
+        self,
+        dataset_name:  str,
+        split_name:    str,
+        tokenizer:     PreTrainedTokenizer,
+        seq_len:       int,
+        buffer_size:   int = 1000,
+        split:         str = "train",
+        val_every:     int = 200,
+        seed:          int = 42,
+    ):
+        super().__init__()
+        self.dataset_name = dataset_name
+        self.split_name   = split_name
+        self.tokenizer    = tokenizer
+        self.seq_len      = seq_len
+        self.buffer_size  = buffer_size
+        self.split        = split
+        self.val_every    = val_every
+        self.seed         = seed
 
-    ds  = load_dataset(config.dataset_name)
-    enc = AutoTokenizer.from_pretrained(config.tokenizer_model)
+    def _iter_documents(self) -> Iterator[list[int]]:
+        from datasets import load_dataset
 
-    assert enc.vocab_size < 2**16, "Tokenizer vocab size too large for uint16"
-
-    def tokenize(example):
-        ids = enc.encode(
-            example["text"],
-            add_special_tokens=False,
-            truncation=True,
-            max_length=config.seq_len,
+        ds = load_dataset(
+            self.dataset_name,
+            name=self.split_name,
+            split="train",
+            streaming=True,
         )
-        return {"ids": ids, "len": len(ids)}
+        ds = ds.shuffle(buffer_size=self.buffer_size, seed=self.seed)
 
-    tokenized_ds = ds.map(
-        tokenize,
-        remove_columns=["text"],
-        desc="Tokenizing splits",
-        num_proc=os.cpu_count(),
-    )
+        sep_id = (
+            self.tokenizer.sep_token_id
+            or self.tokenizer.eos_token_id
+            or 0
+        )
 
-    for split, dset in tokenized_ds.items():
-        filename     = config.val_bin_file if split == "validation" else config.train_bin_file
-        total_tokens = np.sum(dset["len"], dtype=np.uint64)
-        print(f"Found {total_tokens:,} tokens in the '{split}' split.")
+        doc_idx = 0
+        for example in ds:
+            text = (example.get("text") or "").strip()
+            if not text:
+                continue
 
-        arr = np.memmap(filename, dtype=np.uint16, mode="w+", shape=(total_tokens,))  # type: ignore
-        print(f"Writing tokens to {filename}...")
+            is_val_doc = (doc_idx % self.val_every == 0)
+            if (self.split == "val") != is_val_doc:
+                doc_idx += 1
+                continue
 
-        current_idx = 0
-        for batch in tqdm(dset.iter(batch_size=2048), total=len(dset) // 2048):
-            chunk = np.concatenate(batch["ids"])  # type: ignore
-            arr[current_idx : current_idx + len(chunk)] = chunk
-            current_idx += len(chunk)
+            ids = self.tokenizer(
+                text,
+                add_special_tokens=False,
+                truncation=False,
+                return_attention_mask=False,
+                verbose=False,
+            )["input_ids"]
 
-        arr.flush()
+            if ids:
+                ids.append(sep_id) # type: ignore
+                yield ids # type: ignore
 
-    print("Tokenization and file writing complete.")
+            doc_idx += 1
 
+    def __iter__(self) -> Iterator[dict]:
+        carry = []
+
+        for ids in self._iter_documents():
+            carry.extend(ids)
+
+            while len(carry) >= self.seq_len:
+                chunk = carry[:self.seq_len]
+                carry = carry[self.seq_len:]
+                input_ids = torch.tensor(chunk, dtype=torch.long)
+                yield {
+                    "input_ids":      input_ids,
+                    "attention_mask": torch.ones_like(input_ids),
+                }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dataset locale (.bin)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class MaskedDataset(Dataset):
-    """
-    Dataset per il training del DiffusionMoE.
-    Legge sequenze da un file .bin (uint16) prodotto da download_dataset()
-    e restituisce dict {input_ids, attention_mask} pronti per il diffusion trainer.
-    """
-
-    def __init__(self, split: str, config: TrainConfig):
+    def __init__(self, split: str, config):
         bin_file = config.train_bin_file if split == "train" else config.val_bin_file
         assert os.path.exists(bin_file), (
-            f"File {bin_file!r} non trovato. Esegui download_dataset() prima del training."
+            f"File {bin_file!r} non trovato. Esegui download_dataset() prima."
         )
-        self.data      = np.memmap(bin_file, dtype=np.uint16, mode="r")
-        self.seq_len   = config.seq_len
-        self.n_samples = len(self.data) - self.seq_len
+        self.data    = np.memmap(bin_file, dtype=np.uint16, mode="r")
+        self.seq_len = config.seq_len
+        self.n       = len(self.data) - self.seq_len
 
     def __len__(self) -> int:
-        return self.n_samples
+        return self.n
 
     def __getitem__(self, idx: int) -> dict:
         input_ids = torch.from_numpy(
@@ -89,30 +140,72 @@ class MaskedDataset(Dataset):
             "attention_mask": torch.ones_like(input_ids),
         }
 
-class DistributedDataset(Dataset):
-    """
-    Dataset per il training del DiffusionMoE.
-    Legge sequenze da un file .bin (uint16) prodotto da download_dataset()
-    e restituisce dict {input_ids, attention_mask} pronti per il diffusion trainer.
-    """
 
-    def __init__(self, split: str, config: DistributedConfig):
-        bin_file = config.train_bin_file if split == "train" else config.val_bin_file
-        assert os.path.exists(bin_file), (
-            f"File {bin_file!r} non trovato"
+# ─────────────────────────────────────────────────────────────────────────────
+# Factory
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_loaders(train_cfg, tokenizer: PreTrainedTokenizer):
+    from torch.utils.data import DataLoader
+
+    use_streaming = "fineweb" in train_cfg.dataset_name.lower() or \
+                    not (hasattr(train_cfg, "train_bin_file") and
+                         os.path.exists(train_cfg.train_bin_file))
+
+    if use_streaming:
+        print(f"Modalità streaming: {train_cfg.dataset_name} / {train_cfg.dataset_split_name}")
+
+        train_ds = StreamingTextDataset(
+            dataset_name=train_cfg.dataset_name,
+            split_name=train_cfg.dataset_split_name,
+            tokenizer=tokenizer,
+            seq_len=train_cfg.seq_len,
+            buffer_size=train_cfg.stream_buffer_size,
+            split="train",
+            val_every=200,
+            seed=42,
         )
-        self.data      = np.memmap(bin_file, dtype=np.uint16, mode="r")
-        self.seq_len   = config.seq_len
-        self.n_samples = len(self.data) - self.seq_len
-
-    def __len__(self) -> int:
-        return self.n_samples
-
-    def __getitem__(self, idx: int) -> dict:
-        input_ids = torch.from_numpy(
-            self.data[idx : idx + self.seq_len].astype(np.int64)
+        val_ds = StreamingTextDataset(
+            dataset_name=train_cfg.dataset_name,
+            split_name=train_cfg.dataset_split_name,
+            tokenizer=tokenizer,
+            seq_len=train_cfg.seq_len,
+            buffer_size=train_cfg.stream_buffer_size,
+            split="val",
+            val_every=200,
+            seed=42,
         )
-        return {
-            "input_ids":      input_ids,
-            "attention_mask": torch.ones_like(input_ids),
-        }
+
+        # num_workers=0 OBBLIGATORIO con streaming HF
+        # num_workers > 0 causa core dump per file descriptor condivisi
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=train_cfg.batch_size,
+            num_workers=0,
+            pin_memory=True,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=train_cfg.batch_size,
+            num_workers=0,
+            pin_memory=True,
+        )
+
+    else:
+        print(f"Modalità .bin locale: {train_cfg.train_bin_file}")
+        train_loader = DataLoader(
+            MaskedDataset("train", train_cfg),
+            batch_size=train_cfg.batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True,
+        )
+        val_loader = DataLoader(
+            MaskedDataset("val", train_cfg),
+            batch_size=train_cfg.batch_size,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True,
+        )
+
+    return train_loader, val_loader
