@@ -6,63 +6,9 @@ import json
 import torch
 
 
-@dataclass
-class DistributedConfig:
-    batch_size:      int
-    num_epochs:      int
-    lr:              float
-    seq_len:         int
-    d_model:         int
-    model_folder:    str
-    model_basename:  str
-    preload:         str
-    tokenizer_file:  str
-    tokenizer_model: str
-    dataset_name:    str
-    local_rank:      int = -1
-    global_rank:     int = -1
-
-    @property
-    def train_bin_file(self) -> str:
-        name = self.dataset_name.split("/")[-1].lower()
-        return str(Path(self.model_folder) / name / "train.bin")
-
-    @property
-    def val_bin_file(self) -> str:
-        name = self.dataset_name.split("/")[-1].lower()
-        return str(Path(self.model_folder) / name / "val.bin")
-
-
-def get_distributed_config() -> DistributedConfig:
-    return DistributedConfig(
-        batch_size=4,
-        num_epochs=30,
-        lr=10**-4,
-        seq_len=350,
-        d_model=512,
-        model_folder="weights",
-        model_basename="tmodel_{0:02d}.pt",
-        preload="latest",
-        tokenizer_file="tokenizer_{0}.json",
-        tokenizer_model="bert-base-uncased",
-        dataset_name="roneneldan/TinyStories",
-    )
-
-
-def get_distributed_weights_file_path(config: DistributedConfig, epoch: int) -> str:
-    return str(Path(".") / config.model_folder / config.model_basename.format(epoch))
-
-
-def get_distributed_latest_weights_file_path(config: DistributedConfig) -> str | None:
-    model_files = sorted(
-        Path(config.model_folder).glob("*.pt"),
-        key=lambda x: int(x.stem.split("_")[-1]),
-    )
-    return str(model_files[-1]) if model_files else None
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ModelConfig — solo architettura
+# ModelConfig
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -110,14 +56,14 @@ def get_model_config() -> ModelConfig:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TrainConfig — iperparametri ottimizzati per A6000 48GB + FineWeb-Edu
+# TrainConfig 
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class TrainConfig:
     # ── Training ──────────────────────────────────────────────────────────
-    batch_size:    int   = 16      # micro-batch per step (fit in 48GB con POC)
-    grad_accum:    int   = 8       # batch virtuale = batch_size * grad_accum = 128
+    batch_size:    int   = 16     
+    grad_accum:    int   = 8
     max_iters:     int   = 20000
     lr:            float = 3e-4
     seq_len:       int   = 512
@@ -129,14 +75,14 @@ class TrainConfig:
 
     # ── MTF augmentation ──────────────────────────────────────────────────
     use_mtf:   bool = True
-    mtf_turns: int  = 2       # ridotto da 3: meno forward per step, più iters
+    mtf_turns: int  = 2      
 
     # ── Dataset ───────────────────────────────────────────────────────────
     dataset_name:       str = "HuggingFaceFW/fineweb-edu"
-    dataset_split_name: str = "CC-MAIN-2024-10"   # subset ~430GB, gestibile
+    dataset_split_name: str = "CC-MAIN-2024-10"   
     tokenizer_model:    str = "bert-base-uncased"
-    stream_buffer_size: int = 10000   # token nel buffer shuffle per streaming
-    val_samples:        int = 500     # campioni da tenere per validation
+    stream_buffer_size: int = 10000   
+    val_samples:        int = 500     
 
     # ── Checkpoint ────────────────────────────────────────────────────────
     checkpoint_dir:    str = "checkpoints"

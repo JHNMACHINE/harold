@@ -113,46 +113,34 @@ class HaroldSampler:
         return tokens.view(B, L)
 
     @staticmethod
-    def _decode_confidence(
-        logits:      torch.Tensor,
-        xt:          torch.Tensor,
-        mask_id:     int,
-        unmask_frac: float,
-        temperature: float = 1.0,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Confidence-based decoding (stile MaskGIT):
-          1. Calcola la probabilità massima per ogni token mascherato
-          2. Decodifica solo i top-unmask_frac token (i più certi)
-          3. Re-maschera il resto
-
-        Returns:
-            x_new:    sequenza aggiornata
-            unmasked: maschera bool True dove abbiamo decodificato
-        """
+    def _decode_confidence(logits, xt, mask_id, unmask_frac, temperature=1.0):
         B, L, V = logits.shape
-        mask_positions = (xt == mask_id)  # (B, L)
+        mask_positions = (xt == mask_id)
 
-        # Probabilità del token più probabile per ogni posizione
         probs = F.softmax(logits / max(temperature, 1e-5), dim=-1)
-        confidence, candidates = probs.max(dim=-1)  # (B, L)
 
-        # Considera solo le posizioni mascherate
+        # Penalità ripetizione: abbassa la prob dei token già presenti
+        for b in range(B):
+            present = xt[b][~mask_positions[b]]
+            if present.numel() > 0:
+                probs[b].index_fill_(
+                    -1, present.clamp(0, V-1),
+                    0.0  # azzera completamente — puoi usare *=0.3 per penalità soft
+                )
+            # Rinormalizza
+            probs[b] = probs[b] / (probs[b].sum(dim=-1, keepdim=True) + 1e-9)
+
+        confidence, candidates = probs.max(dim=-1)
         confidence = confidence.masked_fill(~mask_positions, -1.0)
 
-        # Numero di token da decodificare in questo step
-        n_masked   = mask_positions.sum(dim=-1).float()         # (B,)
-        n_unmask   = (n_masked * unmask_frac).ceil().long()     # (B,)
-        n_unmask   = n_unmask.clamp(min=1)
+        n_masked = mask_positions.sum(dim=-1).float()
+        n_unmask = (n_masked * unmask_frac).ceil().long().clamp(min=1)
 
         x_new    = xt.clone()
         unmasked = torch.zeros_like(xt, dtype=torch.bool)
-
         for b in range(B):
             k = n_unmask[b].item()
-            if k == 0:
-                continue
-            topk_idx = confidence[b].topk(k).indices # type: ignore
+            topk_idx = confidence[b].topk(k).indices
             x_new[b, topk_idx]    = candidates[b, topk_idx]
             unmasked[b, topk_idx] = True
 
@@ -370,52 +358,45 @@ class HaroldSampler:
 if __name__ == "__main__":
     import sys
     from transformers import AutoTokenizer
-    from config import ModelConfig, get_model_config
+    from config import ModelConfig
     from model import build_model
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    # Carica config POC ridotta
-    cfg = ModelConfig(
-        d_model=512,
-        n_layers=8,
-        n_heads=8,
-        n_kv_heads=2,
-        d_ff=2048,
-        moe_n_routed_experts=4,
-        moe_top_k=2,
-        ds_moe_n_shared_experts=1,
-        max_seq_len=512,
-        diffusion_T=64,
-        vocab_size=30522,       # bert-base-uncased
-        mask_token_id=103,      # [MASK] in bert
-    )
+    ckpt_path = sys.argv[1] if len(sys.argv) > 1 else None
+    
+    state     = torch.load(ckpt_path, map_location="cpu", weights_only=False) # type: ignore
+    model_cfg = state["model_cfg"]
+    model     = build_model(model_cfg)
+    model.load_state_dict(state["model_state"])
+    print(f"Checkpoint caricato: {ckpt_path}")
 
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-    model     = build_model(cfg)
-
-    # Carica checkpoint se disponibile
-    ckpt_path = sys.argv[1] if len(sys.argv) > 1 else None
-    if ckpt_path:
-        state = torch.load(ckpt_path, map_location="cpu")
-        model.load_state_dict(state["model_state"])
-        print(f"Checkpoint caricato: {ckpt_path}")
-    else:
-        print("Nessun checkpoint — pesi random (solo per test struttura)")
-
-    sampler = HaroldSampler(model, tokenizer, device=device)
+    sampler   = HaroldSampler(model, tokenizer, device=device)
 
     prompt = "Once upon a time"
-    print(f"\nPrompt: {prompt!r}")
+    print(f"\nPrompt: {prompt!r}\n")
 
-    for mode in ("argmax", "sample", "confidence"):
+    # confidence con steps alti e temperature variabile
+    for temp in (0.8, 1.0, 1.3):
         out = sampler.generate(
             prompt=prompt,
             gen_len=64,
-            steps=16,
-            mode=mode,
-            temperature=0.8,
+            steps=32,
+            mode="confidence",
+            temperature=temp,
             verbose=False,
         )
-        print(f"[{mode:10s}] {out}")
+        print(f"[confidence t={temp}] {out}")
+
+    # sample come confronto
+    out = sampler.generate(
+        prompt=prompt,
+        gen_len=64,
+        steps=32,
+        mode="sample",
+        temperature=1.0,
+        top_p=0.9,
+    )
+    print(f"[sample     t=1.0] {out}")
