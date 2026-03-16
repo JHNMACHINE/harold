@@ -6,35 +6,34 @@ import json
 import torch
 
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# ModelConfig
+# ModelConfig — architettura 200M
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class ModelConfig:
     # ── Vocabolario ───────────────────────────────────────────────────────
-    vocab_size:     int   = 128256
-    mask_token_id:  int   = 128256
+    vocab_size:     int   = 30522   # bert-base-uncased
+    mask_token_id:  int   = 103     # [MASK] in bert
 
-    # ── Architettura ──────────────────────────────────────────────────────
-    d_model:        int   = 4096
-    n_layers:       int   = 32
-    n_heads:        int   = 32
-    n_kv_heads:     int   = 8
-    d_ff:           int   = 14336
+    # ── Architettura 200M ─────────────────────────────────────────────────
+    d_model:        int   = 768     # era 512
+    n_layers:       int   = 12      # era 8
+    n_heads:        int   = 12      # era 8  — head_dim = 768/12 = 64
+    n_kv_heads:     int   = 4       # era 2  — GQA: 3x compressione KV
+    d_ff:           int   = 3072    # era 2048 — regola: 4 × d_model
 
     # ── MoE ───────────────────────────────────────────────────────────────
-    moe_n_routed_experts:    int = 8
+    moe_n_routed_experts:    int = 4
     moe_top_k:               int = 2
     ds_moe_n_shared_experts: int = 1
 
     # ── Sequenza & Positional ─────────────────────────────────────────────
-    max_seq_len: int   = 4096
+    max_seq_len: int   = 512
     block_size:  int   = 512
 
     # ── Diffusion ─────────────────────────────────────────────────────────
-    diffusion_T: int   = 128
+    diffusion_T: int   = 64
 
     # ── Decoding ──────────────────────────────────────────────────────────
     mask_threshold: float = 0.7
@@ -43,8 +42,8 @@ class ModelConfig:
     # ── Training ──────────────────────────────────────────────────────────
     dropout:     float = 0.0
     bias:        bool  = False
-    m2t_weight: float = 1.0
-    t2t_weight: float = 1.0
+    m2t_weight:  float = 1.0
+    t2t_weight:  float = 1.0
     noise_ratio: float = 0.3
 
     # ── RoPE ──────────────────────────────────────────────────────────────
@@ -56,40 +55,41 @@ def get_model_config() -> ModelConfig:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TrainConfig 
+# TrainConfig — fase 1: pretraining FineWeb-Edu + Wikipedia
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class TrainConfig:
     # ── Training ──────────────────────────────────────────────────────────
-    batch_size:    int   = 16     
-    grad_accum:    int   = 8
-    max_iters:     int   = 20000
-    lr:            float = 3e-4
-    seq_len:       int   = 512
-    warmup_iters:  int   = 400
-    min_lr:        float = 3e-5
-    eval_interval: int   = 500
+    batch_size:    int   = 8       # modello più grande → meno fit in VRAM
+    grad_accum:    int   = 16      # batch virtuale = 8×16 = 128
+    max_iters:     int   = 40000   # doppio rispetto al 61M
+    lr:            float = 2e-4    # più bassa per modello più grande
+    seq_len:       int   = 256     # sequenze brevi per convergenza stabile
+    warmup_iters:  int   = 800     # proporzionale ai parametri
+    min_lr:        float = 2e-5
+    eval_interval: int   = 1000
     eval_iters:    int   = 20
     max_grad_norm: float = 1.0
+    use_mtf:       bool  = False   # disabilitato: q_sample diretto è più pulito
+    mtf_turns:     int   = 2
 
-    # ── MTF augmentation ──────────────────────────────────────────────────
-    use_mtf:   bool = True
-    mtf_turns: int  = 2      
-
-    # ── Dataset ───────────────────────────────────────────────────────────
-    dataset_name:       str = "HuggingFaceFW/fineweb-edu"
-    dataset_split_name: str = "CC-MAIN-2024-10"   
-    tokenizer_model:    str = "bert-base-uncased"
-    stream_buffer_size: int = 10000   
-    val_samples:        int = 500     
+    # ── Dataset fase 1 ────────────────────────────────────────────────────
+    # dataset_name="fase1" è un flag di routing in build_loaders
+    # i dataset reali sono definiti in MixedStreamingDataset
+    dataset_name:         str   = "fase1"
+    dataset_split_name:   str   = ""        # non usato in fase 1
+    tokenizer_model:      str   = "bert-base-uncased"
+    stream_buffer_size:   int   = 1000      # buffer shuffle HF (in documenti)
+    val_every:            int   = 200       # 1 doc ogni N va in val
+    fineweb_weight:       float = 0.4       # proporzione FineWeb-Edu
+    wikipedia_weight:     float = 0.6       # proporzione Wikipedia EN
 
     # ── Checkpoint ────────────────────────────────────────────────────────
-    checkpoint_dir:    str = "checkpoints"
-    checkpoint_prefix: str = "harold"
-    preload:           str = "latest"   # "" | "latest" | "<path esplicito>"
-    save_every:        int = 1000       # salva checkpoint ogni N iters
-                                        # (indipendente dal best val loss)
+    checkpoint_dir:    str = "checkpoints_fase1"
+    checkpoint_prefix: str = "harold_200m"
+    preload:           str = "latest"   # "" | "latest" | "<path>"
+    save_every:        int = 2000
 
     # ── Campi runtime ─────────────────────────────────────────────────────
     device: str = field(init=False)
@@ -97,19 +97,12 @@ class TrainConfig:
 
     def __post_init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-            # A6000 è Ampere: BF16 nativo, nessun loss scaling necessario
-            self.dtype = "bfloat16"
-        elif torch.cuda.is_available():
-            self.dtype = "float16"
-        else:
-            self.dtype = "float32"
-
-    def finalize_distributed(self, local_rank: int, global_rank: int) -> None:
-        self.local_rank  = local_rank
-        self.global_rank = global_rank
-        self.device      = f"cuda:{local_rank}"
+        self.dtype  = (
+            "bfloat16"
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+            else "float16" if torch.cuda.is_available()
+            else "float32"
+        )
 
     @property
     def ptdtype(self) -> torch.dtype:
@@ -123,7 +116,6 @@ class TrainConfig:
 
     @property
     def use_scaler(self) -> bool:
-        """Loss scaling serve solo con FP16, non con BF16."""
         return self.dtype == "float16"
 
     @property
@@ -139,14 +131,12 @@ class TrainConfig:
         return str(Path(self.checkpoint_dir) / "latest.json")
 
     def write_latest(self, iter_num: int, path: str) -> None:
-        """Scrive latest.json con iter e path — atomico tramite rename."""
         tmp = self.latest_json_path() + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"iter_num": iter_num, "path": path}, f)
         Path(tmp).replace(self.latest_json_path())
 
     def read_latest(self) -> tuple[int, str] | None:
-        """Legge latest.json. Ritorna (iter_num, path) o None se non esiste."""
         p = Path(self.latest_json_path())
         if not p.exists():
             return None
@@ -160,7 +150,7 @@ def get_train_config() -> TrainConfig:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers checkpoint (mantenuti per compatibilità)
+# Helpers checkpoint (compatibilità con train.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_weights_file_path(config: TrainConfig, iter_num: int) -> str:
