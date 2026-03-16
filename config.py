@@ -7,7 +7,7 @@ import torch
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ModelConfig — architettura 200M
+# ModelConfig — Harold v3 ~200M parametri (test architettura su singola GPU)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -16,35 +16,34 @@ class ModelConfig:
     vocab_size:     int   = 30522   # bert-base-uncased
     mask_token_id:  int   = 103     # [MASK] in bert
 
-    # ── Architettura 200M ─────────────────────────────────────────────────
-    d_model:        int   = 768     # era 512
-    n_layers:       int   = 12      # era 8
-    n_heads:        int   = 12      # era 8  — head_dim = 768/12 = 64
-    n_kv_heads:     int   = 4       # era 2  — GQA: 3x compressione KV
-    d_ff:           int   = 3072    # era 2048 — regola: 4 × d_model
+    # ── Architettura ──────────────────────────────────────────────────────
+    d_model:    int = 768    # head_dim = 768/12 = 64
+    n_layers:   int = 12
+    n_heads:    int = 12
+    n_kv_heads: int = 4      # GQA: ratio 3:1
+    d_ff:       int = 2048
 
     # ── MoE ───────────────────────────────────────────────────────────────
     moe_n_routed_experts:    int = 4
     moe_top_k:               int = 2
-    ds_moe_n_shared_experts: int = 1
+    ds_moe_n_shared_experts: int = 2
+
+    # ── MLA (Multi-head Latent Attention) ─────────────────────────────────
+    mla_latent_dim: int = 96    # d_model / 8
+
+    # ── DSA (Sparse Attention) ────────────────────────────────────────────
+    dsa_window_size:  int = 256
+    dsa_global_every: int = 64
 
     # ── Sequenza & Positional ─────────────────────────────────────────────
-    max_seq_len: int   = 512
-    block_size:  int   = 512
+    max_seq_len: int = 512
+    block_size:  int = 512
 
     # ── Diffusion ─────────────────────────────────────────────────────────
-    diffusion_T: int   = 64
-
-    # ── Decoding ──────────────────────────────────────────────────────────
-    mask_threshold: float = 0.7
-    edit_threshold: float = 0.9
+    diffusion_T: int = 64
 
     # ── Training ──────────────────────────────────────────────────────────
-    dropout:     float = 0.0
-    bias:        bool  = False
-    m2t_weight:  float = 1.0
-    t2t_weight:  float = 1.0
-    noise_ratio: float = 0.3
+    dropout: float = 0.0
 
     # ── RoPE ──────────────────────────────────────────────────────────────
     rope_theta: float = 500000.0
@@ -55,41 +54,48 @@ def get_model_config() -> ModelConfig:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TrainConfig — fase 1: pretraining FineWeb-Edu + Wikipedia
+# TrainConfig — Harold v3 singola A6000
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class TrainConfig:
     # ── Training ──────────────────────────────────────────────────────────
-    batch_size:    int   = 8       # modello più grande → meno fit in VRAM
-    grad_accum:    int   = 16      # batch virtuale = 8×16 = 128
-    max_iters:     int   = 40000   # doppio rispetto al 61M
-    lr:            float = 2e-4    # più bassa per modello più grande
-    seq_len:       int   = 256     # sequenze brevi per convergenza stabile
-    warmup_iters:  int   = 800     # proporzionale ai parametri
+    batch_size:    int   = 16
+    grad_accum:    int   = 8       # batch virtuale = 16×8 = 128
+    max_iters:     int   = 20000
+    lr:            float = 2e-4
+    seq_len:       int   = 256
+    warmup_iters:  int   = 400
     min_lr:        float = 2e-5
-    eval_interval: int   = 1000
+    eval_interval: int   = 500
     eval_iters:    int   = 20
     max_grad_norm: float = 1.0
-    use_mtf:       bool  = False   # disabilitato: q_sample diretto è più pulito
-    mtf_turns:     int   = 2
 
-    # ── Dataset fase 1 ────────────────────────────────────────────────────
-    # dataset_name="fase1" è un flag di routing in build_loaders
-    # i dataset reali sono definiti in MixedStreamingDataset
-    dataset_name:         str   = "fase1"
-    dataset_split_name:   str   = ""        # non usato in fase 1
-    tokenizer_model:      str   = "bert-base-uncased"
-    stream_buffer_size:   int   = 1000      # buffer shuffle HF (in documenti)
-    val_every:            int   = 200       # 1 doc ogni N va in val
-    fineweb_weight:       float = 0.4       # proporzione FineWeb-Edu
-    wikipedia_weight:     float = 0.6       # proporzione Wikipedia EN
+    # ── Self-conditioning ─────────────────────────────────────────────────
+    self_cond_prob: float = 0.5
+
+    # ── Loss ──────────────────────────────────────────────────────────────
+    ce_loss_weight: float = 0.1
+
+    # ── Dataset ───────────────────────────────────────────────────────────
+    dataset_name:       str   = "v3"
+    tokenizer_model:    str   = "bert-base-uncased"
+    stream_buffer_size: int   = 1000
+    val_every:          int   = 200
+    fineweb_weight:     float = 0.30
+    wikipedia_weight:   float = 0.20
+    books_weight:       float = 0.20
+    c4_weight:          float = 0.15
+    owt_weight:         float = 0.15
+
+    # ── Token weights per noise schedule ──────────────────────────────────
+    token_weights_path: str = "token_weights.pt"
 
     # ── Checkpoint ────────────────────────────────────────────────────────
-    checkpoint_dir:    str = "checkpoints_fase1"
-    checkpoint_prefix: str = "harold_200m"
-    preload:           str = "latest"   # "" | "latest" | "<path>"
-    save_every:        int = 2000
+    checkpoint_dir:    str = "checkpoints_v3"
+    checkpoint_prefix: str = "harold_200m_v3"
+    preload:           str = "latest"
+    save_every:        int = 1000
 
     # ── Campi runtime ─────────────────────────────────────────────────────
     device: str = field(init=False)
@@ -106,7 +112,11 @@ class TrainConfig:
 
     @property
     def ptdtype(self) -> torch.dtype:
-        return {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[self.dtype]
+        return {
+            "float16":  torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32":  torch.float32,
+        }[self.dtype]
 
     @property
     def ctx(self):
@@ -144,13 +154,25 @@ class TrainConfig:
             d = json.load(f)
         return d["iter_num"], d["path"]
 
+    # ── Multi-GPU (per scalare a FSDP in futuro) ──────────────────────────
+    # Questi campi non vengono usati con singola GPU ma sono pronti
+    # per quando si passa a torchrun + FSDP
+
+    @property
+    def is_main_process(self) -> bool:
+        return True   # singola GPU: sempre True
+
+    @property
+    def world_size(self) -> int:
+        return 1
+
 
 def get_train_config() -> TrainConfig:
     return TrainConfig()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers checkpoint (compatibilità con train.py)
+# Helpers checkpoint
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_weights_file_path(config: TrainConfig, iter_num: int) -> str:
