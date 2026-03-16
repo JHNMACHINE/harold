@@ -331,7 +331,11 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
     warnings.filterwarnings("ignore")
+    os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN")
 
     model_cfg = ModelConfig(
         d_model=768,
