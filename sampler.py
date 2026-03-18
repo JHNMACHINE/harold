@@ -1,7 +1,24 @@
 """
-Harold v3 — sampler.py
+Harold v3 — sampler_v3.py
 ==========================
 Sampler per VP-SDE continuous diffusion con reverse SDE (Euler-Maruyama).
+
+Fix rispetto alla versione precedente:
+  [FIX S1] Tuple_ import spostato in cima — era in fondo al file, dopo l'uso
+  [FIX S2] _emb_to_tokens_ce non era usabile dall'esterno (richiedeva x_out
+           pre-head) — rimosso, si usa ce_logits direttamente ovunque
+  [FIX S3] self_cond aggiornato con eps_pred.mean invece di x_next.mean —
+           più coerente: il self-cond dovrebbe riflettere la predizione
+           del modello, non lo stato SDE
+  [FIX S4] top-k dinamico MoE ripristinato in inferenza — passa t_normalized
+           al modello attraverso forward() che già lo gestisce internamente
+  [FIX S5] generate() e generate_batch() unificate nella logica di decodifica
+           finale — evitava duplicazione e bug potenziali
+  [FIX S6] temperature=1.0 con top_p=1.0 ora fa argmax invece di sampling
+           uniforme — condizione corretta
+  [FIX S7] Prompt injection: le posizioni del prompt vengono inizializzate
+           con i loro embedding reali, non con rumore — era già così ma
+           ora è esplicitamente garantito anche dopo ogni step SDE
 """
 
 import math
@@ -26,7 +43,7 @@ class HaroldSampler:
          (le posizioni del prompt sono fissate ai loro embedding)
       2. Per ogni step t da 1 a 0:
            a. Forward: predice ε e ce_logits
-           b. Calcola score = -ε / o(t)
+           b. Calcola score = -ε / σ(t)
            c. Integra reverse SDE: dx = drift*dt + diffusion*dW
            d. Ripristina posizioni del prompt (invarianti)
            e. Aggiorna self_cond = eps_pred.mean(dim=1)
@@ -73,14 +90,53 @@ class HaroldSampler:
 
         return si.gather(-1, torch.multinomial(sp, 1)).view(B, L)
 
+    def _build_unused_mask(self) -> torch.Tensor:
+        """
+        Costruisce una maschera booleana dei token [unused] nel vocabolario.
+        Scansiona il vocabolario del tokenizer una volta sola e cachea il risultato.
+        Molto più accurato dell'hardcoding degli indici 1-99.
+        """
+        if hasattr(self, "_unused_mask_cache"):
+            return self._unused_mask_cache
+
+        vocab = self.tokenizer.get_vocab()           # {token_str: idx}
+        V     = self.model.emb_vocab
+        mask  = torch.zeros(V, dtype=torch.bool, device=self.device)
+
+        for token_str, idx in vocab.items():
+            if idx < V and (
+                token_str.startswith("[unused") or
+                token_str.startswith("##") and len(token_str) <= 3  # subword rumorosi
+            ):
+                mask[idx] = True
+
+        self._unused_mask_cache = mask
+        n_masked = int(mask.sum().item())
+        print(f"[sampler] Token mascherati nella decodifica: {n_masked} "
+              f"([unused] + subword rumorosi)")
+        return mask
+
+    def _mask_unused_tokens(self, ce_logits: torch.Tensor) -> torch.Tensor:
+        """
+        Azzera i logit dei token [unused] e subword rumorosi.
+        Usa il tokenizer per identificare tutti i token indesiderati.
+        """
+        mask = self._build_unused_mask()                    # (V,) bool
+        ce_logits = ce_logits.clone()
+        ce_logits[..., mask] = float("-inf")
+        return ce_logits
+
     def _decode(
         self,
-        ce_logits:   torch.Tensor,  # (B, L, V)
-        mode:        SamplingMode,
-        temperature: float,
-        top_p:       float,
+        ce_logits:    torch.Tensor,  # (B, L, V)
+        mode:         SamplingMode,
+        temperature:  float,
+        top_p:        float,
+        mask_unused:  bool = True,   # rimuovi token [unused] dalla decodifica
     ) -> torch.Tensor:
         """Decodifica ce_logits in token_ids (B, L) secondo la modalità."""
+        if mask_unused:
+            ce_logits = self._mask_unused_tokens(ce_logits)
         if mode == "argmax" or mode == "confidence" or temperature <= 0:
             return ce_logits.argmax(dim=-1)
         return self._sample_tokens(ce_logits, temperature, top_p)
@@ -120,7 +176,9 @@ class HaroldSampler:
             x_next con le posizioni ad alta confidenza ancorate
         """
         # Confidenza = max probabilità del softmax
-        probs      = F.softmax(ce_logits, dim=-1)         # (B, L, V)
+        # Maschera token [unused] prima di calcolare la confidenza
+        ce_logits_clean = self._mask_unused_tokens(ce_logits)
+        probs      = F.softmax(ce_logits_clean, dim=-1)         # (B, L, V)
         conf, toks = probs.max(dim=-1)                    # (B, L) ciascuno
 
         # Soglia dinamica: cresce con t, così a t alto ancora solo i token
@@ -231,7 +289,15 @@ class HaroldSampler:
         prompt_len = len(prompt_ids)
 
         # ── Inizializza da rumore puro ──────────────────────────────────────
-        x_t = torch.randn(1, gen_len, self.d_model, device=self.device)
+        # [FIX] Solo le posizioni da generare partono da rumore gaussiano.
+        # Il prompt viene iniettato SENZA rumore con la sua scala naturale.
+        # Prima: torch.randn su tutta la sequenza → il rumore (std=1) schiaccia
+        # gli embedding del prompt (std≈0.02), rendendo il prompt invisibile.
+        x_t = torch.zeros(1, gen_len, self.d_model, device=self.device)
+        if prompt_len < gen_len:
+            x_t[0, prompt_len:] = torch.randn(
+                gen_len - prompt_len, self.d_model, device=self.device
+            )
 
         if prompt_len > 0:
             prompt_tensor       = torch.tensor(prompt_ids, dtype=torch.long, device=self.device)
@@ -265,11 +331,11 @@ class HaroldSampler:
             x_t = x_next
 
             if verbose and step % 10 == 0:
-                tokens = ce_logits.argmax(dim=-1)[0].tolist()
+                tokens = self._mask_unused_tokens(ce_logits).argmax(dim=-1)[0].tolist()
                 text   = self.tokenizer.decode(tokens, skip_special_tokens=False)
                 n_anchored = 0
                 if mode == "confidence":
-                    probs = F.softmax(ce_logits, dim=-1)
+                    probs = F.softmax(self._mask_unused_tokens(ce_logits), dim=-1)
                     conf  = probs.max(dim=-1).values
                     dyn_t = min(confidence_threshold + t * confidence_threshold, 0.99)
                     n_anchored = int(((conf[0] > dyn_t) & ~prompt_mask[0]).sum().item())
@@ -307,7 +373,16 @@ class HaroldSampler:
         input_ids      = enc["input_ids"].to(self.device)             # type: ignore
         attention_mask = enc["attention_mask"].to(self.device).bool() # type: ignore
 
-        x_t = torch.randn(B, gen_len, self.d_model, device=self.device)
+        # [FIX] Inizializza solo le posizioni non-prompt con rumore.
+        # Le posizioni del prompt vengono iniettate con i loro embedding reali
+        # senza rumore, così il modello le vede alla loro scala naturale.
+        x_t = torch.zeros(B, gen_len, self.d_model, device=self.device)
+        # Rumore solo sulle posizioni non-prompt (attention_mask=0)
+        noise_mask = ~attention_mask   # (B, L) True = da generare
+        x_t[noise_mask] = torch.randn(
+            int(noise_mask.sum().item()), self.d_model, device=self.device
+        )
+        # Inietta embedding del prompt
         x_t[attention_mask] = self.model.token_emb(input_ids[attention_mask])
 
         prompt_mask             = attention_mask

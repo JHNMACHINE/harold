@@ -26,6 +26,7 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from config import ModelConfig, TrainConfig, get_model_config, get_train_config
+from logger import AsyncLogger
 from model import Harold, build_model
 from dataset import MixedStreamingDataset, build_loaders, compute_token_weights
 
@@ -94,6 +95,8 @@ def estimate_loss(
     model:      Harold,
     train_cfg:  TrainConfig,
     val_loader: DataLoader,
+    iter_num:   int = 0,
+    logger:     Optional["AsyncLogger"] = None,
 ) -> float:
     """
     Valuta la loss su diversi timestep continui in [0,1].
@@ -162,6 +165,15 @@ def estimate_loss(
     print("  val total: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_total.items()))
     print("  val score: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_score.items()))
     print("  val CE:    " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_ce.items()))
+
+    if logger is not None:
+        logger.log({
+            "type":        "val_detail",
+            "iter":        iter_num,
+            "total_per_t": {str(t): round(v, 6) for t, v in per_t_total.items()},
+            "score_per_t": {str(t): round(v, 6) for t, v in per_t_score.items()},
+            "ce_per_t":    {str(t): round(v, 6) for t, v in per_t_ce.items()},
+        })
 
     valid = [v for v in per_t_total.values() if v != float("inf")]
     return sum(valid) / len(valid) if valid else float("inf")
@@ -288,6 +300,11 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         else:
             print("Nessun checkpoint trovato, parto da zero.")
 
+    # ── AsyncLogger ───────────────────────────────────────────────────────
+    log_path = os.path.join(train_cfg.checkpoint_dir, "training.log")
+    logger   = AsyncLogger(log_path, flush_every=10)
+    print(f"Log asincrono → {log_path}")
+
     # ── Loop principale ────────────────────────────────────────────────────
     print(f"\nAvvio training — {train_cfg.max_iters} optimizer steps\n")
 
@@ -366,12 +383,23 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
             "grad":  f"{grad_norm:.2f}",
         })
 
+        logger.log({
+            "type":       "train",
+            "iter":       iter_num,
+            "loss":       round(avg_loss,  6),
+            "score":      round(avg_score, 6),
+            "ce":         round(avg_ce,    6),
+            "lr":         lr,
+            "grad_norm":  round(float(grad_norm), 6),
+            "elapsed_min": round((time.time() - start_time) / 60, 2),
+        })
+
         # ── Valutazione ───────────────────────────────────────────────────
         if iter_num % train_cfg.eval_interval == 0 or iter_num == train_cfg.max_iters - 1:
             if iter_num == 0:
                 continue
 
-            val_loss   = estimate_loss(model, train_cfg, val_loader)
+            val_loss   = estimate_loss(model, train_cfg, val_loader, iter_num, logger)
             val_losses.append(val_loss)
             avg_train  = accum_loss / max(train_cfg.eval_interval, 1)
             accum_loss = 0.0
@@ -382,6 +410,15 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
                 f"train={avg_train:.4f}  val={val_loss:.4f}  "
                 f"lr={lr:.2e}  elapsed={elapsed:.1f}min"
             )
+
+            logger.log({
+                "type":        "val",
+                "iter":        iter_num,
+                "train_loss":  round(avg_train, 6),
+                "val_loss":    round(val_loss,  6),
+                "lr":          lr,
+                "elapsed_min": round(elapsed, 2),
+            })
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -395,6 +432,12 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
                     train_losses, val_losses,
                 )
                 print(f"  ★ Best val loss: {val_loss:.4f} → {best_path}")
+                logger.log({
+                    "type":      "best_checkpoint",
+                    "iter":      iter_num,
+                    "val_loss":  round(val_loss, 6),
+                    "path":      best_path,
+                })
                 train_cfg.write_latest(iter_num, best_path)
 
             model.train()
@@ -409,6 +452,11 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
             )
             train_cfg.write_latest(iter_num, p)
             print(f"  Checkpoint periodico → {p}")
+            logger.log({
+                "type": "periodic_checkpoint",
+                "iter": iter_num,
+                "path": p,
+            })
 
     # ── Finale ────────────────────────────────────────────────────────────
     elapsed    = (time.time() - start_time) / 60
@@ -422,6 +470,13 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         train_losses, val_losses,
     )
     train_cfg.write_latest(train_cfg.max_iters, final_path)
+    logger.log({
+        "type":             "finished",
+        "total_iters":      train_cfg.max_iters,
+        "best_val_loss":    round(best_val_loss, 6),
+        "elapsed_min":      round(elapsed, 2),
+        "final_checkpoint": final_path,
+    })
     print(f"\nTraining completato in {elapsed:.1f} min → {final_path}")
 
     return {
