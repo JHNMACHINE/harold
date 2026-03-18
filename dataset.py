@@ -28,63 +28,60 @@ from transformers import PreTrainedTokenizer
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_token_weights(
-    tokenizer:    PreTrainedTokenizer,
-    save_path:    str  = "token_weights.pt",
-    n_docs:       int  = 50000,
-    dataset_name: str  = "HuggingFaceFW/fineweb-edu",
-    subset:       str  = "CC-MAIN-2024-10",
+    tokenizer:   PreTrainedTokenizer,
+    weights:     dict,                    # es. {"fineweb":0.30, "wikipedia":0.20, ...}
+    save_path:   str  = "token_weights.pt",
+    n_docs_total: int = 50000,
 ) -> torch.Tensor:
     """
-    Precomputa i pesi dei token basati sulla frequenza inversa nel dataset.
-
-    Token rari (IDF alto) → peso alto  → mascherati prima
-    Token comuni           → peso basso → mascherati dopo
-
-    Ritorna un tensore (vocab_size,) float in [0, 1].
-    Salva su disco per non ricalcolarlo ad ogni training.
-
-    Tempo stimato: ~10 minuti su 50k documenti.
+    Precomputa i pesi dei token campionando da tutti i dataset del mix
+    in proporzione ai loro pesi — le frequenze riflettono la distribuzione
+    reale che il modello vede durante il training.
     """
     if os.path.exists(save_path):
         print(f"Token weights trovati: {save_path}")
         return torch.load(save_path, weights_only=True)
 
-    print(f"Calcolo token weights su {n_docs} documenti...")
     from datasets import load_dataset
     from collections import Counter
 
-    ds      = load_dataset(dataset_name, name=subset, split="train", streaming=True)
-    counter = Counter()
-    n_docs_seen = 0
+    print(f"Calcolo token weights su {n_docs_total} documenti dal mix...")
+    counter   = Counter()
 
-    for example in ds:
-        if n_docs_seen >= n_docs:
-            break
-        text = (example.get("text") or "").strip()
-        if not text:
+    for i, (name, cfg) in enumerate(MixedStreamingDataset.DATASET_CONFIGS.items()):
+        if name not in weights:
             continue
-        ids = tokenizer(
-            text, truncation=True, max_length=512,
-            return_attention_mask=False, verbose=False,
-        )["input_ids"]
-        counter.update(ids) # type: ignore
-        n_docs_seen += 1
-        if n_docs_seen % 5000 == 0:
-            print(f"  {n_docs_seen}/{n_docs} documenti processati...")
 
-    # Costruisci tensore frequenze
+        n_docs = max(1, int(n_docs_total * weights[name]))
+        print(f"  {name}: {n_docs} documenti ({weights[name]:.0%})...")
+
+        ds = load_dataset(**cfg["load_kwargs"], streaming=True)
+        ds = ds.shuffle(buffer_size=500, seed=42 + i)
+
+        n_seen = 0
+        for example in ds:
+            if n_seen >= n_docs:
+                break
+            text = (example.get(cfg["text_field"]) or "").strip()
+            if not text:
+                continue
+            ids = tokenizer(
+                text, truncation=True, max_length=512,
+                return_attention_mask=False, verbose=False,
+            )["input_ids"]
+            counter.update(ids)  # type: ignore
+            n_seen += 1
+
     freq = torch.zeros(tokenizer.vocab_size)
     for tok_id, count in counter.items():
         if 0 <= tok_id < tokenizer.vocab_size:
             freq[tok_id] = float(count)
 
-    # IDF: log(N / (freq + 1)) — token rari hanno IDF alto
     N   = float(freq.sum())
     idf = torch.log(N / (freq + 1.0))
+    w   = (idf - idf.min()) / (idf.max() - idf.min() + 1e-8)
 
-    # Normalizza in [0, 1]
-    w = (idf - idf.min()) / (idf.max() - idf.min() + 1e-8)
-
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save(w, save_path)
     print(f"Token weights salvati: {save_path}")
     return w

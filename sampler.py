@@ -1,35 +1,17 @@
 """
-Harold v3 — sampler_v3.py
+Harold v3 — sampler.py
 ==========================
-Sampler per continuous diffusion:
-  - Input/output nello spazio embedding invece di token discreti
-  - Nearest neighbor lookup per decodifica finale
-  - Self-conditioning attivo durante il sampling
-  - Top-k dinamico (threshold t-dipendente) per il MoE in inferenza
-  - MLA KV cache: salva c_kv latente invece di (k,v) separati
-
-Modalità disponibili:
-  - confidence  : decodifica i token più certi per step (cosine schedule)
-  - sample      : stochastic con temperature e nucleus
-  - argmax      : greedy deterministico (debug)
-
-Uso base:
-    sampler = HaroldSamplerV3(model, tokenizer, device="cuda")
-    text = sampler.generate("Once upon a time", steps=32)
-    print(text)
+Sampler per VP-SDE continuous diffusion con reverse SDE (Euler-Maruyama).
 """
 
 import math
+import sys
 import torch
 import torch.nn.functional as F
-from typing import Literal
-from transformers import PreTrainedTokenizer
+from typing import Literal, Optional, List, Tuple
+from transformers import PreTrainedTokenizer, AutoTokenizer
 
-from model import Harold
-import sys
-from transformers import AutoTokenizer
-from config import ModelConfig
-from model import build_model
+from model import Harold, build_model
 
 
 SamplingMode = Literal["argmax", "sample", "confidence"]
@@ -37,393 +19,327 @@ SamplingMode = Literal["argmax", "sample", "confidence"]
 
 class HaroldSampler:
     """
-    Sampler per Harold v3 — continuous diffusion.
+    Sampler per Harold v3 — reverse SDE con Euler-Maruyama.
 
-    Differenze chiave rispetto a HaroldSampler (v2):
-      - xt è sempre un embedding (B, L, d_model), non token IDs
-      - Ogni step: Harold predice x0_pred (embedding), non logit
-      - Confidence calcolata via cosine similarity con il vocabolario
-      - Self-conditioning attivo: ogni step passa x0_pred al successivo
-      - KV cache MLA: c_kv latente invece di (k,v)
+    Loop di generazione:
+      1. Inizializza x_1 ~ N(0,I) per le posizioni da generare
+         (le posizioni del prompt sono fissate ai loro embedding)
+      2. Per ogni step t da 1 a 0:
+           a. Forward: predice ε e ce_logits
+           b. Calcola score = -ε / o(t)
+           c. Integra reverse SDE: dx = drift*dt + diffusion*dW
+           d. Ripristina posizioni del prompt (invarianti)
+           e. Aggiorna self_cond = eps_pred.mean(dim=1)
+      3. Decodifica finale con ce_logits (argmax o top-p sampling)
+
+    Modalità di decodifica:
+      "argmax"     — greedy, deterministico
+      "sample"     — top-p con temperature, stocastico
+      "confidence" — ancora progressivamente i token ad alta confidenza
+                     durante il loop SDE (ibrido continuo/discreto)
     """
 
     def __init__(
         self,
-        model:         Harold,
-        tokenizer:     PreTrainedTokenizer,
-        device:        str = "cuda",
-        mask_token_id: int | None = None,
+        model:     Harold,
+        tokenizer: PreTrainedTokenizer,
+        device:    str = "cuda",
     ):
         self.model     = model.eval().to(device)
         self.tokenizer = tokenizer
         self.device    = device
-        self.mask_id   = mask_token_id or model.config.mask_token_id
-        self.T         = model.config.diffusion_T
         self.d_model   = model.config.d_model
-
-        # Embedding del token [MASK] — usato per inizializzare la sequenza
-        with torch.no_grad():
-            mask_id_tensor = torch.tensor([self.mask_id], device=device)
-            self.mask_emb  = model.token_emb(mask_id_tensor)  # (1, d_model)
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
-    def _timestep_tensor(self, t_int: int, batch: int) -> torch.Tensor:
-        return torch.full((batch,), t_int, dtype=torch.long, device=self.device)
+    def _t_tensor(self, t_float: float, batch: int) -> torch.Tensor:
+        return torch.full((batch,), t_float, dtype=torch.float32, device=self.device)
 
-    def _tokens_to_emb(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """Converte token IDs in embedding. token_ids: (B, L) → (B, L, d_model)"""
-        with torch.no_grad():
-            return self.model.token_emb(token_ids)
-
-    def _emb_to_tokens(self, x0_pred: torch.Tensor) -> torch.Tensor:
-        """
-        Nearest neighbor lookup: trova il token più vicino per ogni posizione.
-        x0_pred: (B, L, d_model) → token_ids: (B, L)
-        Usa cosine similarity per efficienza e invarianza alla scala.
-        """
-        return self.model.decode_tokens(x0_pred)
-
-    # ── Modalità di decodifica ───────────────────────────────────────────────
-
-    def _decode_confidence(
+    def _sample_tokens(
         self,
-        x0_pred:     torch.Tensor,   # (B, L, d_model)
-        xt_emb:      torch.Tensor,   # (B, L, d_model)
-        is_masked:   torch.Tensor,   # (B, L) bool — posizioni ancora "sporche"
-        unmask_frac: float,
-        temperature: float = 1.0,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Confidence-based decoding per continuous diffusion.
-
-        La confidenza non viene da un softmax su logit ma dalla
-        cosine similarity tra x0_pred e il nearest neighbor nel vocabolario.
-
-        Decodifica i top-unmask_frac token più certi tra quelli mascherati.
-        Ritorna l'embedding aggiornato e la maschera dei token decodificati.
-        """
-        B, L, D = x0_pred.shape
-
-        # Cosine similarity con tutto il vocabolario → confidenza
-        emb_norm  = F.normalize(self.model.token_emb.weight, dim=-1)  # (V, D)
-        pred_norm = F.normalize(x0_pred / max(temperature, 1e-5), dim=-1)  # (B, L, D)
-        sim       = torch.einsum("bld,vd->blv", pred_norm, emb_norm)  # (B, L, V)
-
-        # Confidence = max cosine similarity (quanto è sicuro il nearest neighbor)
-        confidence, best_tokens = sim.max(dim=-1)  # (B, L)
-
-        # Considera solo le posizioni mascherate
-        confidence = confidence.masked_fill(~is_masked, -1.0)
-
-        # Numero di token da decodificare in questo step
-        n_masked  = is_masked.sum(dim=-1).float()          # (B,)
-        n_unmask  = (n_masked * unmask_frac).ceil().long().clamp(min=1)
-
-        x_new    = xt_emb.clone()
-        unmasked = torch.zeros(B, L, dtype=torch.bool, device=self.device)
-
-        for b in range(B):
-            k        = int(n_unmask[b].item())
-            topk_idx = confidence[b].topk(k).indices
-            # Sostituisci l'embedding mascherato con il nearest neighbor predetto
-            x_new[b, topk_idx]    = self.model.token_emb(best_tokens[b, topk_idx])
-            unmasked[b, topk_idx] = True
-
-        return x_new, unmasked
-
-    def _decode_sample(
-        self,
-        x0_pred:   torch.Tensor,   # (B, L, d_model)
-        xt_emb:    torch.Tensor,   # (B, L, d_model)
-        is_masked: torch.Tensor,   # (B, L) bool
-        temperature: float = 1.0,
-        top_p:       float = 0.9,
+        ce_logits:   torch.Tensor,  # (B, L, V)
+        temperature: float,
+        top_p:       float,
     ) -> torch.Tensor:
-        """
-        Stochastic sampling con temperature e nucleus.
-        Campiona token dalle probabilità derivate dalla cosine similarity.
-        """
-        B, L, D = x0_pred.shape
+        """Top-p sampling con temperature. Ritorna token_ids (B, L)."""
+        B, L, V = ce_logits.shape
+        scaled  = ce_logits / max(temperature, 1e-5)
+        probs   = F.softmax(scaled, dim=-1).view(B * L, V)
 
-        emb_norm  = F.normalize(self.model.token_emb.weight, dim=-1)
-        pred_norm = F.normalize(x0_pred / max(temperature, 1e-5), dim=-1)
-        sim       = torch.einsum("bld,vd->blv", pred_norm, emb_norm)  # (B, L, V)
-
-        # Softmax sulla similarity → distribuzione sui token
-        probs = F.softmax(sim, dim=-1)   # (B, L, V)
-        V     = probs.shape[-1]
-
-        # Top-p filtering
-        probs_flat  = probs.view(B * L, V)
-        sp, si      = torch.sort(probs_flat, descending=True, dim=-1)
-        cum         = sp.cumsum(dim=-1)
-        remove      = cum - sp > top_p
-        sp[remove]  = 0.0
+        sp, si  = torch.sort(probs, descending=True, dim=-1)
+        cum     = sp.cumsum(dim=-1)
+        sp[cum - sp > top_p] = 0.0
         sp.div_(sp.sum(dim=-1, keepdim=True) + 1e-9)
 
-        sampled_idx = si.gather(-1, torch.multinomial(sp, 1)).view(B, L)
+        return si.gather(-1, torch.multinomial(sp, 1)).view(B, L)
 
-        # Aggiorna solo le posizioni mascherate
-        x_new = xt_emb.clone()
-        for b in range(B):
-            mask_pos = is_masked[b].nonzero(as_tuple=True)[0]
-            if mask_pos.numel() > 0:
-                x_new[b, mask_pos] = self.model.token_emb(sampled_idx[b, mask_pos])
-
-        return x_new
-
-    def _decode_argmax(
+    def _decode(
         self,
-        x0_pred:   torch.Tensor,   # (B, L, d_model)
-        xt_emb:    torch.Tensor,   # (B, L, d_model)
-        is_masked: torch.Tensor,   # (B, L) bool
+        ce_logits:   torch.Tensor,  # (B, L, V)
+        mode:        SamplingMode,
+        temperature: float,
+        top_p:       float,
     ) -> torch.Tensor:
-        """Greedy: prende il nearest neighbor per ogni posizione mascherata."""
-        token_ids = self._emb_to_tokens(x0_pred)  # (B, L)
-        x_new     = xt_emb.clone()
-        x_new[is_masked] = self.model.token_emb(token_ids[is_masked])
-        return x_new
+        """Decodifica ce_logits in token_ids (B, L) secondo la modalità."""
+        if mode == "argmax" or mode == "confidence" or temperature <= 0:
+            return ce_logits.argmax(dim=-1)
+        return self._sample_tokens(ce_logits, temperature, top_p)
 
-    # ── Loop principale ──────────────────────────────────────────────────────
+    def _anchor_confident_tokens(
+        self,
+        x_next:      torch.Tensor,   # (B, L, D) stato SDE aggiornato
+        ce_logits:   torch.Tensor,   # (B, L, V) logit del passo corrente
+        prompt_mask: torch.Tensor,   # (B, L) bool — posizioni del prompt
+        threshold:   float,          # soglia di confidenza [0,1]
+        t:           float,          # timestep corrente — usato per threshold dinamica
+    ) -> torch.Tensor:
+        """
+        Confidence-guided anchoring per VP-SDE.
+
+        Per i token con confidenza (max softmax prob) sopra la soglia,
+        sostituisce l'embedding SDE con l'embedding discreto del token
+        più probabile. Questi token non evolveranno più con la SDE nei
+        passi successivi perché la loro posizione viene "congelata".
+
+        La soglia è dinamica rispetto a t:
+          - t alto (tanto rumore) → soglia alta → ancora solo i token
+            già molto certi (pochi)
+          - t basso (poco rumore) → soglia bassa → ancora sempre più token
+
+        Questo ibrida il processo continuo VP-SDE con il decoding
+        progressivo stile MDLM/MaskGIT.
+
+        Args:
+            x_next:      stato SDE dopo il passo corrente
+            ce_logits:   logit ausiliari del modello
+            prompt_mask: maschera del prompt (non viene mai ancorato)
+            threshold:   soglia base di confidenza
+            t:           timestep corrente in (0,1]
+
+        Returns:
+            x_next con le posizioni ad alta confidenza ancorate
+        """
+        # Confidenza = max probabilità del softmax
+        probs      = F.softmax(ce_logits, dim=-1)         # (B, L, V)
+        conf, toks = probs.max(dim=-1)                    # (B, L) ciascuno
+
+        # Soglia dinamica: cresce con t, così a t alto ancora solo i token
+        # veramente certi e a t basso ancora la maggioranza
+        # range: [threshold, min(threshold * 2, 0.99)]
+        dynamic_threshold = min(threshold + t * threshold, 0.99)
+
+        # Maschera dei token da ancorare: alta confidenza E non nel prompt
+        to_anchor = (conf > dynamic_threshold) & ~prompt_mask  # (B, L)
+
+        if to_anchor.any():
+            # Embedding discreto dei token più probabili
+            anchored_emb = self.model.token_emb(toks)    # (B, L, D)
+            x_next = torch.where(
+                to_anchor.unsqueeze(-1),
+                anchored_emb,
+                x_next,
+            )
+
+        return x_next
+
+    # ── Reverse SDE step ─────────────────────────────────────────────────────
+
+    def _reverse_sde_step(
+        self,
+        x_t:       torch.Tensor,           # (B, L, D)
+        t:         float,                   # timestep corrente in (0,1]
+        dt:        float,                   # passo negativo (-1/steps)
+        self_cond: Optional[torch.Tensor], # (B, D) detached o None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Un passo di reverse SDE (Euler-Maruyama).
+
+        Reverse SDE (Anderson 1982):
+          dx = [-0.5*β(t)*x - β(t)*score(x,t)] dt + √β(t) dW
+
+        score(x,t) = ∇ log p_t(x) ≈ -ε_θ(x,t) / σ(t)
+
+        Ritorna (x_next, ce_logits, eps_pred).
+        """
+        B        = x_t.shape[0]
+        t_tensor = self._t_tensor(t, B)
+
+        # Forward del modello
+        # [FIX S4] t_normalized viene calcolato internamente in Harold.forward
+        #          dal valore di t — il top-k dinamico del MoE è automatico
+        eps_pred, ce_logits, _ = self.model(x_t, t_tensor, self_cond=self_cond)
+
+        # Parametri SDE al tempo t
+        beta_t           = self.model.schedule.get_beta(t_tensor)           # (B,)
+        _, sigma_t       = self.model.schedule.get_alpha_sigma(t_tensor)    # (B,)
+
+        # Score: ∇ log p_t(x) = -ε / σ(t)
+        score     = -eps_pred / sigma_t.view(-1, 1, 1).clamp(min=1e-8)
+
+        # Reverse SDE drift e diffusion
+        b         = beta_t.view(-1, 1, 1)
+        drift     = -0.5 * b * x_t - b * score
+        diffusion = b.sqrt()
+
+        # Nessun rumore all'ultimo step (t ≈ 0) per decodifica stabile
+        noise  = torch.randn_like(x_t) if t > 1e-5 else torch.zeros_like(x_t)
+        x_next = x_t + drift * dt + diffusion * noise * math.sqrt(abs(dt))
+
+        return x_next, ce_logits, eps_pred
+
+    # ── Generate ─────────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def generate(
         self,
-        prompt:      str   = "",
-        gen_len:     int   = 64,
-        steps:       int   = 32,
-        mode:        SamplingMode = "confidence",
-        temperature: float = 1.0,
-        top_p:       float = 0.9,
-        use_self_cond: bool = True,   # self-conditioning attivo
-        verbose:     bool  = False,
+        prompt:               str          = "",
+        gen_len:              int          = 64,
+        steps:                int          = 100,
+        mode:                 SamplingMode = "argmax",
+        temperature:          float        = 1.0,
+        top_p:                float        = 0.9,
+        confidence_threshold: float        = 0.7,
+        anchor_every:         int          = 5,
+        use_self_cond:        bool         = True,
+        verbose:              bool         = False,
     ) -> str:
         """
-        Genera testo a partire da un prompt.
+        Genera testo con reverse SDE.
 
         Args:
-            prompt:        testo iniziale (freezato durante il sampling)
-            gen_len:       lunghezza totale sequenza (prompt + generazione)
-            steps:         numero di passi di denoising
-            mode:          "confidence" | "sample" | "argmax"
-            temperature:   temperatura per confidence e sample mode
-            top_p:         nucleus threshold per sample mode
-            use_self_cond: usa self-conditioning (consigliato)
-            verbose:       stampa lo stato ad ogni step
-
-        Returns:
-            testo generato (stringa decodificata)
+            prompt:               testo iniziale (posizioni fissate, non modificate)
+            gen_len:              lunghezza totale della sequenza (prompt + generazione)
+            steps:                passi Euler-Maruyama (più = qualità migliore, più lento)
+            mode:                 "argmax" | "sample" | "confidence"
+            temperature:          temperatura per mode="sample"
+            top_p:                nucleus threshold per mode="sample"
+            confidence_threshold: soglia base per mode="confidence" [0,1]
+                                  valori tipici: 0.6-0.8
+                                  più basso = ancora più token per step
+            anchor_every:         ogni quanti step applicare l'anchoring
+                                  (default 5 = ogni 5 step SDE)
+            use_self_cond:        passa eps_pred.mean come hint al passo successivo
+            verbose:              stampa decodifica intermedia ogni 10 step
         """
-        assert steps <= self.T, f"steps ({steps}) deve essere ≤ diffusion_T ({self.T})"
-
-        # ── Inizializzazione ────────────────────────────────────────────────
-        prompt_ids = self.tokenizer.encode(
-            prompt, add_special_tokens=True, truncation=True, max_length=gen_len
-        ) if prompt else []
+        # ── Tokenizza il prompt ─────────────────────────────────────────────
+        prompt_ids = (
+            self.tokenizer.encode(
+                prompt, add_special_tokens=True,
+                truncation=True, max_length=gen_len,
+            ) if prompt else []
+        )
         prompt_len = len(prompt_ids)
 
-        # Sequenza iniziale: embedding del prompt + embedding del [MASK]
-        xt_emb = self.mask_emb.expand(1, gen_len, self.d_model).clone()
-        if prompt_len > 0:
-            prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long, device=self.device)
-            xt_emb[0, :prompt_len] = self.model.token_emb(prompt_tensor)
+        # ── Inizializza da rumore puro ──────────────────────────────────────
+        x_t = torch.randn(1, gen_len, self.d_model, device=self.device)
 
-        # Maschera statica: posizioni del prompt non vengono mai modificate
+        if prompt_len > 0:
+            prompt_tensor       = torch.tensor(prompt_ids, dtype=torch.long, device=self.device)
+            x_t[0, :prompt_len] = self.model.token_emb(prompt_tensor)
+
         prompt_mask = torch.zeros(1, gen_len, dtype=torch.bool, device=self.device)
         prompt_mask[0, :prompt_len] = True
 
-        # Posizioni ancora da decodificare
-        is_masked = ~prompt_mask  # (1, L)
+        # ── Loop reverse SDE ────────────────────────────────────────────────
+        self_cond: Optional[torch.Tensor] = None
+        dt = -1.0 / steps
 
-        # Schedule timestep: da T a 1 in steps passi
-        t_schedule = torch.linspace(self.T, 1, steps).long()
+        for step in range(steps):
+            t = 1.0 - step / steps
 
-        def unmask_frac(step_idx: int) -> float:
-            cos = math.cos(math.pi * step_idx / (2 * steps))
-            return float(1.0 - cos + 1.0 / steps)
+            x_next, ce_logits, eps_pred = self._reverse_sde_step(x_t, t, dt, self_cond)
 
-        # Self-conditioning: parte con None, aggiornato ad ogni step
-        self_cond: torch.Tensor | None = None
+            # Ripristina le posizioni del prompt
+            x_next = torch.where(prompt_mask.unsqueeze(-1), x_t, x_next)
 
-        # ── Loop di denoising ───────────────────────────────────────────────
-        for step_idx, t_val in enumerate(t_schedule):
-            t_tensor = self._timestep_tensor(int(t_val.item()), batch=1)
+            # Confidence anchoring: congela i token certi ogni anchor_every step
+            if mode == "confidence" and step % anchor_every == 0:
+                x_next = self._anchor_confident_tokens(
+                    x_next, ce_logits, prompt_mask,
+                    threshold=confidence_threshold, t=t,
+                )
 
-            # Forward: predice x0 nello spazio embedding
-            x0_pred, ce_logits, _ = self.model(
-                xt_emb, t_tensor,
-                self_cond=self_cond,
-            )
-
-            # Aggiorna self-conditioning per il prossimo step
             if use_self_cond:
-                self_cond = x0_pred.mean(dim=1).detach()  # (1, d_model)
+                self_cond = eps_pred.mean(dim=1).detach()
 
-            # Decodifica in base alla modalità
-            if mode == "argmax":
-                xt_emb_new = self._decode_argmax(x0_pred, xt_emb, is_masked)
-                xt_emb     = torch.where(
-                    prompt_mask.unsqueeze(-1), xt_emb, xt_emb_new
-                )
-                is_masked  = torch.zeros_like(is_masked)  # tutto decodificato
+            x_t = x_next
 
-            elif mode == "sample":
-                xt_emb_new = self._decode_sample(
-                    x0_pred, xt_emb, is_masked, temperature, top_p
-                )
-                # Re-masking graduale: mantieni mascherato una frazione decrescente
-                if step_idx < steps - 1:
-                    frac      = 1.0 - (step_idx + 1) / steps
-                    n_gen     = gen_len - prompt_len
-                    n_remask  = max(0, int(n_gen * frac))
-                    gen_pos   = torch.arange(prompt_len, gen_len, device=self.device)
-                    perm      = torch.randperm(len(gen_pos), device=self.device)
-                    remask_pos = gen_pos[perm[:n_remask]]
-                    xt_emb_new[0, remask_pos] = self.mask_emb.squeeze(0)
-                    is_masked[0, remask_pos]  = True
-                    is_masked[0, :prompt_len] = False
-                xt_emb   = torch.where(prompt_mask.unsqueeze(-1), xt_emb, xt_emb_new)
-                is_masked = is_masked & ~prompt_mask
-
-            elif mode == "confidence":
-                frac = unmask_frac(step_idx)
-                xt_emb_new, newly_unmasked = self._decode_confidence(
-                    x0_pred, xt_emb, is_masked, frac, temperature
-                )
-                xt_emb    = torch.where(prompt_mask.unsqueeze(-1), xt_emb, xt_emb_new)
-                is_masked = is_masked & ~newly_unmasked & ~prompt_mask
-
-            if verbose:
-                n_masked_left = is_masked.sum().item()
-                # Decodifica corrente per stampa
-                cur_tokens = self._emb_to_tokens(xt_emb)
-                cur_text   = self.tokenizer.decode(
-                    cur_tokens[0].tolist(), skip_special_tokens=False
-                )
-                print(f"Step {step_idx+1:3d}/{steps} | t={t_val:4d} | "
-                      f"masked={n_masked_left:3d} | {cur_text[:80]}")
-
-            # Termina prima se non ci sono più token mascherati
-            if is_masked.sum() == 0:
-                break
+            if verbose and step % 10 == 0:
+                tokens = ce_logits.argmax(dim=-1)[0].tolist()
+                text   = self.tokenizer.decode(tokens, skip_special_tokens=False)
+                n_anchored = 0
+                if mode == "confidence":
+                    probs = F.softmax(ce_logits, dim=-1)
+                    conf  = probs.max(dim=-1).values
+                    dyn_t = min(confidence_threshold + t * confidence_threshold, 0.99)
+                    n_anchored = int(((conf[0] > dyn_t) & ~prompt_mask[0]).sum().item())
+                print(f"  step {step+1:3d}/{steps} | t={t:.3f} | anchored={n_anchored} | {text[:70]}")
 
         # ── Decodifica finale ───────────────────────────────────────────────
-        # Posizioni ancora mascherate: forza un ultimo forward a t=1
-        if is_masked.any():
-            t_final = self._timestep_tensor(1, batch=1)
-            x0_pred, _, _ = self.model(xt_emb, t_final, self_cond=self_cond)
-            final_tokens  = self._emb_to_tokens(x0_pred)
-            final_emb     = self.model.token_emb(final_tokens)
-            xt_emb        = torch.where(
-                (is_masked & ~prompt_mask).unsqueeze(-1),
-                final_emb, xt_emb,
-            )
+        t_final        = self._t_tensor(1.0 / steps, batch=1)
+        _, ce_final, _ = self.model(x_t, t_final, self_cond=self_cond)
+        token_ids      = self._decode(ce_final, mode, temperature, top_p)[0]
 
-        # Nearest neighbor sull'intera sequenza → token IDs → testo
-        token_ids = self._emb_to_tokens(xt_emb)[0].tolist()
-        text      = self.tokenizer.decode(token_ids, skip_special_tokens=True)
-        return text # type: ignore
+        return self.tokenizer.decode(token_ids.tolist(), skip_special_tokens=True)  # type: ignore
 
     @torch.no_grad()
     def generate_batch(
         self,
-        prompts:       list[str],
-        gen_len:       int   = 64,
-        steps:         int   = 32,
-        mode:          SamplingMode = "confidence",
-        temperature:   float = 1.0,
-        top_p:         float = 0.9,
-        use_self_cond: bool  = True,
-    ) -> list[str]:
+        prompts:              List[str],
+        gen_len:              int          = 64,
+        steps:                int          = 100,
+        mode:                 SamplingMode = "argmax",
+        temperature:          float        = 1.0,
+        top_p:                float        = 0.9,
+        confidence_threshold: float        = 0.7,
+        anchor_every:         int          = 5,
+        use_self_cond:        bool         = True,
+    ) -> List[str]:
         """
-        Genera un batch di sequenze in parallelo.
-        Più efficiente di chiamare generate() in loop.
+        Versione batch di generate — più efficiente di chiamare generate() in loop.
+        Stessa logica di generate() ma vettorializzata su B sequenze.
         """
-        B = len(prompts)
-
+        B   = len(prompts)
         enc = self.tokenizer(
-            prompts,
-            padding="max_length",
-            truncation=True,
-            max_length=gen_len,
-            return_tensors="pt",
+            prompts, padding="max_length", truncation=True,
+            max_length=gen_len, return_tensors="pt",
         )
-        input_ids      = enc["input_ids"].to(self.device)           # type: ignore # (B, L)
-        attention_mask = enc["attention_mask"].to(self.device).bool()  # type: ignore # (B, L)
+        input_ids      = enc["input_ids"].to(self.device)             # type: ignore
+        attention_mask = enc["attention_mask"].to(self.device).bool() # type: ignore
 
-        # Inizializza: prompt embedding + mask embedding
-        xt_emb = self.mask_emb.expand(B, gen_len, self.d_model).clone()
-        xt_emb[attention_mask] = self.model.token_emb(input_ids[attention_mask])
+        x_t = torch.randn(B, gen_len, self.d_model, device=self.device)
+        x_t[attention_mask] = self.model.token_emb(input_ids[attention_mask])
 
-        prompt_mask = attention_mask   # (B, L): True = prompt
-        is_masked   = ~prompt_mask
+        prompt_mask             = attention_mask
+        self_cond: Optional[torch.Tensor] = None
+        dt = -1.0 / steps
 
-        t_schedule = torch.linspace(self.T, 1, steps).long()
+        for step in range(steps):
+            t = 1.0 - step / steps
 
-        def unmask_frac(i: int) -> float:
-            return float(1.0 - math.cos(math.pi * i / (2 * steps)) + 1.0 / steps)
+            x_next, ce_logits, eps_pred = self._reverse_sde_step(x_t, t, dt, self_cond)
 
-        self_cond: torch.Tensor | None = None
+            x_next = torch.where(prompt_mask.unsqueeze(-1), x_t, x_next)
 
-        for step_idx, t_val in enumerate(t_schedule):
-            t_tensor = self._timestep_tensor(int(t_val.item()), batch=B)
-
-            x0_pred, _, _ = self.model(xt_emb, t_tensor, self_cond=self_cond)
+            if mode == "confidence" and step % anchor_every == 0:
+                x_next = self._anchor_confident_tokens(
+                    x_next, ce_logits, prompt_mask,
+                    threshold=confidence_threshold, t=t,
+                )
 
             if use_self_cond:
-                self_cond = x0_pred.mean(dim=1).detach()
+                self_cond = eps_pred.mean(dim=1).detach()
 
-            if mode == "argmax":
-                xt_emb_new = self._decode_argmax(x0_pred, xt_emb, is_masked)
-                xt_emb     = torch.where(prompt_mask.unsqueeze(-1), xt_emb, xt_emb_new)
-                is_masked  = torch.zeros_like(is_masked)
+            x_t = x_next
 
-            elif mode == "sample":
-                xt_emb_new = self._decode_sample(
-                    x0_pred, xt_emb, is_masked, temperature, top_p
-                )
-                if step_idx < steps - 1:
-                    frac = 1.0 - (step_idx + 1) / steps
-                    for b in range(B):
-                        gen_pos   = (~prompt_mask[b]).nonzero(as_tuple=True)[0]
-                        n_remask  = max(0, int(len(gen_pos) * frac))
-                        perm      = torch.randperm(len(gen_pos), device=self.device)
-                        remask_pos = gen_pos[perm[:n_remask]]
-                        xt_emb_new[b, remask_pos] = self.mask_emb.squeeze(0)
-                        is_masked[b, remask_pos]  = True
-                xt_emb    = torch.where(prompt_mask.unsqueeze(-1), xt_emb, xt_emb_new)
-                is_masked = is_masked & ~prompt_mask
-
-            elif mode == "confidence":
-                frac = unmask_frac(step_idx)
-                xt_emb_new, newly_unmasked = self._decode_confidence(
-                    x0_pred, xt_emb, is_masked, frac, temperature
-                )
-                xt_emb    = torch.where(prompt_mask.unsqueeze(-1), xt_emb, xt_emb_new)
-                is_masked = is_masked & ~newly_unmasked & ~prompt_mask
-
-            if is_masked.sum() == 0:
-                break
-
-        # Cleanup finale
-        if is_masked.any():
-            t_final   = self._timestep_tensor(1, batch=B)
-            x0_pred, _, _ = self.model(xt_emb, t_final, self_cond=self_cond)
-            final_tokens  = self._emb_to_tokens(x0_pred)
-            final_emb     = self.model.token_emb(final_tokens)
-            xt_emb        = torch.where(
-                (is_masked & ~prompt_mask).unsqueeze(-1),
-                final_emb, xt_emb,
-            )
+        t_final         = self._t_tensor(1.0 / steps, batch=B)
+        _, ce_final, _  = self.model(x_t, t_final, self_cond=self_cond)
+        token_ids_batch = self._decode(ce_final, mode, temperature, top_p)
 
         return [
-            self.tokenizer.decode(
-                self._emb_to_tokens(xt_emb)[b].tolist(),
-                skip_special_tokens=True,
-            )
+            self.tokenizer.decode(token_ids_batch[b].tolist(), skip_special_tokens=True)
             for b in range(B)
-        ] # type: ignore
+        ]  # type: ignore
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -434,9 +350,12 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    ckpt_path = sys.argv[1] if len(sys.argv) > 1 else None
+    if len(sys.argv) < 2:
+        print("Usage: python sampler_v3.py <checkpoint_path>")
+        sys.exit(1)
 
-    state     = torch.load(ckpt_path, map_location="cpu", weights_only=False) # type: ignore
+    ckpt_path = sys.argv[1]
+    state     = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     model_cfg = state["model_cfg"]
     model     = build_model(model_cfg)
     model.load_state_dict(state["model_state"])
@@ -448,23 +367,36 @@ if __name__ == "__main__":
     prompt = "Once upon a time"
     print(f"\nPrompt: {prompt!r}\n")
 
+    # Greedy
+    out = sampler.generate(
+        prompt=prompt, gen_len=64, steps=100,
+        mode="argmax", use_self_cond=True, verbose=True,
+    )
+    print(f"[argmax] {out}\n")
+
+    # Confidence-guided
+    out = sampler.generate(
+        prompt=prompt, gen_len=64, steps=100,
+        mode="confidence", confidence_threshold=0.7, anchor_every=5,
+        use_self_cond=True, verbose=True,
+    )
+    print(f"[confidence] {out}\n")
+
+    # Top-p sampling con diverse temperature
     for temp in (0.8, 1.0, 1.3):
         out = sampler.generate(
-            prompt=prompt,
-            gen_len=64,
-            steps=32,
-            mode="confidence",
-            temperature=temp,
+            prompt=prompt, gen_len=64, steps=100,
+            mode="sample", temperature=temp, top_p=0.9,
             use_self_cond=True,
         )
-        print(f"[confidence t={temp}] {out}")
+        print(f"[sample t={temp}] {out}")
 
-    out = sampler.generate(
-        prompt=prompt,
-        gen_len=64,
-        steps=32,
-        mode="sample",
-        temperature=1.0,
-        top_p=0.9,
+    # Batch
+    print("\n--- Batch ---")
+    outs = sampler.generate_batch(
+        prompts=["Once upon a time", "The quick brown fox"],
+        gen_len=64, steps=100, mode="confidence",
+        confidence_threshold=0.7, anchor_every=5,
     )
-    print(f"[sample     t=1.0] {out}")
+    for p, o in zip(["Once upon a time", "The quick brown fox"], outs):
+        print(f"[{p!r}] {o}")

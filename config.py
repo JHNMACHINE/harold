@@ -7,7 +7,7 @@ import torch
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ModelConfig — Harold v3 ~200M parametri (test architettura su singola GPU)
+# ModelConfig — Harold v3
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -17,10 +17,10 @@ class ModelConfig:
     mask_token_id:  int   = 103     # [MASK] in bert
 
     # ── Architettura ──────────────────────────────────────────────────────
-    d_model:    int = 768    # head_dim = 768/12 = 64
+    d_model:    int = 768
     n_layers:   int = 12
     n_heads:    int = 12
-    n_kv_heads: int = 4      # GQA: ratio 3:1
+    n_kv_heads: int = 4
     d_ff:       int = 2048
 
     # ── MoE ───────────────────────────────────────────────────────────────
@@ -28,18 +28,22 @@ class ModelConfig:
     moe_top_k:               int = 2
     ds_moe_n_shared_experts: int = 2
 
-    # ── MLA (Multi-head Latent Attention) ─────────────────────────────────
-    mla_latent_dim: int = 96    # d_model / 8
+    # ── MLA ───────────────────────────────────────────────────────────────
+    mla_latent_dim: int = 96
 
-    # ── DSA (Sparse Attention) ────────────────────────────────────────────
+    # ── DSA ───────────────────────────────────────────────────────────────
     dsa_window_size:  int = 256
     dsa_global_every: int = 64
 
-    # ── Sequenza & Positional ─────────────────────────────────────────────
+    # ── Sequenza ──────────────────────────────────────────────────────────
     max_seq_len: int = 512
     block_size:  int = 512
 
-    # ── Diffusion ─────────────────────────────────────────────────────────
+    # ── Diffusion VP-SDE ──────────────────────────────────────────────────
+    diffusion_beta_min: float = 0.1
+    diffusion_beta_max: float = 20.0
+
+    # diffusion_T mantenuto per compatibilità con vecchi checkpoint
     diffusion_T: int = 64
 
     # ── Training ──────────────────────────────────────────────────────────
@@ -54,14 +58,14 @@ def get_model_config() -> ModelConfig:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TrainConfig — Harold v3 singola A6000
+# TrainConfig — Harold v3
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class TrainConfig:
     # ── Training ──────────────────────────────────────────────────────────
     batch_size:    int   = 16
-    grad_accum:    int   = 8       # batch virtuale = 16×8 = 128
+    grad_accum:    int   = 8
     max_iters:     int   = 20000
     lr:            float = 2e-4
     seq_len:       int   = 256
@@ -88,8 +92,8 @@ class TrainConfig:
     c4_weight:          float = 0.15
     owt_weight:         float = 0.15
 
-    # ── Token weights per noise schedule ──────────────────────────────────
-    token_weights_path: str = "token_weights.pt"
+    # ── Token weights (opzionale) ──────────────────────────────────────────
+    token_weights_path: str = "token_weights/token_weights.pt"
 
     # ── Checkpoint ────────────────────────────────────────────────────────
     checkpoint_dir:    str = "checkpoints_v3"
@@ -97,7 +101,7 @@ class TrainConfig:
     preload:           str = "latest"
     save_every:        int = 1000
 
-    # ── Campi runtime ─────────────────────────────────────────────────────
+    # ── Runtime ───────────────────────────────────────────────────────────
     device: str = field(init=False)
     dtype:  str = field(init=False)
 
@@ -112,11 +116,7 @@ class TrainConfig:
 
     @property
     def ptdtype(self) -> torch.dtype:
-        return {
-            "float16":  torch.float16,
-            "bfloat16": torch.bfloat16,
-            "float32":  torch.float32,
-        }[self.dtype]
+        return {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[self.dtype]
 
     @property
     def ctx(self):
@@ -131,8 +131,6 @@ class TrainConfig:
     @property
     def effective_batch_size(self) -> int:
         return self.batch_size * self.grad_accum
-
-    # ── Paths checkpoint ──────────────────────────────────────────────────
 
     def ckpt_path(self, iter_num: int) -> str:
         return str(Path(self.checkpoint_dir) / f"{self.checkpoint_prefix}_{iter_num:07d}.pt")
@@ -154,13 +152,9 @@ class TrainConfig:
             d = json.load(f)
         return d["iter_num"], d["path"]
 
-    # ── Multi-GPU (per scalare a FSDP in futuro) ──────────────────────────
-    # Questi campi non vengono usati con singola GPU ma sono pronti
-    # per quando si passa a torchrun + FSDP
-
     @property
     def is_main_process(self) -> bool:
-        return True   # singola GPU: sempre True
+        return True
 
     @property
     def world_size(self) -> int:
@@ -170,10 +164,6 @@ class TrainConfig:
 def get_train_config() -> TrainConfig:
     return TrainConfig()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers checkpoint
-# ─────────────────────────────────────────────────────────────────────────────
 
 def get_weights_file_path(config: TrainConfig, iter_num: int) -> str:
     return config.ckpt_path(iter_num)

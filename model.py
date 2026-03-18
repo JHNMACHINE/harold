@@ -1,48 +1,40 @@
 """
 Harold v3 — model.py
 =====================
-Architettura 1B con stack completa:
-
-  Attention:
-    - MLA  (Multi-head Latent Attention) — KV cache compressa 4-8x
-    - DSA  (sparse attention) — window locale + global tokens
-    - GQA  — query heads > kv heads
-    - RoPE — positional encoding rotazionale
-
-  FFN:
-    - DeepSeekMoE — shared SwiGLU (sempre attivi) + routed GELU (top-k)
-    - Router t-condizionato (Mixture of Diffusions)
-    - Top-k fisso in training, dinamico (threshold) in inferenza
-
-  Conditioning:
-    - AdaLN — adaptive layer norm condizionata su t_emb + self_cond
-    - Self-conditioning — hint dalla predizione al timestep precedente
+Architettura con VP-SDE continuous diffusion.
 
   Diffusion:
-    - Continuous diffusion — predice embedding invece di logit discreti
-    - Token-weighted schedule — maschera prima i token informativi
-    - Cosine schedule base invariato
+    - VP-SDE (Variance Preserving SDE) con beta_min/beta_max
+    - Modello predice il rumore ε (epsilon prediction)
+    - Score matching loss sui token non-padding
+    - CE ausiliaria weight-tied per stabilizzazione e decoding
+    - compute_loss centralizzato nel modello (gestisce self-cond internamente)
 
-  Modifiche rispetto a v2:
-    - Gate tanh rimosse (erano inizializzate a 1, ma più pulito senza)
-    - lm_head proietta su d_model invece di vocab_size (continuous)
-    - Harold.forward accetta xt_emb (B,L,d_model) invece di xt (B,L)
-    - Loss: MSE embedding + 0.1 * CE ausiliaria per stabilità
+  Fix rispetto alla versione precedente:
+    - [FIX #1] compute_loss: score matching (MSE su ε) + CE ausiliaria
+               accetta fixed_t per valutazione per-timestep
+               gestisce self_cond_prob internamente
+    - [FIX #2] VP-SDE schedule sostituisce masking discreto
+    - [FIX #3] shared_out diviso fuori dal loop
+    - [FIX #4] self_cond sempre .detach()
+    - [FIX #5] eps_pred con init standard std=0.02
+    - [FIX #6] modello predice ε invece di x0
+    - [FIX #7] get_timestep_embedding riscalato *1000 per t in [0,1]
 """
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional, Tuple, List, Dict
 from config import ModelConfig
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Expert e SharedExpert — invariati da v2
+# Expert e SharedExpert
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Expert(nn.Module):
-    """MLP expert con attivazione GELU."""
     def __init__(self, n_embd: int, hidden_dim: int, dropout: float = 0.0):
         super().__init__()
         self.net = nn.Sequential(
@@ -57,7 +49,6 @@ class Expert(nn.Module):
 
 
 class SharedExpert(nn.Module):
-    """Shared expert con SwiGLU — sempre attivo su tutti i token."""
     def __init__(self, n_embd: int, hidden_dim: int, dropout: float = 0.0):
         super().__init__()
         self.w1      = nn.Linear(n_embd, hidden_dim, bias=False)
@@ -70,19 +61,10 @@ class SharedExpert(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DeepSeekMoELayer v3 — router t-condizionato + top-k dinamico
+# DeepSeekMoELayer
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DeepSeekMoELayer(nn.Module):
-    """
-    DeepSeek-style MoE v3:
-      - N shared experts SwiGLU (sempre attivi)
-      - E routed experts GELU (top-k selezionati per token)
-      - Router t-condizionato: input = [x, t_emb] → Mixture of Diffusions
-      - Top-k fisso durante training (efficienza GPU)
-      - Top-k dinamico con threshold durante inferenza (flessibilità)
-      - Router bias adattivo per load balancing
-    """
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.n_routed_experts  = config.moe_n_routed_experts
@@ -101,120 +83,99 @@ class DeepSeekMoELayer(nn.Module):
             for _ in range(self.n_routed_experts)
         ])
 
-        # Router t-condizionato: input = concat(x, t_emb) → 2 * d_model
-        # Inizializzazione con std piccolo per stabilità
         self.router = nn.Linear(config.d_model * 2, self.n_routed_experts, bias=False)
         nn.init.normal_(self.router.weight, std=0.01)
 
         self.register_buffer("router_bias", torch.zeros(self.n_routed_experts))
-        self.router_indices: torch.Tensor | None = None
+        self.router_indices: Optional[torch.Tensor] = None
 
     def _affinity(self, x_flat: torch.Tensor, t_emb_flat: torch.Tensor) -> torch.Tensor:
-        """Router condizionato su x e t — Mixture of Diffusions."""
-        router_input = torch.cat([x_flat, t_emb_flat], dim=-1)  # (N, 2*d_model)
-        return torch.sigmoid(self.router(router_input).float())
+        return torch.sigmoid(self.router(torch.cat([x_flat, t_emb_flat], dim=-1)).float())
 
     def _compute_threshold(self, t_normalized: float) -> float:
-        """
-        Threshold t-dipendente per top-k dinamico:
-          t alto (molto rumore) → threshold più bassa → più esperti attivi
-          t basso (poco rumore) → threshold più alta  → meno esperti attivi
-        """
-        return self.threshold_base - (
-            (self.threshold_base - self.threshold_min) * t_normalized
-        )
+        return self.threshold_base - (self.threshold_base - self.threshold_min) * t_normalized
 
     def forward(
         self,
-        x:           torch.Tensor,
-        t_emb:       torch.Tensor,
-        t_normalized: float | None = None,  # None = training (top-k fisso)
+        x:            torch.Tensor,
+        t_emb:        torch.Tensor,
+        t_normalized: Optional[float] = None,
     ) -> torch.Tensor:
-        B, T, C = x.shape
-        x_flat  = x.view(-1, C)
-
-        # Espandi t_emb su tutti i token: (B, d_model) → (B*T, d_model)
+        B, T, C    = x.shape
+        x_flat     = x.view(-1, C)
         t_emb_flat = t_emb.unsqueeze(1).expand(B, T, C).reshape(-1, C)
 
-        # Shared experts (sempre attivi)
+        # [FIX #3] divide UNA VOLTA fuori dal loop
         shared_out = torch.zeros_like(x_flat)
         for expert in self.shared_experts:
             shared_out += expert(x_flat)
+        shared_out = shared_out / len(self.shared_experts)
 
-        # Router t-condizionato
         s          = self._affinity(x_flat, t_emb_flat)
         sel_scores = s + self.router_bias.to(s.device)  # type: ignore
 
-        # Selezione esperti: top-k fisso in training, dinamico in inferenza
         if self.training or t_normalized is None:
             topk_indices = torch.topk(sel_scores, self.top_k, dim=-1).indices
         else:
-            threshold = self._compute_threshold(t_normalized)
-            active    = sel_scores > threshold
-            n_active  = active.sum(dim=-1).clamp(self.top_k_min, self.n_routed_experts)
-            k_max     = int(n_active.max().item())
+            threshold    = self._compute_threshold(t_normalized)
+            k_max        = int(
+                (sel_scores > threshold).sum(dim=-1)
+                .clamp(self.top_k_min, self.n_routed_experts).max().item()
+            )
             topk_indices = torch.topk(sel_scores, k_max, dim=-1).indices
-            # Maschera esperti sotto threshold
-            topk_scores = sel_scores.gather(1, topk_indices)
-            invalid     = topk_scores <= threshold
-            topk_indices = topk_indices.masked_fill(invalid, -1)
+            topk_scores  = sel_scores.gather(1, topk_indices)
+            topk_indices = topk_indices.masked_fill(topk_scores <= threshold, -1)
 
         self.router_indices = topk_indices.detach()
 
-        # Gating normalizzato
         valid_mask = topk_indices >= 0
-        s_sel = s.gather(dim=1, index=topk_indices.clamp(min=0))
-        s_sel = s_sel * valid_mask.to(s_sel.dtype)
-        denom = s_sel.sum(dim=1, keepdim=True)
-        gates = torch.where(
+        s_sel      = s.gather(dim=1, index=topk_indices.clamp(min=0)) * valid_mask.to(s.dtype)
+        denom      = s_sel.sum(dim=1, keepdim=True)
+        gates      = torch.where(
             denom > 1e-9,
             s_sel / (denom + 1e-9),
             torch.full_like(s_sel, 1.0 / self.top_k),
         ).to(x.dtype)
 
-        # Routed experts
         routed_out = torch.zeros_like(x_flat)
         for i in range(self.n_routed_experts):
-            mask             = (topk_indices == i)
-            row_idx, which_k = mask.nonzero(as_tuple=True)
+            row_idx, which_k = (topk_indices == i).nonzero(as_tuple=True)
             if row_idx.numel() == 0:
                 continue
-            expert_out  = self.routed_experts[i](x_flat.index_select(0, row_idx))
-            gate_values = gates[row_idx, which_k].unsqueeze(1)
-            routed_out.index_add_(0, row_idx, expert_out * gate_values)
+            expert_out = self.routed_experts[i](x_flat.index_select(0, row_idx))
+            routed_out.index_add_(0, row_idx, expert_out * gates[row_idx, which_k].unsqueeze(1))
 
-        return (shared_out + routed_out).view(B, T, C)
+        return ((shared_out + routed_out) / (len(self.shared_experts) + self.top_k)).view(B, T, C)
 
     @torch.no_grad()
     def update_bias(self):
         if self.router_indices is None:
             return
-        valid   = self.router_indices[self.router_indices >= 0]
+        valid = self.router_indices[self.router_indices >= 0]
         if valid.numel() == 0:
             return
-        counts  = torch.bincount(valid.view(-1), minlength=self.n_routed_experts)
-        counts  = counts.float().to(self.router_bias.device)  # type: ignore
+        counts = torch.bincount(valid.view(-1), minlength=self.n_routed_experts).float()
+        counts = counts.to(self.router_bias.device)  # type: ignore
         self.router_bias += self.bias_update_gamma * (counts.mean() - counts).sign()
         self.router_indices = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RoPE — invariato da v2
+# RoPE
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, head_dim: int, max_seq_len: int, theta: float = 10000.0):
         super().__init__()
         freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        t     = torch.arange(max_seq_len, dtype=torch.float32)
-        emb   = torch.outer(t, freqs)
+        emb   = torch.outer(torch.arange(max_seq_len, dtype=torch.float32), freqs)
         self.register_buffer("cos_cached", torch.cat([torch.cos(emb), torch.cos(emb)], dim=-1))
         self.register_buffer("sin_cached", torch.cat([torch.sin(emb), torch.sin(emb)], dim=-1))
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-        half = x.shape[-1] // 2
-        return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
+        h = x.shape[-1] // 2
+        return torch.cat([-x[..., h:], x[..., :h]], dim=-1)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, offset: int = 0):
         T   = q.shape[2]
@@ -224,152 +185,87 @@ class RotaryEmbedding(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BlockCausalAttention v3 — MLA + DSA
+# BlockCausalAttention — MLA + DSA
 # ─────────────────────────────────────────────────────────────────────────────
 
 class BlockCausalAttention(nn.Module):
-    """
-    Attenzione v3 con MLA e DSA:
-
-    MLA (Multi-head Latent Attention):
-      - Comprimi K e V in spazio latente (latent_dim << n_kv_heads * head_dim)
-      - KV cache salva solo c_kv (latent) → 4-8x meno memoria
-      - K e V vengono ricostruiti al momento dell'uso
-
-    DSA (Sparse Attention):
-      - Ogni token vede una finestra locale di window_size token
-      - Ogni dsa_global_every token è un global token che vede tutto
-      - Complessità: O(n × window) invece di O(n²)
-      - Mantiene la block-causal semantics originale (OR con sparse mask)
-    """
     def __init__(self, config: ModelConfig):
         super().__init__()
         assert config.d_model % config.n_heads == 0
         assert config.n_heads % config.n_kv_heads == 0
 
-        self.n_heads      = config.n_heads
-        self.n_kv_heads   = config.n_kv_heads
-        self.n_kv_groups  = config.n_heads // config.n_kv_heads
-        self.head_dim     = config.d_model // config.n_heads
-        self.block_size   = config.block_size
-        self.dropout      = config.dropout
+        self.n_heads     = config.n_heads
+        self.n_kv_groups = config.n_heads // config.n_kv_heads
+        self.head_dim    = config.d_model // config.n_heads
+        self.block_size  = config.block_size
+        self.dropout     = config.dropout
 
-        # MLA: proiezioni latenti invece di k_proj/v_proj diretti
         self.latent_dim = config.mla_latent_dim
-        self.q_proj   = nn.Linear(config.d_model, config.n_heads * self.head_dim, bias=False)
-        self.kv_down  = nn.Linear(config.d_model, self.latent_dim, bias=False)
-        self.k_up     = nn.Linear(self.latent_dim, config.n_kv_heads * self.head_dim, bias=False)
-        self.v_up     = nn.Linear(self.latent_dim, config.n_kv_heads * self.head_dim, bias=False)
-        self.o_proj   = nn.Linear(config.n_heads * self.head_dim, config.d_model, bias=False)
+        self.q_proj  = nn.Linear(config.d_model, config.n_heads * self.head_dim, bias=False)
+        self.kv_down = nn.Linear(config.d_model, self.latent_dim, bias=False)
+        self.k_up    = nn.Linear(self.latent_dim, config.n_kv_heads * self.head_dim, bias=False)
+        self.v_up    = nn.Linear(self.latent_dim, config.n_kv_heads * self.head_dim, bias=False)
+        self.o_proj  = nn.Linear(config.n_heads * self.head_dim, config.d_model, bias=False)
 
-        # DSA: parametri per window e global tokens
         self.window_size  = config.dsa_window_size
         self.global_every = config.dsa_global_every
-
-        self.rope       = RotaryEmbedding(self.head_dim, config.max_seq_len, config.rope_theta)
-        self.resid_drop = nn.Dropout(config.dropout)
+        self.rope         = RotaryEmbedding(self.head_dim, config.max_seq_len, config.rope_theta)
+        self.resid_drop   = nn.Dropout(config.dropout)
 
     def _build_sparse_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        """
-        Maschera sparse: combina DSA (window + global) con block-causal.
-
-        mask[i,j] = True → posizione j NON visibile da i (attention = -inf)
-
-        Visibile se:
-          - j è nella finestra locale di i (|i-j| <= window_size)
-          - j è un global token (j % global_every == 0)
-          - block(j) <= block(i) (block-causal: non vedere il futuro inter-block)
-        """
-        idx       = torch.arange(seq_len, device=device)
-        block_idx = idx // self.block_size
-
-        # Maschera block-causal: True se j è in blocco futuro rispetto a i
-        future_block = block_idx.unsqueeze(0) > block_idx.unsqueeze(1)
-
-        # Maschera window locale: True se j è fuori finestra
-        dist = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs()
-        outside_window = dist > self.window_size
-
-        # Token globali: visibili sempre (override window)
-        is_global = (idx % self.global_every == 0)
-        global_visible = is_global.unsqueeze(0).expand(seq_len, seq_len)
-
-        # Visibile se: (nella finestra OR global token) AND non blocco futuro
-        mask = (outside_window & ~global_visible) | future_block
-        return mask  # bool
+        idx            = torch.arange(seq_len, device=device)
+        block_idx      = idx // self.block_size
+        future_block   = block_idx.unsqueeze(0) > block_idx.unsqueeze(1)
+        outside_window = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs() > self.window_size
+        global_visible = (idx % self.global_every == 0).unsqueeze(0).expand(seq_len, seq_len)
+        return (outside_window & ~global_visible) | future_block
 
     def forward(
         self,
         x:         torch.Tensor,
-        past_kv:   torch.Tensor | None = None,   # MLA: cache di c_kv invece di (k,v)
+        past_kv:   Optional[torch.Tensor] = None,
         use_cache: bool = False,
         kv_offset: int  = 0,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         B, T, C = x.shape
 
-        # Query — invariata
-        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        q    = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        c_kv = self.kv_down(x)
+        k    = self.k_up(c_kv).view(B, T, -1, self.head_dim).transpose(1, 2)
+        v    = self.v_up(c_kv).view(B, T, -1, self.head_dim).transpose(1, 2)
 
-        # MLA: comprimi in spazio latente
-        c_kv = self.kv_down(x)  # (B, T, latent_dim) — questo va in cache
-        k    = self.k_up(c_kv).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v    = self.v_up(c_kv).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
-
-        # RoPE su q e k
         q, k = self.rope(q, k, offset=kv_offset)
 
-        # KV cache MLA: concatena c_kv latente (molto più piccolo di k,v)
         if past_kv is not None:
-            c_kv_full = torch.cat([past_kv, c_kv], dim=1)   # (B, past+T, latent_dim)
-            k = self.k_up(c_kv_full).view(B, -1, self.n_kv_heads, self.head_dim).transpose(1, 2)
-            v = self.v_up(c_kv_full).view(B, -1, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            c_kv_full = torch.cat([past_kv, c_kv], dim=1)
+            k = self.k_up(c_kv_full).view(B, -1, -1, self.head_dim).transpose(1, 2)
+            v = self.v_up(c_kv_full).view(B, -1, -1, self.head_dim).transpose(1, 2)
         else:
             c_kv_full = c_kv
 
-        full_len = k.shape[2]
+        full_len  = k.shape[2]
+        k_exp     = k.repeat_interleave(self.n_kv_groups, dim=1)
+        v_exp     = v.repeat_interleave(self.n_kv_groups, dim=1)
 
-        # GQA: espandi k/v
-        k_exp = k.repeat_interleave(self.n_kv_groups, dim=1)
-        v_exp = v.repeat_interleave(self.n_kv_groups, dim=1)
-
-        # DSA: maschera sparse
-        mask = self._build_sparse_mask(full_len, x.device)
+        mask      = self._build_sparse_mask(full_len, x.device)
         if T < full_len:
-            mask = mask[-T:, :]
-
+            mask  = mask[-T:, :]
         attn_bias = torch.zeros(T, full_len, device=x.device, dtype=x.dtype)
-        attn_bias = attn_bias.masked_fill(mask, float("-inf"))
-        attn_bias = attn_bias.unsqueeze(0).unsqueeze(0)
+        attn_bias = attn_bias.masked_fill(mask, float("-inf")).unsqueeze(0).unsqueeze(0)
 
         y = F.scaled_dot_product_attention(
-            q, k_exp, v_exp,
-            attn_mask=attn_bias,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=False,
+            q, k_exp, v_exp, attn_mask=attn_bias,
+            dropout_p=self.dropout if self.training else 0.0, is_causal=False,
         )
-
-        y   = y.transpose(1, 2).contiguous().view(B, T, C)
-        out = self.resid_drop(self.o_proj(y))
-
-        # Salva c_kv latente nella cache (4x più piccolo di k,v separati)
-        present_kv = c_kv_full if use_cache else None
-        return out, present_kv
+        out = self.resid_drop(self.o_proj(y.transpose(1, 2).contiguous().view(B, T, C)))
+        return out, (c_kv_full if use_cache else None)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AdaLN v3 — con self-conditioning
+# AdaLN
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AdaLN(nn.Module):
-    """
-    Adaptive Layer Norm v3 con self-conditioning:
-      out = norm(x) * (1 + scale) + shift
-      scale, shift = proj(t_emb + self_cond_emb)
-
-    self_cond_emb è la predizione del timestep precedente proiettata
-    nello stesso spazio di t_emb — permette al modello di usare
-    il proprio output precedente come hint per il passo corrente.
-    """
     def __init__(self, d_model: int):
         super().__init__()
         self.norm = nn.LayerNorm(d_model, elementwise_affine=False)
@@ -378,26 +274,15 @@ class AdaLN(nn.Module):
         nn.init.zeros_(self.proj.bias)
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
-        """
-        t_emb può già incorporare il self-conditioning se sommato a monte
-        in Harold.forward — AdaLN non ha bisogno di saperlo.
-        """
         scale, shift = self.proj(t_emb).chunk(2, dim=-1)
         return self.norm(x) * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Block v3
+# Block
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Block(nn.Module):
-    """
-    Transformer block v3:
-      - AdaLN con self-conditioning (incorporato in t_emb a monte)
-      - BlockCausalAttention v3 (MLA + DSA)
-      - DeepSeekMoELayer v3 (router t-condizionato)
-      - Residual standard (gate tanh rimossi — erano fonte di instabilità)
-    """
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.ada_ln_1 = AdaLN(config.d_model)
@@ -409,159 +294,129 @@ class Block(nn.Module):
         self,
         x:            torch.Tensor,
         t_emb:        torch.Tensor,
-        past_kv:      torch.Tensor | None = None,
-        use_cache:    bool  = False,
-        kv_offset:    int   = 0,
-        t_normalized: float | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-
+        past_kv:      Optional[torch.Tensor] = None,
+        use_cache:    bool = False,
+        kv_offset:    int  = 0,
+        t_normalized: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         attn_out, present_kv = self.attn(
             self.ada_ln_1(x, t_emb),
-            past_kv=past_kv,
-            use_cache=use_cache,
-            kv_offset=kv_offset,
+            past_kv=past_kv, use_cache=use_cache, kv_offset=kv_offset,
         )
-        x = x + attn_out
-        x = x + self.moe(self.ada_ln_2(x, t_emb), t_emb, t_normalized=t_normalized)
-        return x, present_kv
+        x       = x + attn_out
+        moe_out = self.moe(self.ada_ln_2(x, t_emb), t_emb, t_normalized=t_normalized)
+        moe_out = moe_out / (moe_out.norm(dim=-1, keepdim=True).clamp(min=1.0))
+        return x + moe_out, present_kv
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MaskDiffusionSchedule v3 — token-weighted schedule
+# VP-SDE Schedule
 # ─────────────────────────────────────────────────────────────────────────────
 
-class MaskDiffusionSchedule(nn.Module):
+class VPSDESchedule(nn.Module):
     """
-    Cosine noise schedule v3 con token-weighted masking.
+    Variance Preserving SDE schedule.
 
-    Token-weighted: la probabilità di masking è modulata per token:
-      - Token rari (informativi) → mascherati prima (peso alto)
-      - Token comuni ("the","a") → mascherati dopo (peso basso)
+    Forward process: x_t = a(t)*x0 + o(t)*ε,  ε ~ N(0,I)
 
-    token_weights è una lookup table precomputata dalle frequenze
-    del dataset. Se non fornita, tutti i token hanno peso uguale
-    (comportamento identico a v2).
+      β(t)  = β_min + t*(β_max - β_min)
+      α²(t) = exp(-(β_min*t + 0.5*(β_max-β_min)*t²))
+      σ²(t) = 1 - α²(t)
+
+    t ∈ [0,1]:
+      t=0 → o≈1, o≈0  (dato pulito)
+      t=1 → o≈0, o≈1  (rumore puro)
     """
-    def __init__(self, config: ModelConfig, token_weights: torch.Tensor | None = None):
+    def __init__(self, beta_min: float = 0.1, beta_max: float = 20.0):
         super().__init__()
-        self.T             = config.diffusion_T
-        self.mask_token_id = config.mask_token_id
+        self.beta_min = beta_min
+        self.beta_max = beta_max
 
-        t      = torch.linspace(0, self.T, self.T + 1)
-        alphas = torch.cos((t / self.T) * math.pi / 2) ** 2
-        self.register_buffer("alphas", alphas)
+    def get_beta(self, t: torch.Tensor) -> torch.Tensor:
+        return self.beta_min + t * (self.beta_max - self.beta_min)
 
-        # Token weights: (vocab_size,) float in [0, 1]
-        if token_weights is not None:
-            w = token_weights.float()
-            w = (w - w.min()) / (w.max() - w.min() + 1e-8)
-        else:
-            w = torch.ones(config.vocab_size)
-        self.register_buffer("token_weights", w)
+    def get_alpha_sigma(self, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        beta_int = self.beta_min * t + 0.5 * (self.beta_max - self.beta_min) * t ** 2
+        alpha_sq = torch.exp(-beta_int)
+        alpha    = torch.sqrt(alpha_sq.clamp(min=0.0))
+        sigma    = torch.sqrt((1.0 - alpha_sq).clamp(min=1e-8))
+        return alpha, sigma
 
-    def q_sample(
+    def add_noise(
         self,
-        x0: torch.Tensor,   # (B, L) token IDs
-        t:  torch.Tensor,   # (B,)
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        alpha_t    = self.alphas[t]          # type: ignore  (B,)
-        base_prob  = 1.0 - alpha_t.unsqueeze(1)  # (B, 1)
+        x0: torch.Tensor,   # (B, L, D)
+        t:  torch.Tensor,   # (B,) in [0,1]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """x_t = a(t)*x0 + o(t)*ε. Ritorna (x_t, ε)."""
+        alpha, sigma = self.get_alpha_sigma(t)
+        eps = torch.randn_like(x0)
+        x_t = alpha.view(-1, 1, 1) * x0 + sigma.view(-1, 1, 1) * eps
+        return x_t, eps
 
-        # Peso per ogni token nella sequenza
-        tok_w = self.token_weights[x0]       # type: ignore  (B, L)
-
-        # Scala la probabilità: token importanti → più facile da mascherare
-        # range: [base_prob * 0.5, base_prob * 1.5]
-        scaled_prob = base_prob * (0.5 + tok_w)
-        scaled_prob = scaled_prob.clamp(0.0, 1.0)
-
-        mask = torch.bernoulli(scaled_prob).bool()
-        xt   = x0.clone()
-        xt[mask] = self.mask_token_id
-        return xt, mask
-
-    def get_alpha(self, t: torch.Tensor) -> torch.Tensor:
-        return self.alphas[t]  # type: ignore
+    def get_snr(self, t: torch.Tensor) -> torch.Tensor:
+        alpha, sigma = self.get_alpha_sigma(t)
+        return (alpha / sigma.clamp(min=1e-8)) ** 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Harold v3 — continuous diffusion + self-conditioning
+# Harold v3 — VP-SDE Continuous Diffusion
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Harold(nn.Module):
     """
-    Harold v3 — DiffusionMoE con continuous diffusion e self-conditioning.
+    Harold v3 — Continuous Diffusion con VP-SDE.
 
-    Differenze chiave rispetto a v2:
+    Pipeline training:
+      1. x0_emb = token_emb(x0)
+      2. x_t, ε = schedule.add_noise(x0_emb, t)    t ~ U[0,1]
+      3. ε_pred = forward(x_t, t, self_cond)
+      4. loss   = MSE(ε_pred, ε)[mask] + λ*CE(ce_logits, x0)[mask]
 
-    Continuous diffusion:
-      - Input: xt_emb (B, L, d_model) embedding continui invece di token IDs
-      - Output: x0_pred (B, L, d_model) embedding predetti invece di logit
-      - Loss: MSE(x0_pred, emb(x0)) + 0.1 * CE(x0_pred @ W_emb^T, x0)
-      - Nearest neighbor per decodifica: argmin dist(x0_pred, W_emb)
-
-    Self-conditioning:
-      - Con prob 0.5 durante training: passa la predizione precedente come hint
-      - self_cond_proj proietta x0_prev nello spazio di t_emb
-      - t_emb_sc = t_emb + self_cond_proj(x0_prev.mean(dim=1))
-      - Init a zero → no-op all'inizio del training
-
-    forward accetta:
-      xt_emb:    (B, L, d_model) — embedding corrotti
-      t:         (B,)            — timestep
-      self_cond: (B, d_model) | None — embedding medio della predizione precedente
+    Pipeline inferenza:
+      - Parti da rumore puro x_1 ~ N(0,I)
+      - Integra reverse SDE con Euler-Maruyama da t=1 a t=0
+      - Decodifica finale con ce_logits.argmax o nearest-neighbor
     """
-    def __init__(self, config: ModelConfig, token_weights: torch.Tensor | None = None):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config        = config
         self.d_model       = config.d_model
-        self.mask_token_id = config.mask_token_id
+        emb_vocab          = config.vocab_size + 1
+        self.emb_vocab     = emb_vocab
+        self.mask_token_id = config.vocab_size
 
-        # Vocabulary size per embedding e nearest neighbor lookup
-        emb_vocab = max(config.vocab_size, config.mask_token_id) + 1
-        self.emb_vocab = emb_vocab
-
-        # Token embedding — usato per:
-        #   1. Convertire token ID in embedding (input al modello)
-        #   2. Nearest neighbor lookup nella decodifica
         self.token_emb = nn.Embedding(emb_vocab, config.d_model, padding_idx=0)
         self.pos_emb   = nn.Embedding(config.max_seq_len, config.d_model)
 
-        # Timestep MLP — invariato
         self.time_emb = nn.Sequential(
             nn.Linear(config.d_model, config.d_model * 4),
             nn.SiLU(),
             nn.Linear(config.d_model * 4, config.d_model),
         )
 
-        # Self-conditioning projection
-        # Proietta x0_prev (media degli embedding) nello spazio di t_emb
-        # Init a zero: no-op all'inizio, il modello impara quando usarlo
         self.self_cond_proj = nn.Linear(config.d_model, config.d_model, bias=False)
-        nn.init.zeros_(self.self_cond_proj.weight)
+        nn.init.normal_(self.self_cond_proj.weight, std=0.02)
 
-        # Frequenze sinusoidali per il timestep
+        # [FIX #7] Frequenze per sinusoidi — t verrà riscalato *1000
         half  = config.d_model // 2
-        freqs = torch.exp(
-            -math.log(10000) * torch.arange(half, dtype=torch.float32) / half
-        )
+        freqs = torch.exp(-math.log(10000) * torch.arange(half, dtype=torch.float32) / half)
         self.register_buffer("t_freqs", freqs)
 
-        # Transformer blocks
         self.blocks   = nn.ModuleList([Block(config) for _ in range(config.n_layers)])
         self.norm_out = nn.LayerNorm(config.d_model)
 
-        # lm_head v3: proietta su d_model invece di vocab_size (continuous diffusion)
-        # NON weight-tied: predice embedding, non logit
-        self.lm_head = nn.Linear(config.d_model, config.d_model, bias=False)
+        # [FIX #6] Predice ε (rumore) — non x0 né logit
+        self.eps_pred = nn.Linear(config.d_model, config.d_model, bias=False)
 
-        # Proiezione ausiliaria per la CE loss di stabilizzazione
-        # Weight-tied con token_emb per coerenza
-        self.ce_head = nn.Linear(config.d_model, emb_vocab, bias=False)
+        # CE head ausiliaria weight-tied con token_emb
+        self.ce_head        = nn.Linear(config.d_model, emb_vocab, bias=False)
         self.ce_head.weight = self.token_emb.weight
 
-        # Noise schedule
-        self.schedule = MaskDiffusionSchedule(config, token_weights)
+        # [FIX #2] VP-SDE schedule
+        self.schedule = VPSDESchedule(
+            beta_min=config.diffusion_beta_min,
+            beta_max=config.diffusion_beta_max,
+        )
 
         self._init_weights()
 
@@ -569,17 +424,21 @@ class Harold(nn.Module):
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 std = (0.02 / math.sqrt(2 * self.config.n_layers)
-                       if any(name.endswith(s) for s in ("o_proj", "w2", "v_up"))
+                       if any(name.endswith(s) for s in ("o_proj", "w2", "v_up", "eps_pred"))
                        else 0.02)
                 nn.init.normal_(module.weight, std=std)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, std=0.02)
-        # self_cond_proj rimane a zero (init sopra)
 
     def get_timestep_embedding(self, t: torch.Tensor) -> torch.Tensor:
-        args = t[:, None].float() * self.t_freqs[None]  # type: ignore
+        """
+        [FIX #7] Riscala t ∈ [0,1] → [0,1000] prima delle sinusoidi.
+        Senza questo, gli argomenti sarebbero quasi-zero → embedding
+        quasi costante → il modello non distingue i timestep.
+        """
+        args = (t.float() * 1000.0)[:, None] * self.t_freqs[None]  # type: ignore
         emb  = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if self.d_model % 2:
             emb = F.pad(emb, (0, 1))
@@ -587,108 +446,134 @@ class Harold(nn.Module):
 
     def forward(
         self,
-        xt_emb:          torch.Tensor,                  # (B, L, d_model) embedding corrotti
-        t:               torch.Tensor,                  # (B,)
-        self_cond:       torch.Tensor | None = None,    # (B, d_model) predizione precedente
-        past_key_values: list[torch.Tensor] | None = None,
+        x_t:             torch.Tensor,                   # (B, L, D)
+        t:               torch.Tensor,                   # (B,) float in [0,1]
+        self_cond:       Optional[torch.Tensor] = None,  # (B, D) già detached
+        past_key_values: Optional[List[torch.Tensor]] = None,
         use_cache:       bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, list | None]:
-        """
-        Returns:
-            x0_pred:  (B, L, d_model) embedding predetti
-            ce_logits: (B, L, V)      logit ausiliari per CE loss
-            present_key_values: lista di c_kv latenti (MLA cache)
-        """
-        B, L, _ = xt_emb.shape
-        device  = xt_emb.device
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[List]]:
+        B, L, _ = x_t.shape
+        device  = x_t.device
 
         kv_offset = past_key_values[0].shape[1] if past_key_values is not None else 0
+        pos       = torch.arange(kv_offset, kv_offset + L, device=device).unsqueeze(0).expand(B, -1)
+        x         = x_t + self.pos_emb(pos)
 
-        # Posizione encoding
-        pos = torch.arange(kv_offset, kv_offset + L, device=device).unsqueeze(0).expand(B, -1)
-        x   = xt_emb + self.pos_emb(pos)
+        t_emb = self.time_emb(self.get_timestep_embedding(t))
 
-        # Timestep embedding
-        t_emb = self.time_emb(self.get_timestep_embedding(t))  # (B, d_model)
-
-        # Self-conditioning: aggiungi hint dalla predizione precedente
+        # [FIX #4] self_cond sempre detached
         if self_cond is not None:
-            sc_emb = self.self_cond_proj(self_cond)  # (B, d_model)
-            t_emb  = t_emb + sc_emb
+            t_emb = t_emb + self.self_cond_proj(self_cond.detach())
 
-        # t normalizzato per top-k dinamico in inferenza
-        t_normalized = (t.float().mean() / self.config.diffusion_T).item() if not self.training else None
+        t_normalized = t.float().mean().item() if not self.training else None
 
         present_kvs = [] if use_cache else None
-
         for i, block in enumerate(self.blocks):
             past_kv = past_key_values[i] if past_key_values is not None else None
             x, present_kv = block(
                 x, t_emb,
-                past_kv=past_kv,
-                use_cache=use_cache,
-                kv_offset=kv_offset,
-                t_normalized=t_normalized,
+                past_kv=past_kv, use_cache=use_cache,
+                kv_offset=kv_offset, t_normalized=t_normalized,
             )
             if use_cache:
                 present_kvs.append(present_kv)  # type: ignore
 
-        x_out     = self.norm_out(x)
-        x0_pred   = self.lm_head(x_out)       # (B, L, d_model) — embedding predetti
-        ce_logits = self.ce_head(x_out)        # (B, L, V)       — logit ausiliari
+        x_out    = self.norm_out(x)
+        eps_pred = self.eps_pred(x_out)     # (B, L, D)
+        ce_logits = self.ce_head(x_out)     # (B, L, V)
 
-        return x0_pred, ce_logits, present_kvs
-
-    def decode_tokens(self, x0_pred: torch.Tensor) -> torch.Tensor:
-        """
-        Nearest neighbor lookup: trova il token più vicino per ogni posizione.
-        x0_pred: (B, L, d_model) → token_ids: (B, L)
-        """
-        # Distanza euclidea tra predizione e tutti gli embedding del vocabolario
-        # Usiamo prodotto scalare normalizzato (cosine similarity) per efficienza
-        emb_norm  = F.normalize(self.token_emb.weight, dim=-1)   # (V, d_model)
-        pred_norm = F.normalize(x0_pred, dim=-1)                  # (B, L, d_model)
-        sim       = torch.einsum("bld,vd->blv", pred_norm, emb_norm)  # (B, L, V)
-        return sim.argmax(dim=-1)  # (B, L)
+        return eps_pred, ce_logits, present_kvs
 
     def compute_loss(
         self,
-        x0_pred:   torch.Tensor,  # (B, L, d_model)
-        ce_logits: torch.Tensor,  # (B, L, V)
-        x0:        torch.Tensor,  # (B, L) token IDs originali
-        mask:      torch.Tensor,  # (B, L) bool
-        ce_weight: float = 0.1,
-    ) -> tuple[torch.Tensor, dict]:
+        x0:             torch.Tensor,                   # (B, L) token IDs
+        mask:           torch.Tensor,                   # (B, L) bool — token non-padding
+        ce_weight:      float = 0.1,
+        fixed_t:        Optional[torch.Tensor] = None,  # (B,) in [0,1] — per valutazione
+        self_cond_prob: float = 0.0,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Loss ibrida: MSE embedding + CE ausiliaria per stabilità.
-
-        La CE ausiliaria previene il collasso dello spazio embedding
-        nelle prime fasi del training, quando la MSE da sola è instabile.
+        Score matching loss per VP-SDE con SNR weighting.
+ 
+        Struttura:
+          1. t ~ U[0,1]  (o fixed_t per valutazione per-timestep)
+          2. x0_emb = token_emb(x0)
+          3. x_t, ε = schedule.add_noise(x0_emb, t)
+          4. (opz.) self-cond: primo forward senza hint → hint detached
+          5. ε_pred = forward(x_t, t, self_cond)
+          6. loss_score = SNR-weighted MSE(ε_pred, ε)[mask]
+          7. loss_ce    = CE(ce_logits[mask], x0[mask])
+          8. total = loss_score + ce_weight * loss_ce
+ 
+        SNR weighting (Min-SNR, Hang et al. 2023):
+          w(t) = SNR(t) / (SNR(t) + 1)  ∈ (0, 1)
+ 
+          - t alto (tanto rumore, SNR≈0) → w≈0 → contribuisce poco
+          - t basso (poco rumore, SNR>>1) → w→1 → contribuisce normalmente
+ 
+          Razionale: a t alto la loss MSE è naturalmente rumorosa perché
+          il segnale è quasi completamente corrotto. Pesarla meno stabilizza
+          i gradienti e fa convergere più velocemente i timestep bassi
+          (quelli che contano di più per la qualità finale della generazione).
         """
+        device = x0.device
+ 
         if mask.sum() == 0:
-            zero = torch.tensor(0.0, device=x0_pred.device, requires_grad=True)
-            return zero, {"mse": 0.0, "ce": 0.0, "total": 0.0}
-
-        # Target: embedding dei token originali
-        emb_target = self.token_emb(x0)  # (B, L, d_model)
-
-        # MSE loss sulle posizioni mascherate
-        loss_mse = F.mse_loss(x0_pred[mask], emb_target[mask].detach())
-
-        # CE loss ausiliaria per stabilità
-        loss_ce = F.cross_entropy(
-            ce_logits[mask],
-            x0[mask],
-            reduction="mean",
-        )
-
-        total = loss_mse + ce_weight * loss_ce
-
+            zero = torch.tensor(0.0, device=device, requires_grad=True)
+            return zero, {"score": 0.0, "ce": 0.0, "total": 0.0}
+ 
+        # ── Timestep ────────────────────────────────────────────────────────
+        B = x0.shape[0]
+        t = fixed_t if fixed_t is not None else torch.rand(B, device=device)
+ 
+        # ── Forward process ──────────────────────────────────────────────────
+        with torch.no_grad():
+            x0_emb = self.token_emb(x0)             # (B, L, D)
+        x_t, eps = self.schedule.add_noise(x0_emb, t)
+ 
+        # ── Self-conditioning ────────────────────────────────────────────────
+        self_cond: Optional[torch.Tensor] = None
+        if self_cond_prob > 0 and torch.rand(1).item() < self_cond_prob:
+            with torch.no_grad():
+                eps_prev, _, _ = self.forward(x_t, t, self_cond=None)
+            self_cond = eps_prev.mean(dim=1).detach()   # (B, D)
+ 
+        # ── Predizione ───────────────────────────────────────────────────────
+        eps_pred, ce_logits, _ = self.forward(x_t, t, self_cond=self_cond)
+ 
+        # ── SNR weighting ────────────────────────────────────────────────────
+        # w(t) = SNR(t) / (SNR(t) + 1)
+        # Clampato a snr_clip per evitare che t≈0 domini con peso enorme
+        snr_clip = 5.0
+        snr      = self.schedule.get_snr(t).clamp(max=snr_clip)   # (B,)
+        snr_w    = (snr / (snr + 1.0)).to(eps_pred.dtype)         # (B,) ∈ (0, 1)
+ 
+        # ── Score matching con SNR weighting ─────────────────────────────────
+        # MSE per token: (B, L, D) → media su D → (B, L)
+        per_token_mse = F.mse_loss(eps_pred, eps, reduction="none").mean(dim=-1)
+ 
+        # Applica peso SNR per batch item, poi media sui token mascherati
+        # snr_w: (B,) → (B, 1) per broadcasting su L
+        weighted_mse = per_token_mse * snr_w.unsqueeze(1)         # (B, L)
+        loss_score   = weighted_mse[mask].mean()
+ 
+        # ── CE ausiliaria ─────────────────────────────────────────────────────
+        loss_ce = F.cross_entropy(ce_logits[mask], x0[mask], reduction="mean")
+ 
+        total = loss_score + ce_weight * loss_ce
+ 
         return total, {
-            "mse":   loss_mse.item(),
+            "score": loss_score.item(),
             "ce":    loss_ce.item(),
             "total": total.item(),
         }
+
+    @torch.no_grad()
+    def decode_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        """Nearest neighbor lookup: cosine similarity con il vocabolario."""
+        emb_norm = F.normalize(self.token_emb.weight, dim=-1)
+        x_norm   = F.normalize(x, dim=-1)
+        return torch.einsum("bld,vd->blv", x_norm, emb_norm).argmax(dim=-1)
 
     @torch.no_grad()
     def update_router_biases(self):
@@ -696,5 +581,5 @@ class Harold(nn.Module):
             block.moe.update_bias()  # type: ignore
 
 
-def build_model(model_cfg: ModelConfig, token_weights: torch.Tensor | None = None) -> Harold:
-    return Harold(model_cfg, token_weights)
+def build_model(model_cfg: ModelConfig) -> Harold:
+    return Harold(model_cfg)
