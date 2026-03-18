@@ -16,11 +16,10 @@ Aggiunge:
 
 import os
 from typing import Iterator
-
-import numpy as np
 import torch
-from torch.utils.data import IterableDataset
 from transformers import PreTrainedTokenizer
+from torch.utils.data import IterableDataset, DataLoader
+from typing import Iterator, Optional
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -360,6 +359,328 @@ def build_loaders(train_cfg, tokenizer: PreTrainedTokenizer):
         batch_size=train_cfg.batch_size,
         num_workers=0,
         pin_memory=True,
+    )
+
+    return train_loader, val_loader
+
+"""
+===========================
+Dataset per Supervised Fine-Tuning (SFT) con CFG.
+
+Strati:
+  1. HuggingFaceH4/ultrachat_200k  — 200k conversazioni multi-turn
+  2. Open-Orca/OpenOrca            — 1M Q&A con chain-of-thought
+
+Formato output per ogni esempio:
+  {
+    "prompt_ids":   (L_ctx,)  token IDs del contesto (ultimi max_ctx_turns turni)
+    "response_ids": (L_resp,) token IDs della risposta da generare
+    "attention_mask": (L_resp,) bool — token non-padding
+  }
+
+CFG: il contesto viene usato come conditioning signal.
+     Con prob p_uncond viene sostituito con una sequenza vuota (zeros)
+     per abilitare il training unconditional.
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers di formattazione
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _format_turn(role: str, content: str) -> str:
+    """Formatta un singolo turno con marker di ruolo."""
+    role_tag = "User" if role == "user" else "Assistant"
+    return f"{role_tag}: {content.strip()}"
+
+
+def _build_context_and_response(
+    messages:      list,
+    max_ctx_turns: int,
+) -> tuple[str, str]:
+    """
+    Estrae contesto e risposta da una lista di messaggi.
+
+    Strategia:
+      - L'ultimo messaggio deve essere dell'assistente (la risposta target)
+      - Il contesto è composto dagli ultimi max_ctx_turns turni precedenti
+      - Se la conversazione è troppo corta, il contesto può essere vuoto
+
+    Returns:
+        (context_str, response_str)
+    """
+    # Trova l'ultimo turno dell'assistente
+    if not messages or messages[-1].get("role") != "assistant":
+        return "", ""
+
+    response = messages[-1]["content"].strip()
+    if not response:
+        return "", ""
+
+    # Prendi gli ultimi max_ctx_turns turni PRIMA della risposta
+    preceding = messages[:-1]
+    ctx_turns  = preceding[-max_ctx_turns:] if max_ctx_turns > 0 else []
+
+    context = " ".join(_format_turn(m["role"], m["content"]) for m in ctx_turns)
+    return context, response
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Iteratori per i dataset
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _iter_ultrachat(
+    tokenizer:      PreTrainedTokenizer,
+    split:          str,
+    max_ctx_len:    int,
+    max_resp_len:   int,
+    max_ctx_turns:  int,
+    val_every:      int,
+    seed:           int,
+) -> Iterator[dict]:
+    """Iteratore per HuggingFaceH4/ultrachat_200k."""
+    from datasets import load_dataset
+
+    ds = load_dataset(
+        "HuggingFaceH4/ultrachat_200k",
+        split="train_sft" if split == "train" else "test_sft",
+        streaming=True,
+    )
+    ds = ds.shuffle(buffer_size=1000, seed=seed)
+
+    doc_idx = 0
+    for example in ds:
+        messages = example.get("messages", [])
+        if len(messages) < 2:
+            doc_idx += 1
+            continue
+
+        is_val = (doc_idx % val_every == 0)
+        if (split == "val") != is_val:
+            doc_idx += 1
+            continue
+
+        context, response = _build_context_and_response(messages, max_ctx_turns)
+        if not response:
+            doc_idx += 1
+            continue
+
+        prompt_ids = tokenizer(
+            context, truncation=True, max_length=max_ctx_len,
+            add_special_tokens=False, return_attention_mask=False,
+        )["input_ids"] if context else []
+
+        resp_ids = tokenizer(
+            response, truncation=True, max_length=max_resp_len,
+            add_special_tokens=True, return_attention_mask=False,
+        )["input_ids"]
+
+        if len(resp_ids) < 4: # type: ignore
+            doc_idx += 1
+            continue
+
+        yield {
+            "prompt_ids":   prompt_ids,
+            "response_ids": resp_ids,
+        }
+        doc_idx += 1
+
+
+def _iter_openorca(
+    tokenizer:      PreTrainedTokenizer,
+    split:          str,
+    max_ctx_len:    int,
+    max_resp_len:   int,
+    val_every:      int,
+    seed:           int,
+) -> Iterator[dict]:
+    """
+    Iteratore per Open-Orca/OpenOrca.
+    Formato: {"system_prompt": ..., "question": ..., "response": ...}
+    """
+    from datasets import load_dataset
+
+    ds = load_dataset("Open-Orca/OpenOrca", split="train", streaming=True)
+    ds = ds.shuffle(buffer_size=1000, seed=seed)
+
+    doc_idx = 0
+    for example in ds:
+        is_val = (doc_idx % val_every == 0)
+        if (split == "val") != is_val:
+            doc_idx += 1
+            continue
+
+        system   = (example.get("system_prompt") or "").strip()
+        question = (example.get("question") or "").strip()
+        response = (example.get("response") or "").strip()
+
+        if not question or not response:
+            doc_idx += 1
+            continue
+
+        # Contesto = system prompt + domanda
+        context = f"{system} User: {question}".strip() if system else f"User: {question}"
+
+        prompt_ids = tokenizer(
+            context, truncation=True, max_length=max_ctx_len,
+            add_special_tokens=False, return_attention_mask=False,
+        )["input_ids"]
+
+        resp_ids = tokenizer(
+            response, truncation=True, max_length=max_resp_len,
+            add_special_tokens=True, return_attention_mask=False,
+        )["input_ids"]
+
+        if len(resp_ids) < 4: # type: ignore
+            doc_idx += 1
+            continue
+
+        yield {
+            "prompt_ids":   prompt_ids,
+            "response_ids": resp_ids,
+        }
+        doc_idx += 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SFTDataset — mix ultrachat + openorca
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SFTDataset(IterableDataset):
+    """
+    Dataset SFT che mixa UltraChat e OpenOrca in streaming.
+
+    Ogni batch contiene:
+      - prompt_ids:    (B, max_ctx_len)   token del contesto, paddato a sinistra
+      - response_ids:  (B, max_resp_len)  token della risposta, paddato a destra
+      - response_mask: (B, max_resp_len)  bool — token non-padding
+
+    Il padding usa 0 (padding_idx del modello).
+    """
+
+    DATASET_WEIGHTS = {
+        "ultrachat": 0.5,
+        "openorca":  0.5,
+    }
+
+    def __init__(
+        self,
+        tokenizer:     PreTrainedTokenizer,
+        split:         str   = "train",
+        max_ctx_len:   int   = 128,   # lunghezza massima del contesto
+        max_resp_len:  int   = 128,   # lunghezza massima della risposta
+        max_ctx_turns: int   = 3,     # ultimi N turni come contesto
+        val_every:     int   = 200,
+        seed:          int   = 42,
+        weights:       Optional[dict] = None,
+    ):
+        super().__init__()
+        self.tokenizer     = tokenizer
+        self.split         = split
+        self.max_ctx_len   = max_ctx_len
+        self.max_resp_len  = max_resp_len
+        self.max_ctx_turns = max_ctx_turns
+        self.val_every     = val_every
+        self.seed          = seed
+        self.weights       = weights or self.DATASET_WEIGHTS
+
+    def _make_iterators(self) -> dict:
+        iters = {}
+        if "ultrachat" in self.weights:
+            iters["ultrachat"] = _iter_ultrachat(
+                self.tokenizer, self.split,
+                self.max_ctx_len, self.max_resp_len,
+                self.max_ctx_turns, self.val_every,
+                seed=self.seed,
+            )
+        if "openorca" in self.weights:
+            iters["openorca"] = _iter_openorca(
+                self.tokenizer, self.split,
+                self.max_ctx_len, self.max_resp_len,
+                self.val_every,
+                seed=self.seed + 7,
+            )
+        return iters
+
+    def _pad_left(self, ids: list, length: int) -> torch.Tensor:
+        """Padding a sinistra con 0 — il contesto è più leggibile così."""
+        t = torch.zeros(length, dtype=torch.long)
+        n = min(len(ids), length)
+        t[length - n:] = torch.tensor(ids[-n:], dtype=torch.long)
+        return t
+
+    def _pad_right(self, ids: list, length: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Padding a destra con 0. Ritorna (ids_padded, mask)."""
+        t    = torch.zeros(length, dtype=torch.long)
+        mask = torch.zeros(length, dtype=torch.bool)
+        n    = min(len(ids), length)
+        t[:n]    = torch.tensor(ids[:n], dtype=torch.long)
+        mask[:n] = True
+        return t, mask
+
+    def __iter__(self) -> Iterator[dict]:
+        """Mixing deterministico con contatore cumulativo."""
+        iters     = self._make_iterators()
+        names     = list(iters.keys())
+        counters  = {n: 0.0 for n in names}
+        incs      = {n: 1.0 / self.weights[n] for n in names}
+        exhausted = set()
+
+        while len(exhausted) < len(names):
+            active = [(counters[n], n) for n in names if n not in exhausted]
+            if not active:
+                break
+            _, chosen = min(active)
+
+            try:
+                item = next(iters[chosen])
+                counters[chosen] += incs[chosen]
+            except StopIteration:
+                exhausted.add(chosen)
+                continue
+
+            prompt_ids   = self._pad_left(item["prompt_ids"], self.max_ctx_len)
+            resp_ids, mask = self._pad_right(item["response_ids"], self.max_resp_len)
+
+            yield {
+                "prompt_ids":    prompt_ids,    # (max_ctx_len,)
+                "response_ids":  resp_ids,      # (max_resp_len,)
+                "response_mask": mask,          # (max_resp_len,) bool
+            }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Factory
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_sft_loaders(
+    train_cfg,
+    tokenizer: PreTrainedTokenizer,
+    max_ctx_len:  int = 128,
+    max_resp_len: int = 128,
+    max_ctx_turns: int = 3,
+) -> tuple[DataLoader, DataLoader]:
+    """Costruisce train e val loader per il SFT."""
+
+    train_ds = SFTDataset(
+        tokenizer=tokenizer, split="train",
+        max_ctx_len=max_ctx_len, max_resp_len=max_resp_len,
+        max_ctx_turns=max_ctx_turns,
+        val_every=train_cfg.val_every, seed=42,
+    )
+    val_ds = SFTDataset(
+        tokenizer=tokenizer, split="val",
+        max_ctx_len=max_ctx_len, max_resp_len=max_resp_len,
+        max_ctx_turns=max_ctx_turns,
+        val_every=train_cfg.val_every, seed=42,
+    )
+
+    train_loader = DataLoader(
+        train_ds, batch_size=train_cfg.batch_size,
+        num_workers=0, pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=train_cfg.batch_size,
+        num_workers=0, pin_memory=True,
     )
 
     return train_loader, val_loader

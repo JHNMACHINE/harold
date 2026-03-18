@@ -29,7 +29,7 @@ from typing import Literal, Optional, List, Tuple
 from transformers import PreTrainedTokenizer, AutoTokenizer
 
 from model import Harold, build_model
-
+from config import SFTConfig
 
 SamplingMode = Literal["argmax", "sample", "confidence"]
 
@@ -92,28 +92,52 @@ class HaroldSampler:
 
     def _build_unused_mask(self) -> torch.Tensor:
         """
-        Costruisce una maschera booleana dei token [unused] nel vocabolario.
-        Scansiona il vocabolario del tokenizer una volta sola e cachea il risultato.
-        Molto più accurato dell'hardcoding degli indici 1-99.
+        Costruisce una maschera booleana dei token indesiderati nel vocabolario.
+        Usa un approccio allowlist: mantiene solo i token "puliti" e blocca tutto
+        il resto.
+
+        Token TENUTI (allowlist):
+          - Parole inglesi normali (solo lettere ASCII a-z)
+          - Numeri (0-9)
+          - Punteggiatura standard
+          - Subword con ## seguiti da lettere ASCII
+
+        Token BLOCCATI:
+          - Token speciali [CLS], [SEP], [PAD], [MASK], [UNK], [unused...]
+          - Caratteri non-ASCII: arabo, hindi, coreano, unicode vario
+          - Simboli matematici, caratteri CJK, ecc.
+
+        Nota: parole inglesi rare come "creaked", "sparkled", ecc. NON vengono
+        bloccate — sono parole valide. La ripetizione ossessiva viene gestita
+        dalla repetition_penalty in _decode().
         """
         if hasattr(self, "_unused_mask_cache"):
             return self._unused_mask_cache
 
-        vocab = self.tokenizer.get_vocab()           # {token_str: idx}
+        import re
+        allowed = re.compile(
+            r"^("
+            r"[a-z]+"           r"|"
+            r"[0-9]+"           r"|"
+            r"[.,!?:;'\"\-\(\)\[\]/@#&\*\+=%<>\\]+"  r"|"
+            r"##[a-z0-9]+"
+            r")$"
+        )
+
+        vocab = self.tokenizer.get_vocab()
         V     = self.model.emb_vocab
         mask  = torch.zeros(V, dtype=torch.bool, device=self.device)
 
         for token_str, idx in vocab.items():
-            if idx < V and (
-                token_str.startswith("[unused") or
-                token_str.startswith("##") and len(token_str) <= 3  # subword rumorosi
-            ):
+            if idx >= V:
+                continue
+            if not allowed.match(token_str.lower()):
                 mask[idx] = True
 
         self._unused_mask_cache = mask
-        n_masked = int(mask.sum().item())
-        print(f"[sampler] Token mascherati nella decodifica: {n_masked} "
-              f"([unused] + subword rumorosi)")
+        n_allowed = V - int(mask.sum().item())
+        n_masked  = int(mask.sum().item())
+        print(f"[sampler] Vocabolario: {n_allowed} token attivi, {n_masked} bloccati")
         return mask
 
     def _mask_unused_tokens(self, ce_logits: torch.Tensor) -> torch.Tensor:
@@ -126,17 +150,57 @@ class HaroldSampler:
         ce_logits[..., mask] = float("-inf")
         return ce_logits
 
+    def _apply_repetition_penalty(
+        self,
+        ce_logits:     torch.Tensor,   # (B, L, V)
+        penalty:       float = 1.5,
+        generated_ids: Optional[torch.Tensor] = None,  # (B, L) token già generati
+    ) -> torch.Tensor:
+        """
+        Penalizza i token già presenti nella sequenza generata.
+        penalty > 1.0: riduce la probabilità dei token già visti
+        penalty = 1.0: nessun effetto
+
+        Se generated_ids è fornito, penalizza quei token specifici.
+        Altrimenti usa argmax come proxy dei token correnti.
+
+        Implementazione standard (HuggingFace style):
+          logit > 0 → logit / penalty
+          logit < 0 → logit * penalty
+        """
+        if penalty == 1.0:
+            return ce_logits
+
+        B, L, V   = ce_logits.shape
+        ce_logits = ce_logits.clone()
+
+        token_ids = generated_ids if generated_ids is not None else ce_logits.argmax(dim=-1)
+
+        for b in range(B):
+            seen  = token_ids[b].unique()
+            score = ce_logits[b, :, seen]
+            score = torch.where(score > 0, score / penalty, score * penalty)
+            ce_logits[b, :, seen] = score
+
+        return ce_logits
+
     def _decode(
         self,
-        ce_logits:    torch.Tensor,  # (B, L, V)
-        mode:         SamplingMode,
-        temperature:  float,
-        top_p:        float,
-        mask_unused:  bool = True,   # rimuovi token [unused] dalla decodifica
+        ce_logits:          torch.Tensor,
+        mode:               SamplingMode,
+        temperature:        float,
+        top_p:              float,
+        mask_unused:        bool  = True,
+        repetition_penalty: float = 1.5,
+        generated_ids:      Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Decodifica ce_logits in token_ids (B, L) secondo la modalità."""
         if mask_unused:
             ce_logits = self._mask_unused_tokens(ce_logits)
+        if repetition_penalty != 1.0:
+            ce_logits = self._apply_repetition_penalty(
+                ce_logits, repetition_penalty, generated_ids
+            )
         if mode == "argmax" or mode == "confidence" or temperature <= 0:
             return ce_logits.argmax(dim=-1)
         return self._sample_tokens(ce_logits, temperature, top_p)
@@ -326,13 +390,20 @@ class HaroldSampler:
                 )
 
             if use_self_cond:
-                self_cond = eps_pred.mean(dim=1).detach()
+                # Self-cond: usa gli embedding dei token più probabili (puliti)
+                # invece di eps_pred grezzo — così i token bias non inquinano
+                # la traiettoria SDE attraverso il self-conditioning
+                clean_logits = self._mask_unused_tokens(ce_logits)
+                clean_logits = self._apply_repetition_penalty(clean_logits, penalty=1.5)
+                clean_ids    = clean_logits.argmax(dim=-1)           # (B, L)
+                self_cond    = self.model.token_emb(clean_ids).mean(dim=1).detach()  # (B, D)
 
             x_t = x_next
 
             if verbose and step % 10 == 0:
-                tokens = self._mask_unused_tokens(ce_logits).argmax(dim=-1)[0].tolist()
-                text   = self.tokenizer.decode(tokens, skip_special_tokens=False)
+                tokens = clean_logits.argmax(dim=-1)[0].tolist() if use_self_cond else \
+                         self._mask_unused_tokens(ce_logits).argmax(dim=-1)[0].tolist()
+                text   = self.tokenizer.decode(tokens, skip_special_tokens=True)
                 n_anchored = 0
                 if mode == "confidence":
                     probs = F.softmax(self._mask_unused_tokens(ce_logits), dim=-1)
@@ -416,6 +487,120 @@ class HaroldSampler:
             for b in range(B)
         ]  # type: ignore
 
+    # ── CFG conditioned generation ───────────────────────────────────────────
+
+    def _encode_context(self, context: str) -> torch.Tensor:
+        """
+        Encoda un testo di contesto come mean pooling degli embedding.
+        Identico a encode_context() in train_sft.py.
+
+        Returns:
+            ctx_emb: (1, D)
+        """
+        ids      = self.tokenizer(
+            context, return_tensors="pt",
+            truncation=True, max_length=128,
+        )["input_ids"].to(self.device)                       # type: ignore # (1, L)
+        pad_mask = (ids != 0).float()                         # (1, L)
+        emb      = self.model.token_emb(ids)                  # (1, L, D)
+        n        = pad_mask.sum(dim=1, keepdim=True).clamp(min=1)
+        return (emb * pad_mask.unsqueeze(-1)).sum(dim=1) / n  # (1, D)
+
+    @torch.no_grad()
+    def generate_conditioned(
+        self,
+        context:            str,
+        gen_len:            int   = 64,
+        steps:              int   = 50,
+        cfg_scale:          float = 3.0,
+        mode:               SamplingMode = "argmax",
+        temperature:        float = 1.0,
+        top_p:              float = 0.9,
+        repetition_penalty: float = 1.5,
+        use_self_cond:      bool  = True,
+        verbose:            bool  = False,
+    ) -> str:
+        """
+        Genera testo condizionato sul contesto usando CFG.
+
+        A differenza di generate(), qui:
+          - Il contesto NON viene iniettato come token nella sequenza
+          - Il contesto viene encodato come ctx_emb e usato per guidare la SDE
+          - Ogni step fa DUE forward pass: uno condizionato, uno no
+          - La guida è: ε_guided = ε_uncond + cfg_scale * (ε_cond - ε_uncond)
+
+        Usare questo metodo per testare il SFT con CFG.
+        Usare generate() per generazione non condizionata (pretraining).
+
+        Args:
+            context:     prompt conversazionale (es. "What is the capital of France?")
+            gen_len:     lunghezza della risposta
+            steps:       passi di integrazione (50 è sufficiente per test)
+            cfg_scale:   forza del conditioning. 1.0 = nessuna guida (come uncond).
+                         Valori tipici: 2.0-5.0. Troppo alto → testo ripetitivo.
+            mode:        modalità decodifica finale
+            temperature: per mode="sample"
+            top_p:       per mode="sample"
+            use_self_cond: usa self-conditioning
+            verbose:     stampa progresso ogni 10 step
+        """
+        # Encoda il contesto — usato per entrambi i forward pass
+        ctx_emb   = self._encode_context(context)  # (1, D)
+
+        # Parti da rumore puro — nessun token della sequenza è noto
+        x_t       = torch.randn(1, gen_len, self.d_model, device=self.device)
+        self_cond: Optional[torch.Tensor] = None
+        dt        = -1.0 / steps
+
+        for step in range(steps):
+            t        = 1.0 - step / steps
+            t_tensor = self._t_tensor(t, batch=1)
+
+            # Forward condizionato (con ctx_emb)
+            eps_cond, ce_logits, _ = self.model(
+                x_t, t_tensor, self_cond=self_cond, ctx_emb=ctx_emb
+            )
+            # Forward incondizionato (ctx_emb=None)
+            eps_uncond, _, _ = self.model(
+                x_t, t_tensor, self_cond=self_cond, ctx_emb=None
+            )
+
+            # CFG: interpola tra condizionato e incondizionato
+            eps = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+
+            # Parametri SDE
+            beta_t        = self.model.schedule.get_beta(t_tensor)
+            _, sigma_t    = self.model.schedule.get_alpha_sigma(t_tensor)
+            score         = -eps / sigma_t.view(-1, 1, 1).clamp(min=1e-8)
+            b             = beta_t.view(-1, 1, 1)
+            noise         = torch.randn_like(x_t) if t > 1e-5 else torch.zeros_like(x_t)
+            x_t           = x_t + (-0.5*b*x_t - b*score)*dt + b.sqrt()*noise*math.sqrt(abs(dt))
+
+            if use_self_cond:
+                # Self-cond: embedding dei token puliti, non eps_pred grezzo
+                clean_logits_sc = self._mask_unused_tokens(ce_logits)
+                clean_logits_sc = self._apply_repetition_penalty(clean_logits_sc, 1.5)
+                clean_ids_sc    = clean_logits_sc.argmax(dim=-1)
+                self_cond       = self.model.token_emb(clean_ids_sc).mean(dim=1).detach()
+
+            if verbose and step % 10 == 0:
+                tokens = self._mask_unused_tokens(ce_logits).argmax(dim=-1)[0].tolist()
+                text   = self.tokenizer.decode(tokens, skip_special_tokens=False)
+                print(f"  step {step+1:3d}/{steps} | t={t:.3f} | cfg={cfg_scale} | {text[:70]}")
+
+        # Decodifica finale — forward condizionato a t≈0
+        t_final           = self._t_tensor(1.0 / steps, batch=1)
+        _, ce_final, _    = self.model(x_t, t_final, self_cond=self_cond, ctx_emb=ctx_emb)
+        # Usa i token intermedi come riferimento per la repetition penalty
+        intermediate_ids  = self._mask_unused_tokens(ce_final).argmax(dim=-1)
+        token_ids         = self._decode(
+            ce_final, mode, temperature, top_p,
+            repetition_penalty=repetition_penalty,
+            generated_ids=intermediate_ids,
+        )[0]
+
+        return self.tokenizer.decode(token_ids.tolist(), skip_special_tokens=True)  # type: ignore
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Standalone test
@@ -453,11 +638,11 @@ if __name__ == "__main__":
     out = sampler.generate(
         prompt=prompt, gen_len=64, steps=100,
         mode="confidence", confidence_threshold=0.7, anchor_every=5,
-        use_self_cond=True, verbose=True,
+        use_self_cond=True,
     )
     print(f"[confidence] {out}\n")
 
-    # Top-p sampling con diverse temperature
+    # Top-p sampling
     for temp in (0.8, 1.0, 1.3):
         out = sampler.generate(
             prompt=prompt, gen_len=64, steps=100,
@@ -466,7 +651,26 @@ if __name__ == "__main__":
         )
         print(f"[sample t={temp}] {out}")
 
-    # Batch
+    # CFG conditioned — per testare il SFT
+    # Confronta cfg_scale=1.0 (no guidance) vs 3.0 vs 5.0
+    # Se il SFT funziona, le risposte devono essere tematicamente coerenti col prompt
+    print("\n--- CFG Conditioned (SFT test) ---")
+    cfg_prompts = [
+        "What is the capital of France?",
+        "Tell me a joke about programming.",
+        "Explain what a neural network is in simple terms.",
+    ]
+    for cfg_prompt in cfg_prompts:
+        print(f"\n[prompt] {cfg_prompt}")
+        for scale in (1.0, 3.0, 5.0):
+            out = sampler.generate_conditioned(
+                context=cfg_prompt, gen_len=64, steps=50,
+                cfg_scale=scale, mode="argmax",
+                repetition_penalty=1.3,
+            )
+            print(f"  [cfg={scale:.1f}] {out}")
+
+    # Batch non condizionato
     print("\n--- Batch ---")
     outs = sampler.generate_batch(
         prompts=["Once upon a time", "The quick brown fox"],

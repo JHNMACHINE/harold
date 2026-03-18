@@ -317,15 +317,15 @@ class VPSDESchedule(nn.Module):
     """
     Variance Preserving SDE schedule.
 
-    Forward process: x_t = a(t)*x0 + o(t)*ε,  ε ~ N(0,I)
+    Forward process: x_t = α(t)*x0 + σ(t)*ε,  ε ~ N(0,I)
 
       β(t)  = β_min + t*(β_max - β_min)
       α²(t) = exp(-(β_min*t + 0.5*(β_max-β_min)*t²))
       σ²(t) = 1 - α²(t)
 
     t ∈ [0,1]:
-      t=0 → o≈1, o≈0  (dato pulito)
-      t=1 → o≈0, o≈1  (rumore puro)
+      t=0 → α≈1, σ≈0  (dato pulito)
+      t=1 → α≈0, σ≈1  (rumore puro)
     """
     def __init__(self, beta_min: float = 0.1, beta_max: float = 20.0):
         super().__init__()
@@ -347,7 +347,7 @@ class VPSDESchedule(nn.Module):
         x0: torch.Tensor,   # (B, L, D)
         t:  torch.Tensor,   # (B,) in [0,1]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """x_t = a(t)*x0 + o(t)*ε. Ritorna (x_t, ε)."""
+        """x_t = α(t)*x0 + σ(t)*ε. Ritorna (x_t, ε)."""
         alpha, sigma = self.get_alpha_sigma(t)
         eps = torch.randn_like(x0)
         x_t = alpha.view(-1, 1, 1) * x0 + sigma.view(-1, 1, 1) * eps
@@ -396,6 +396,13 @@ class Harold(nn.Module):
 
         self.self_cond_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         nn.init.normal_(self.self_cond_proj.weight, std=0.02)
+
+        # CFG (Classifier-Free Guidance) — conditioning sul contesto conversazionale
+        # Proietta il context embedding (mean pooling del prompt) nello spazio di t_emb
+        # Init a zero: no-op all'inizio, il modello impara gradualmente a usarlo
+        # Viene aggiunto solo durante il SFT, durante il pretraining ctx_emb=None
+        self.cfg_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        nn.init.zeros_(self.cfg_proj.weight)
 
         # [FIX #7] Frequenze per sinusoidi — t verrà riscalato *1000
         half  = config.d_model // 2
@@ -449,6 +456,7 @@ class Harold(nn.Module):
         x_t:             torch.Tensor,                   # (B, L, D)
         t:               torch.Tensor,                   # (B,) float in [0,1]
         self_cond:       Optional[torch.Tensor] = None,  # (B, D) già detached
+        ctx_emb:         Optional[torch.Tensor] = None,  # (B, D) context embedding per CFG
         past_key_values: Optional[List[torch.Tensor]] = None,
         use_cache:       bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[List]]:
@@ -461,9 +469,16 @@ class Harold(nn.Module):
 
         t_emb = self.time_emb(self.get_timestep_embedding(t))
 
-        # [FIX #4] self_cond sempre detached
+        # Self-conditioning — sempre detached
         if self_cond is not None:
             t_emb = t_emb + self.self_cond_proj(self_cond.detach())
+
+        # CFG conditioning — context embedding del prompt
+        # Durante il pretraining ctx_emb=None → nessun effetto
+        # Durante il SFT ctx_emb è il mean pooling degli embedding del prompt
+        # Con p_uncond=0.1 ctx_emb viene azzerato → training unconditional
+        if ctx_emb is not None:
+            t_emb = t_emb + self.cfg_proj(ctx_emb.detach())
 
         t_normalized = t.float().mean().item() if not self.training else None
 
@@ -489,12 +504,14 @@ class Harold(nn.Module):
         x0:             torch.Tensor,                   # (B, L) token IDs
         mask:           torch.Tensor,                   # (B, L) bool — token non-padding
         ce_weight:      float = 0.1,
-        fixed_t:        Optional[torch.Tensor] = None,  # (B,) in [0,1] — per valutazione
+        fixed_t:        Optional[torch.Tensor] = None,  # (B,) in [0,1]
         self_cond_prob: float = 0.0,
+        ctx_emb:        Optional[torch.Tensor] = None,  # (B, D) context per CFG
+        p_uncond:       float = 0.1,                    # prob di zerare ctx_emb (CFG)
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Score matching loss per VP-SDE con SNR weighting.
- 
+
         Struttura:
           1. t ~ U[0,1]  (o fixed_t per valutazione per-timestep)
           2. x0_emb = token_emb(x0)
@@ -504,64 +521,74 @@ class Harold(nn.Module):
           6. loss_score = SNR-weighted MSE(ε_pred, ε)[mask]
           7. loss_ce    = CE(ce_logits[mask], x0[mask])
           8. total = loss_score + ce_weight * loss_ce
- 
+
         SNR weighting (Min-SNR, Hang et al. 2023):
           w(t) = SNR(t) / (SNR(t) + 1)  ∈ (0, 1)
- 
+
           - t alto (tanto rumore, SNR≈0) → w≈0 → contribuisce poco
           - t basso (poco rumore, SNR>>1) → w→1 → contribuisce normalmente
- 
+
           Razionale: a t alto la loss MSE è naturalmente rumorosa perché
           il segnale è quasi completamente corrotto. Pesarla meno stabilizza
           i gradienti e fa convergere più velocemente i timestep bassi
           (quelli che contano di più per la qualità finale della generazione).
         """
         device = x0.device
- 
+
         if mask.sum() == 0:
             zero = torch.tensor(0.0, device=device, requires_grad=True)
             return zero, {"score": 0.0, "ce": 0.0, "total": 0.0}
- 
+
         # ── Timestep ────────────────────────────────────────────────────────
         B = x0.shape[0]
         t = fixed_t if fixed_t is not None else torch.rand(B, device=device)
- 
+
         # ── Forward process ──────────────────────────────────────────────────
         with torch.no_grad():
             x0_emb = self.token_emb(x0)             # (B, L, D)
         x_t, eps = self.schedule.add_noise(x0_emb, t)
- 
+
         # ── Self-conditioning ────────────────────────────────────────────────
         self_cond: Optional[torch.Tensor] = None
         if self_cond_prob > 0 and torch.rand(1).item() < self_cond_prob:
             with torch.no_grad():
-                eps_prev, _, _ = self.forward(x_t, t, self_cond=None)
+                eps_prev, _, _ = self.forward(x_t, t, self_cond=None, ctx_emb=None)
             self_cond = eps_prev.mean(dim=1).detach()   # (B, D)
- 
+
+        # ── CFG dropout ──────────────────────────────────────────────────────
+        # Con prob p_uncond azzera il context embedding → training unconditional
+        # Necessario per abilitare CFG in inferenza: guida = uncond + scale*(cond-uncond)
+        cfg_emb: Optional[torch.Tensor] = None
+        if ctx_emb is not None:
+            if p_uncond > 0 and torch.rand(1).item() < p_uncond:
+                cfg_emb = torch.zeros_like(ctx_emb)   # unconditional
+            else:
+                cfg_emb = ctx_emb
+
         # ── Predizione ───────────────────────────────────────────────────────
-        eps_pred, ce_logits, _ = self.forward(x_t, t, self_cond=self_cond)
- 
+        eps_pred, ce_logits, _ = self.forward(x_t, t, self_cond=self_cond, ctx_emb=cfg_emb)
+
         # ── SNR weighting ────────────────────────────────────────────────────
         # w(t) = SNR(t) / (SNR(t) + 1)
         # Clampato a snr_clip per evitare che t≈0 domini con peso enorme
         snr_clip = 5.0
         snr      = self.schedule.get_snr(t).clamp(max=snr_clip)   # (B,)
         snr_w    = (snr / (snr + 1.0)).to(eps_pred.dtype)         # (B,) ∈ (0, 1)
- 
+
         # ── Score matching con SNR weighting ─────────────────────────────────
         # MSE per token: (B, L, D) → media su D → (B, L)
         per_token_mse = F.mse_loss(eps_pred, eps, reduction="none").mean(dim=-1)
- 
+
         # Applica peso SNR per batch item, poi media sui token mascherati
         # snr_w: (B,) → (B, 1) per broadcasting su L
         weighted_mse = per_token_mse * snr_w.unsqueeze(1)         # (B, L)
         loss_score   = weighted_mse[mask].mean()
- 
+
         # ── CE ausiliaria ─────────────────────────────────────────────────────
         loss_ce = F.cross_entropy(ce_logits[mask], x0[mask], reduction="mean")
- 
+
         total = loss_score + ce_weight * loss_ce
- 
+
         return total, {
             "score": loss_score.item(),
             "ce":    loss_ce.item(),
