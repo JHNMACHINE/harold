@@ -1,20 +1,14 @@
 """
-Harold v3 — train.py
+Harold v4 — train.py
 =====================
 Trainer per VP-SDE continuous diffusion + self-conditioning.
-
-Fix rispetto alla versione precedente:
-  [FIX #1] train_step delega compute_loss al modello (score matching)
-  [FIX #2] Rimosso MaskDiffusionSchedule, usa VPSDESchedule interno al modello
-  [FIX #4] self_cond gestito internamente da compute_loss, sempre detached
-  [FIX #6] self_cond_prob = 0.5 in config (coerente col sampler)
-  [FIX #7] estimate_loss passa fixed_t per valutazione per-timestep
-  [FIX #8] estimate_loss: tutto dentro train_cfg.ctx
-  [FIX #9] gradient accumulation: salta micro-batch con mask vuota
 """
 
+import json
 import math
 import os
+import queue
+import threading
 import time
 import warnings
 from typing import Dict, Tuple, Optional
@@ -26,9 +20,94 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from config import ModelConfig, TrainConfig, get_model_config, get_train_config
-from logger import AsyncLogger
 from model import Harold, build_model
 from dataset import MixedStreamingDataset, build_loaders, compute_token_weights
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AsyncLogger — logging su file in background, zero impatto sul training
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AsyncLogger:
+    """
+    Logger asincrono che scrive su file JSONL in un thread di background.
+
+    Il training scrive nella queue senza aspettare (non-blocking).
+    Il thread di background svuota la queue e appende al file di log.
+
+    Formato JSONL: una riga JSON per evento, facile da parsare con pandas:
+        import pandas as pd
+        df = pd.read_json("training.log", lines=True)
+
+    Uso:
+        logger = AsyncLogger("checkpoints_v3/training.log")
+        logger.log({"iter": 100, "loss": 0.45, "ce": 7.1})
+        logger.close()  # sempre chiamare alla fine
+    """
+
+    def __init__(self, log_path: str, flush_every: int = 10):
+        """
+        Args:
+            log_path:    percorso del file di log (viene appeso, non sovrascritto)
+            flush_every: scrivi su disco ogni N eventi (default 10)
+                         più alto = meno I/O, più basso = più sicuro contro crash
+        """
+        self.log_path   = log_path
+        self.flush_every = flush_every
+        self._queue     = queue.Queue()
+        self._stop      = threading.Event()
+
+        # Crea la directory se non esiste
+        os.makedirs(os.path.dirname(log_path) if os.path.dirname(log_path) else ".", exist_ok=True)
+
+        # Thread daemon: si chiude automaticamente se il processo principale muore
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def log(self, data: dict) -> None:
+        """
+        Accoda un evento da loggare. Non-blocking — ritorna immediatamente.
+        Aggiunge automaticamente il timestamp Unix.
+        """
+        data["timestamp"] = time.time()
+        self._queue.put(data)
+
+    def _worker(self) -> None:
+        """Thread di background: svuota la queue e scrive su file."""
+        buffer = []
+        while not self._stop.is_set() or not self._queue.empty():
+            # Raccoglie eventi dalla queue con timeout
+            try:
+                item = self._queue.get(timeout=0.5)
+                buffer.append(json.dumps(item))
+                self._queue.task_done()
+            except queue.Empty:
+                pass
+
+            # Flush su disco ogni flush_every eventi o quando la queue è vuota
+            if len(buffer) >= self.flush_every or (buffer and self._queue.empty()):
+                with open(self.log_path, "a") as f:
+                    f.write("\n".join(buffer) + "\n")
+                buffer.clear()
+
+        # Flush finale di tutto quello che rimane
+        if buffer:
+            with open(self.log_path, "a") as f:
+                f.write("\n".join(buffer) + "\n")
+
+    def close(self) -> None:
+        """
+        Segnala al thread di fermarsi e aspetta che finisca di scrivere.
+        Chiamare sempre alla fine del training.
+        """
+        self._stop.set()
+        self._thread.join(timeout=10)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -37,15 +116,17 @@ from dataset import MixedStreamingDataset, build_loaders, compute_token_weights
 
 class DiffusionTrainer:
     """
-    Trainer per Harold v3 VP-SDE.
+    Trainer per Harold v0.4 VP-SDE.
     Tutta la logica di diffusion (noise, self-cond, loss) vive in model.compute_loss.
     Il trainer si occupa solo di: iterare i batch, chiamare compute_loss, backward.
     """
 
-    def __init__(self, model: Harold, config: ModelConfig, train_cfg: TrainConfig):
-        self.model     = model
-        self.config    = config
-        self.train_cfg = train_cfg
+    def __init__(self, model: Harold, config: ModelConfig, train_cfg: TrainConfig,
+                 pad_token_id: int = 0):
+        self.model        = model
+        self.config       = config
+        self.train_cfg    = train_cfg
+        self.pad_token_id = pad_token_id   # GPT-2: eos_token_id (50256)
 
     def train_step(
         self,
@@ -55,8 +136,10 @@ class DiffusionTrainer:
         Ritorna None se tutti i token sono padding (batch invalido).
         Il caller deve saltare il micro-batch in questo caso.
         """
-        # Maschera token validi (non-padding, padding_idx=0)
-        mask = (batch != 0)   # (B, L)
+        # Maschera token validi (non-padding)
+        # GPT-2 usa eos_token come pad (id=50256) — usiamo pad_token_id dal trainer
+        pad_id = getattr(self, "pad_token_id", 0)
+        mask = (batch != pad_id)   # (B, L)
 
         # [FIX #9] Salta batch completamente vuoti
         if mask.sum() == 0:
@@ -108,7 +191,6 @@ def estimate_loss(
     device = next(model.parameters()).device
     model.eval()
 
-    # t in spazio continuo [0,1]: da poco rumore a tanto rumore
     t_values  = [0.1, 0.3, 0.5, 0.7, 0.9]
     all_total = {t: [] for t in t_values}
     all_score = {t: [] for t in t_values}
@@ -130,17 +212,15 @@ def estimate_loss(
         B = input_ids.shape[0]
 
         for t_val in t_values:
-            # [FIX #7] fixed_t per valutazione disaggregata per timestep
             fixed_t = torch.full((B,), t_val, dtype=torch.float32, device=device)
 
-            # [FIX #8] ctx wrappa tutta la compute_loss incluso il forward
             with train_cfg.ctx:
                 _, loss_dict = model.compute_loss(
                     x0=input_ids,
                     mask=mask,
                     ce_weight=train_cfg.ce_loss_weight,
                     fixed_t=fixed_t,
-                    self_cond_prob=0.0,   # no self-cond in val per riproducibilità
+                    self_cond_prob=0.0,
                 )
 
             all_total[t_val].append(loss_dict["total"])
@@ -166,6 +246,7 @@ def estimate_loss(
     print("  val score: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_score.items()))
     print("  val CE:    " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_ce.items()))
 
+    # Log asincrono dei dettagli per-timestep
     if logger is not None:
         logger.log({
             "type":        "val_detail",
@@ -187,7 +268,7 @@ def save_checkpoint(
     path:         str,
     model:        Harold,
     optimizer:    torch.optim.Optimizer,
-    scaler:       torch.amp.GradScaler,  # type: ignore
+    scaler:       torch.GradScaler,  
     iter_num:     int,
     val_loss:     float,
     model_cfg:    ModelConfig,
@@ -212,7 +293,7 @@ def load_checkpoint(
     path:      str,
     model:     Harold,
     optimizer: torch.optim.Optimizer,
-    scaler:    torch.amp.GradScaler,  # type: ignore
+    scaler:    torch.GradScaler,
     device:    str,
 ) -> Tuple[int, float, list, list]:
     print(f"Carico checkpoint: {path}")
@@ -244,14 +325,20 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     print(f"Beta:           [{model_cfg.diffusion_beta_min}, {model_cfg.diffusion_beta_max}]")
 
     # ── Tokenizer ─────────────────────────────────────────────────────────
-    tokenizer               = AutoTokenizer.from_pretrained(train_cfg.tokenizer_model)
+    tokenizer = AutoTokenizer.from_pretrained(train_cfg.tokenizer_model)
+
+    # GPT-2 non ha pad token — usa eos come pad (standard per generazione)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    pad_token_id = tokenizer.pad_token_id
+
     model_cfg.vocab_size    = tokenizer.vocab_size
     model_cfg.mask_token_id = int(getattr(tokenizer, "mask_token_id", None) or tokenizer.vocab_size)
 
     # ── Modello ───────────────────────────────────────────────────────────
     model    = build_model(model_cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"Harold v3 — {n_params:.1f}M parametri totali")
+    print(f"Harold v0.4 — {n_params:.1f}M parametri totali")
 
     # ── Optimizer ─────────────────────────────────────────────────────────
     muon_names  = {"q_proj", "k_up", "v_up", "o_proj", "w1", "w2", "w3", "kv_down"}
@@ -272,13 +359,13 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         weight_decay=0.1,
         fused=True,
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=train_cfg.use_scaler)  # type: ignore
+    scaler = torch.GradScaler("cuda", enabled=train_cfg.use_scaler)
 
     # ── Dataset ───────────────────────────────────────────────────────────
     train_loader, val_loader = build_loaders(train_cfg, tokenizer)
 
     # ── Trainer ───────────────────────────────────────────────────────────
-    trainer = DiffusionTrainer(model, model_cfg, train_cfg)
+    trainer = DiffusionTrainer(model, model_cfg, train_cfg, pad_token_id=pad_token_id)
 
     # ── Checkpoint resume ─────────────────────────────────────────────────
     os.makedirs(train_cfg.checkpoint_dir, exist_ok=True)
@@ -383,6 +470,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
             "grad":  f"{grad_norm:.2f}",
         })
 
+        # Log asincrono ogni step — zero impatto sul training
         logger.log({
             "type":       "train",
             "iter":       iter_num,
@@ -411,6 +499,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
                 f"lr={lr:.2e}  elapsed={elapsed:.1f}min"
             )
 
+            # Log val asincrono
             logger.log({
                 "type":        "val",
                 "iter":        iter_num,
@@ -432,13 +521,13 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
                     train_losses, val_losses,
                 )
                 print(f"  ★ Best val loss: {val_loss:.4f} → {best_path}")
+                train_cfg.write_latest(iter_num, best_path)
                 logger.log({
                     "type":      "best_checkpoint",
                     "iter":      iter_num,
                     "val_loss":  round(val_loss, 6),
                     "path":      best_path,
                 })
-                train_cfg.write_latest(iter_num, best_path)
 
             model.train()
 
@@ -477,6 +566,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         "elapsed_min":      round(elapsed, 2),
         "final_checkpoint": final_path,
     })
+    logger.close()   # flush finale garantito prima di uscire
     print(f"\nTraining completato in {elapsed:.1f} min → {final_path}")
 
     return {
