@@ -1,7 +1,17 @@
 """
 dataset.py — Harold v0.4
 ==========================
-Dataset dinamico configurato da YAML
+Dataset dinamico guidato da YAML — nessun dataset hardcoded nel codice.
+
+La lista dei dataset, i pesi e i campi testo sono in datasets_config.yaml.
+Per aggiungere/rimuovere dataset basta modificare il YAML senza toccare Python.
+
+Formati speciali supportati (campo "format" nel YAML):
+  standard      — testo diretto dal text_field (default)
+  codecontests  — concatena description + prima soluzione nested
+  oasst2        — coppie prompter→assistant filtrate per rank=0
+  openorca      — system_prompt + question → response
+  ultrachat     — conversazioni multi-turn (legacy, non usato in v0.4)
 """
 
 from __future__ import annotations
@@ -60,7 +70,7 @@ def load_dataset_config(yaml_path: str = "datasets_config.yaml") -> dict:
     if not path.exists():
         raise FileNotFoundError(
             f"Dataset config non trovato: {yaml_path}\n"
-            f"Assicurati che datasets_v04.yaml sia nella stessa directory."
+            f"Assicurati che datasets_config.yaml sia nella stessa directory."
         )
     with open(path) as f:
         cfg = yaml.safe_load(f)
@@ -343,26 +353,26 @@ class MixedStreamingDataset(IterableDataset):
         self.weights     = {d["name"]: d["weight"] for d in dataset_cfg}
 
     def _make_iterators(self) -> dict[str, Iterator[list[int]]]:
-        # Estrai i token ID una sola volta
-        sep_token = _first_token_id(self.tokenizer.sep_token_id)
-        eos_token = _first_token_id(self.tokenizer.eos_token_id)
-        
-        # Determina sep_id con priorità
-        if sep_token is not None:
-            sep_id = int(sep_token)
-        elif eos_token is not None:
-            sep_id = int(eos_token)
-        else:
-            sep_id = 0
-        
-        return {
-            d["name"]: _iter_pretraining_dataset(
-                ds_cfg=d, tokenizer=self.tokenizer, sep_id=sep_id,
-                split=self.split, val_every=self.val_every,
-                buffer_size=self.buffer_size, seed=self.seed + i * 7,
-            )
-            for i, d in enumerate(self.dataset_cfg)
-        }
+            # Estrai i token ID una sola volta
+            sep_token = _first_token_id(self.tokenizer.sep_token_id)
+            eos_token = _first_token_id(self.tokenizer.eos_token_id)
+            
+            # Determina sep_id con priorità
+            if sep_token is not None:
+                sep_id = int(sep_token)
+            elif eos_token is not None:
+                sep_id = int(eos_token)
+            else:
+                sep_id = 0
+            
+            return {
+                d["name"]: _iter_pretraining_dataset(
+                    ds_cfg=d, tokenizer=self.tokenizer, sep_id=sep_id,
+                    split=self.split, val_every=self.val_every,
+                    buffer_size=self.buffer_size, seed=self.seed + i * 7,
+                )
+                for i, d in enumerate(self.dataset_cfg)
+            }
 
     def __iter__(self) -> Iterator[dict]:
         iters     = self._make_iterators()
@@ -494,8 +504,25 @@ def build_loaders(
         split="val", val_every=train_cfg.val_every,
         seed=42, buffer_size=train_cfg.stream_buffer_size,
     )
-    train_loader = DataLoader(train_ds, batch_size=train_cfg.batch_size, num_workers=0, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=train_cfg.batch_size, num_workers=0, pin_memory=True)
+    def worker_init_fn(_: int) -> None:
+        """Partiziona lo stream tra i worker per evitare duplicati."""
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            ds = worker_info.dataset
+            current_seed = getattr(ds, 'seed', 42)
+            setattr(ds, 'seed', current_seed + worker_info.id * 31)
+
+    num_workers = 2
+    train_loader = DataLoader(
+        train_ds, batch_size=train_cfg.batch_size,
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=True, worker_init_fn=worker_init_fn,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=train_cfg.batch_size,
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=True, worker_init_fn=worker_init_fn,
+    )
     return train_loader, val_loader
 
 
@@ -521,6 +548,12 @@ def build_sft_loaders(
         max_ctx_len=max_ctx_len, max_resp_len=max_resp_len,
         max_ctx_turns=max_ctx_turns, val_every=train_cfg.val_every, seed=42,
     )
-    train_loader = DataLoader(train_ds, batch_size=train_cfg.batch_size, num_workers=0, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=train_cfg.batch_size, num_workers=0, pin_memory=True)
+    train_loader = DataLoader(
+        train_ds, batch_size=train_cfg.batch_size,
+        num_workers=2, pin_memory=True, persistent_workers=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=train_cfg.batch_size,
+        num_workers=2, pin_memory=True, persistent_workers=True,
+    )
     return train_loader, val_loader
