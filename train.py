@@ -1,7 +1,16 @@
 """
-Harold v4 — train.py
+Harold v0.4 — train.py
 =====================
 Trainer per VP-SDE continuous diffusion + self-conditioning.
+
+Fix rispetto alla versione precedente:
+  [FIX #1] train_step delega compute_loss al modello (score matching)
+  [FIX #2] Rimosso MaskDiffusionSchedule, usa VPSDESchedule interno al modello
+  [FIX #4] self_cond gestito internamente da compute_loss, sempre detached
+  [FIX #6] self_cond_prob = 0.5 in config (coerente col sampler)
+  [FIX #7] estimate_loss passa fixed_t per valutazione per-timestep
+  [FIX #8] estimate_loss: tutto dentro train_cfg.ctx
+  [FIX #9] gradient accumulation: salta micro-batch con mask vuota
 """
 
 import json
@@ -23,7 +32,6 @@ from config import ModelConfig, TrainConfig, get_model_config, get_train_config
 from model import Harold, build_model
 from dataset import build_loaders
 from logger import AsyncLogger
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Trainer
@@ -90,11 +98,12 @@ def get_lr(it: int, cfg: TrainConfig) -> float:
 
 @torch.no_grad()
 def estimate_loss(
-    model:      Harold,
-    train_cfg:  TrainConfig,
-    val_loader: DataLoader,
-    iter_num:   int = 0,
-    logger:     Optional["AsyncLogger"] = None,
+    model:        Harold,
+    train_cfg:    TrainConfig,
+    val_loader:   DataLoader,
+    pad_token_id: int = 50256,
+    iter_num:     int = 0,
+    logger:       Optional["AsyncLogger"] = None,
 ) -> float:
     """
     Valuta la loss su diversi timestep continui in [0,1].
@@ -119,7 +128,7 @@ def estimate_loss(
             break
 
         input_ids = batch["input_ids"].to(device)
-        mask      = (input_ids != 0)
+        mask      = (input_ids != pad_token_id)
 
         if mask.sum() == 0:
             continue
@@ -183,7 +192,7 @@ def save_checkpoint(
     path:         str,
     model:        Harold,
     optimizer:    torch.optim.Optimizer,
-    scaler:       torch.GradScaler, 
+    scaler:       torch.GradScaler,
     iter_num:     int,
     val_loss:     float,
     model_cfg:    ModelConfig,
@@ -232,7 +241,7 @@ def load_checkpoint(
 def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     device = train_cfg.device
 
-    print("Harold v4 — VP-SDE Continuous Diffusion")
+    print("Harold v0.4 — VP-SDE Continuous Diffusion")
     print(f"Device:         {device}")
     print(f"Dtype:          {train_cfg.dtype}  (scaler={'ON' if train_cfg.use_scaler else 'OFF'})")
     print(f"Batch virtuale: {train_cfg.batch_size} × {train_cfg.grad_accum} = {train_cfg.effective_batch_size}")
@@ -304,7 +313,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     train_iter = iter(train_loader)
     accum_loss = 0.0
 
-    pbar = tqdm(range(initial_iter, train_cfg.max_iters), desc="Harold v4")
+    pbar = tqdm(range(initial_iter, train_cfg.max_iters), desc="Harold v0.4")
 
     for iter_num in pbar:
         lr = get_lr(iter_num, train_cfg)
@@ -391,7 +400,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
             if iter_num == 0:
                 continue
 
-            val_loss   = estimate_loss(model, train_cfg, val_loader, iter_num, logger)
+            val_loss   = estimate_loss(model, train_cfg, val_loader, pad_token_id, iter_num, logger)
             val_losses.append(val_loss)
             avg_train  = accum_loss / max(train_cfg.eval_interval, 1)
             accum_loss = 0.0
