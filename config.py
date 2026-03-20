@@ -43,8 +43,6 @@ class ModelConfig:
     # ── Diffusion VP-SDE ──────────────────────────────────────────────────
     diffusion_beta_min: float = 0.1
     diffusion_beta_max: float = 20.0
-    diffusion_T:        int   = 64
-
     # ── Training ──────────────────────────────────────────────────────────
     dropout: float = 0.0
 
@@ -69,26 +67,26 @@ def get_model_config() -> ModelConfig:
 
 @dataclass
 class TrainConfig:
-    batch_size:    int   = 6       # ridotto per 733M (era 16 per 168M)
-    grad_accum:    int   = 32      # batch virtuale = 4×32 = 128
+    batch_size:    int   = 6       # A100 80GB senza OOM
+    grad_accum:    int   = 32      # batch virtuale = 6×32 = 192
     max_iters:     int   = 100000  # Chinchilla ottimale per 733M (~13B token)
-    lr:            float = 1e-4    # leggermente più basso per modello più grande
-    seq_len:       int   = 1024    # aumentato da 256
-    warmup_iters:  int   = 2000    # ~2% del training (era 400/20000 = 2%)
+    lr:            float = 1e-4
+    seq_len:       int   = 1024
+    warmup_iters:  int   = 2000
     min_lr:        float = 1e-5
-    eval_interval: int   = 1000    # eval ogni 1000 step
+    eval_interval: int   = 1000
     eval_iters:    int   = 20
     max_grad_norm: float = 1.0
     self_cond_prob: float = 0.5
     ce_loss_weight: float = 0.1
-    dataset_name:       str   = "v4"
     tokenizer_model:    str   = "gpt2"
     stream_buffer_size: int   = 1000
-    val_every:          int   = 500
+    val_every:          int   = 200
+
     checkpoint_dir:    str = "checkpoints_v4"
     checkpoint_prefix: str = "harold_v04"
     preload:           str = "latest"
-    save_every:        int = 2000   # checkpoint ogni 2000 step (50 totali su 100k)
+    save_every:        int = 500   # sessioni da 6h a ~15s/it → ~1440 step/sessione
     device: str = field(init=False)
     dtype:  str = field(init=False)
 
