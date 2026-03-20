@@ -364,7 +364,13 @@ class VPSDESchedule(nn.Module):
 
 class Harold(nn.Module):
     """
-    Harold v3 — Continuous Diffusion con VP-SDE.
+    Harold v0.4 — Continuous Diffusion con VP-SDE.
+
+    Cambiamenti rispetto a v0.3:
+      - Tokenizer: GPT-2 BPE (50,257 vocab, case-sensitive, byte-level)
+                   invece di BERT-uncased (30,522 vocab, lowercase)
+      - padding_idx rimosso — GPT-2 non ha token di padding dedicato,
+        usiamo la mask esplicita nel compute_loss
 
     Pipeline training:
       1. x0_emb = token_emb(x0)
@@ -375,7 +381,7 @@ class Harold(nn.Module):
     Pipeline inferenza:
       - Parti da rumore puro x_1 ~ N(0,I)
       - Integra reverse SDE con Euler-Maruyama da t=1 a t=0
-      - Decodifica finale con ce_logits.argmax o nearest-neighbor
+      - Decodifica finale con ce_logits.argmax
     """
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -385,7 +391,8 @@ class Harold(nn.Module):
         self.emb_vocab     = emb_vocab
         self.mask_token_id = config.vocab_size
 
-        self.token_emb = nn.Embedding(emb_vocab, config.d_model, padding_idx=0)
+        # GPT-2: nessun padding_idx fisso — il padding è gestito dalla mask
+        self.token_emb = nn.Embedding(emb_vocab, config.d_model)
         self.pos_emb   = nn.Embedding(config.max_seq_len, config.d_model)
 
         self.time_emb = nn.Sequential(
@@ -507,7 +514,7 @@ class Harold(nn.Module):
         fixed_t:        Optional[torch.Tensor] = None,  # (B,) in [0,1]
         self_cond_prob: float = 0.0,
         ctx_emb:        Optional[torch.Tensor] = None,  # (B, D) context per CFG
-        p_uncond:       float = 0.1,                    # prob di zerare ctx_emb (CFG)
+        p_uncond:       float = 0.0,                    # prob di zerare ctx_emb (CFG)
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Score matching loss per VP-SDE con SNR weighting.

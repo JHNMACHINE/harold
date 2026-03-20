@@ -1,5 +1,5 @@
 """
-dataset.py — Harold v3
+dataset.py — Harold v0.4
 ==========================
 MixedStreamingDataset a 5 sorgenti:
   - FineWeb-Edu  30%  (base accademica)
@@ -8,18 +8,18 @@ MixedStreamingDataset a 5 sorgenti:
   - C4            15%  (testo web generico)
   - OpenWebText   15%  (Reddit/HN, registro informale)
 
-Aggiunge:
-  - compute_token_weights(): precomputa frequenze per token-weighted schedule
-  - Mixing deterministico con contatore cumulativo (invariato da v2)
-  - num_workers=0 obbligatorio per streaming HF (fix core dump)
+Cambiamenti v0.4 rispetto a v0.3:
+  - sep_id: usa eos_token_id (GPT-2: 50256) invece di sep_token_id (BERT: 102)
+  - padding SFT: usa pad_token_id del tokenizer invece di 0
+    (con GPT-2, token 0 = "!" — un token valido, non padding)
+  - mask SFT: usa pad_token_id per costruire response_mask correttamente
 """
 
 import os
-from typing import Iterator
-import torch
-from transformers import PreTrainedTokenizer
-from torch.utils.data import IterableDataset, DataLoader
 from typing import Iterator, Optional
+import torch
+from transformers import BatchEncoding, PreTrainedTokenizer
+from torch.utils.data import IterableDataset, DataLoader
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -27,15 +27,14 @@ from typing import Iterator, Optional
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_token_weights(
-    tokenizer:   PreTrainedTokenizer,
-    weights:     dict,                    # es. {"fineweb":0.30, "wikipedia":0.20, ...}
-    save_path:   str  = "token_weights.pt",
+    tokenizer:    PreTrainedTokenizer,
+    weights:      dict,
+    save_path:    str = "token_weights.pt",
     n_docs_total: int = 50000,
 ) -> torch.Tensor:
     """
-    Precomputa i pesi dei token campionando da tutti i dataset del mix
-    in proporzione ai loro pesi — le frequenze riflettono la distribuzione
-    reale che il modello vede durante il training.
+    Precomputa i pesi dei token campionando dal mix di dataset.
+    Usato per il token-weighted noise schedule.
     """
     if os.path.exists(save_path):
         print(f"Token weights trovati: {save_path}")
@@ -45,7 +44,7 @@ def compute_token_weights(
     from collections import Counter
 
     print(f"Calcolo token weights su {n_docs_total} documenti dal mix...")
-    counter   = Counter()
+    counter = Counter()
 
     for i, (name, cfg) in enumerate(MixedStreamingDataset.DATASET_CONFIGS.items()):
         if name not in weights:
@@ -64,23 +63,28 @@ def compute_token_weights(
             text = (example.get(cfg["text_field"]) or "").strip()
             if not text:
                 continue
-            ids = tokenizer(
+            tokenized = tokenizer(
                 text, truncation=True, max_length=512,
-                return_attention_mask=False, verbose=False,
-            )["input_ids"]
-            counter.update(ids)  # type: ignore
+                return_attention_mask=False,
+            )
+            ids = tokenized["input_ids"]
+            # Ensure ids is a list of ints
+            if isinstance(ids, list):
+                counter.update(ids)
+            elif isinstance(ids, (int, float)):
+                counter.update([int(ids)])
             n_seen += 1
 
     freq = torch.zeros(tokenizer.vocab_size)
     for tok_id, count in counter.items():
-        if 0 <= tok_id < tokenizer.vocab_size:
-            freq[tok_id] = float(count)
+        if isinstance(tok_id, (int, float)) and 0 <= tok_id < tokenizer.vocab_size:
+            freq[int(tok_id)] = float(count)
 
     N   = float(freq.sum())
     idf = torch.log(N / (freq + 1.0))
     w   = (idf - idf.min()) / (idf.max() - idf.min() + 1e-8)
 
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
     torch.save(w, save_path)
     print(f"Token weights salvati: {save_path}")
     return w
@@ -92,14 +96,84 @@ def compute_token_weights(
 
 def _tokenize_doc(text: str, tokenizer: PreTrainedTokenizer, sep_id: int) -> list[int]:
     """Tokenizza un documento e aggiunge il separatore finale."""
-    ids = tokenizer(
+    tokenized = tokenizer(
         text,
         add_special_tokens=False,
         truncation=False,
         return_attention_mask=False,
-        verbose=False,
-    )["input_ids"]
-    return [int(x) for x in ids] + [sep_id] # type: ignore
+    )
+    
+    # Extract input_ids safely
+    ids = None
+    
+    # Handle dict-like objects (BatchEncoding)
+    if isinstance(tokenized, dict):
+        ids = tokenized.get("input_ids")
+    # Handle objects with input_ids attribute (Encoding, BatchEncoding)
+    elif hasattr(tokenized, "input_ids"):
+        ids = tokenized.input_ids
+    else:
+        # Fallback: use tokenized directly
+        ids = tokenized
+    
+    # If ids is still None, return just the separator
+    if ids is None:
+        return [sep_id]
+    
+    # Convert to list of ints
+    if hasattr(ids, "tolist"):
+        # PyTorch/TensorFlow tensor
+        token_ids = ids.tolist()
+    elif isinstance(ids, (list, tuple)):
+        token_ids = list(ids)
+    elif isinstance(ids, (int, float)):
+        token_ids = [int(ids)]
+    else:
+        # Try to convert iterable to list
+        try:
+            token_ids = list(ids) if hasattr(ids, "__iter__") else [ids]
+        except (TypeError, ValueError):
+            token_ids = []
+    
+    # Ensure all are ints and filter out invalid values
+    result = []
+    for x in token_ids:
+        # Skip if x is a dict or BatchEncoding or any container type
+        if isinstance(x, (dict, BatchEncoding)):
+            # Recursively extract from nested structures
+            result.extend(_extract_token_ids_from_value(x))
+        else:
+            try:
+                result.append(int(x))
+            except (TypeError, ValueError):
+                continue
+    
+    return result + [sep_id]
+
+def _extract_token_ids_from_value(value) -> list[int]:
+    """Helper to extract token IDs from nested values."""
+    if value is None:
+        return []
+    
+    if isinstance(value, (dict, BatchEncoding)):
+        ids = value.get("input_ids") if isinstance(value, dict) else getattr(value, "input_ids", None)
+        if ids is not None:
+            return _extract_token_ids_from_value(ids)
+        return []
+    
+    if isinstance(value, (list, tuple)):
+        result = []
+        for item in value:
+            result.extend(_extract_token_ids_from_value(item))
+        return result
+    
+    if hasattr(value, "tolist"):
+        return _extract_token_ids_from_value(value.tolist())
+    
+    try:
+        return [int(value)]
+    except (TypeError, ValueError):
+        return []
 
 
 def _iter_dataset(
@@ -112,10 +186,7 @@ def _iter_dataset(
     buffer_size:  int,
     seed:         int,
 ) -> Iterator[list[int]]:
-    """
-    Iteratore generico per qualsiasi dataset HF con campo testo.
-    Applica split train/val interleaved.
-    """
+    """Iteratore generico per qualsiasi dataset HF con campo testo."""
     from datasets import load_dataset
 
     ds = load_dataset(**load_kwargs, streaming=True)
@@ -140,27 +211,15 @@ def _iter_dataset(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MixedStreamingDataset v3 — 5 sorgenti
+# MixedStreamingDataset v0.4 — 5 sorgenti
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MixedStreamingDataset(IterableDataset):
     """
     Mescola 5 dataset HF in streaming con proporzioni configurabili.
-
-    Mixing deterministico con contatore cumulativo:
-      - Sceglie il dataset con il deficit maggiore rispetto alla proporzione target
-      - Proporzioni esatte garantite su milioni di documenti
-      - Riproducibile con lo stesso seed
-
-    Dataset e proporzioni default:
-      FineWeb-Edu  30%  — base accademica, vocabolario ricco
-      Wikipedia    20%  — conoscenza fattuale strutturata
-      Books        20%  — narrativa, coerenza su sequenze lunghe
-      C4           15%  — testo web generico, varietà di registro
-      OpenWebText  15%  — Reddit/HN, linguaggio informale/conversazionale
+    Mixing deterministico con contatore cumulativo.
     """
 
-    # Configurazione dei dataset — modifica qui per cambiare sorgenti
     DATASET_CONFIGS = {
         "fineweb": {
             "load_kwargs": {
@@ -206,15 +265,12 @@ class MixedStreamingDataset(IterableDataset):
         self,
         tokenizer:    PreTrainedTokenizer,
         seq_len:      int,
-        split:        str   = "train",
-        val_every:    int   = 200,
-        seed:         int   = 42,
-        buffer_size:  int   = 1000,
-        weights:      dict  | None = None,
+        split:        str        = "train",
+        val_every:    int        = 200,
+        seed:         int        = 42,
+        buffer_size:  int        = 1000,
+        weights:      dict | None = None,
     ):
-        """
-        weights: dizionario {nome_dataset: proporzione} — default 30/20/20/15/15
-        """
         super().__init__()
         self.tokenizer   = tokenizer
         self.seq_len     = seq_len
@@ -222,8 +278,6 @@ class MixedStreamingDataset(IterableDataset):
         self.val_every   = val_every
         self.seed        = seed
         self.buffer_size = buffer_size
-
-        # Pesi default
         self.weights = weights or {
             "fineweb":   0.30,
             "wikipedia": 0.20,
@@ -231,20 +285,35 @@ class MixedStreamingDataset(IterableDataset):
             "c4":        0.15,
             "owt":       0.15,
         }
-
-        # Verifica che i pesi sommino a ~1
         total = sum(self.weights.values())
-        assert abs(total - 1.0) < 0.01, f"I pesi devono sommare a 1.0, trovato {total:.3f}"
-
-        # Verifica che tutti i dataset siano configurati
+        assert abs(total - 1.0) < 0.01, f"Pesi devono sommare a 1.0, trovato {total:.3f}"
         for name in self.weights:
             assert name in self.DATASET_CONFIGS, f"Dataset sconosciuto: {name!r}"
 
     def _make_iterators(self) -> dict[str, Iterator[list[int]]]:
-        """Crea un iteratore per ogni dataset attivo."""
-        sep_id = int(self.tokenizer.sep_token_id or self.tokenizer.eos_token_id or 0) # type: ignore
-        iters  = {}
+        # [v0.4] GPT-2 non ha sep_token — usa eos_token_id come separatore
+        # BERT aveva sep_token_id=102 ([SEP]), GPT-2 usa eos_token_id=50256
+        
+        # Helper function to safely extract a single token ID
+        def get_token_id(token_id):
+            if token_id is None:
+                return None
+            if isinstance(token_id, list):
+                return token_id[0] if token_id else None
+            return token_id
+        
+        sep_token = get_token_id(self.tokenizer.sep_token_id)
+        eos_token = get_token_id(self.tokenizer.eos_token_id)
+        
+        sep_id = int(
+            sep_token
+            if sep_token is not None
+            else eos_token
+            if eos_token is not None
+            else 0
+        )
 
+        iters = {}
         for i, (name, cfg) in enumerate(self.DATASET_CONFIGS.items()):
             if name not in self.weights:
                 continue
@@ -256,37 +325,20 @@ class MixedStreamingDataset(IterableDataset):
                 split        = self.split,
                 val_every    = self.val_every,
                 buffer_size  = self.buffer_size,
-                seed         = self.seed + i * 7,   # seed diverso per ogni sorgente
+                seed         = self.seed + i * 7,
             )
-
         return iters
 
     def __iter__(self) -> Iterator[dict]:
-        """
-        Mixing deterministico con contatore cumulativo.
-
-        Per ogni dataset mantiene un contatore cumulativo:
-          incremento = 1 / peso
-        Dataset con peso 0.30 incrementa di 3.33 per doc → meno frequente
-        Dataset con peso 0.15 incrementa di 6.67 per doc → ancora meno
-
-        Scegliamo sempre il dataset con il contatore minore (il più "in debito").
-        Questo garantisce le proporzioni esatte su qualsiasi numero di documenti.
-        """
-        iters    = self._make_iterators()
-        names    = list(iters.keys())
-        carry    = []
-
-        # Contatori cumulativi: init uguale per tutti
-        counters = {name: 0.0 for name in names}
-        incs     = {name: 1.0 / self.weights[name] for name in names}
-
-        # Dataset esauriti — rimuovere dalla rotazione
-        exhausted = set()
+        iters     = self._make_iterators()
+        names     = list(iters.keys())
+        carry: list[int] = []
+        counters  = {name: 0.0 for name in names}
+        incs      = {name: 1.0 / self.weights[name] for name in names}
+        exhausted: set[str] = set()
 
         while len(exhausted) < len(names):
-            # Sceglie il dataset con contatore minore tra i non esauriti
-            active  = [(counters[n], n) for n in names if n not in exhausted]
+            active = [(counters[n], n) for n in names if n not in exhausted]
             if not active:
                 break
             _, chosen = min(active)
@@ -300,7 +352,6 @@ class MixedStreamingDataset(IterableDataset):
 
             carry.extend(ids)
 
-            # Estrai chunk di seq_len senza overlap
             while len(carry) >= self.seq_len:
                 chunk = carry[:self.seq_len]
                 carry = carry[self.seq_len:]
@@ -312,16 +363,11 @@ class MixedStreamingDataset(IterableDataset):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Factory
+# Factory pretraining
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_loaders(train_cfg, tokenizer: PreTrainedTokenizer):
-    """
-    Costruisce train_loader e val_loader per il training v3.
-    num_workers=0 obbligatorio con streaming HF (fix core dump multiprocessing).
-    """
-    from torch.utils.data import DataLoader
-
+    """Costruisce train_loader e val_loader per il pretraining v0.4."""
     weights = {
         "fineweb":   train_cfg.fineweb_weight,
         "wikipedia": train_cfg.wikipedia_weight,
@@ -330,10 +376,7 @@ def build_loaders(train_cfg, tokenizer: PreTrainedTokenizer):
         "owt":       train_cfg.owt_weight,
     }
 
-    print(
-        f"Dataset mix v3: "
-        + ", ".join(f"{k} {v:.0%}" for k, v in weights.items())
-    )
+    print("Dataset mix v0.4: " + ", ".join(f"{k} {v:.0%}" for k, v in weights.items()))
 
     train_ds = MixedStreamingDataset(
         tokenizer=tokenizer, seq_len=train_cfg.seq_len,
@@ -348,47 +391,18 @@ def build_loaders(train_cfg, tokenizer: PreTrainedTokenizer):
         weights=weights,
     )
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=train_cfg.batch_size,
-        num_workers=0,    # obbligatorio con streaming HF
-        pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=train_cfg.batch_size,
-        num_workers=0,
-        pin_memory=True,
-    )
-
+    train_loader = DataLoader(train_ds, batch_size=train_cfg.batch_size,
+                              num_workers=0, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=train_cfg.batch_size,
+                              num_workers=0, pin_memory=True)
     return train_loader, val_loader
 
-"""
-===========================
-Dataset per Supervised Fine-Tuning (SFT) con CFG.
-
-Strati:
-  1. HuggingFaceH4/ultrachat_200k  — 200k conversazioni multi-turn
-  2. Open-Orca/OpenOrca            — 1M Q&A con chain-of-thought
-
-Formato output per ogni esempio:
-  {
-    "prompt_ids":   (L_ctx,)  token IDs del contesto (ultimi max_ctx_turns turni)
-    "response_ids": (L_resp,) token IDs della risposta da generare
-    "attention_mask": (L_resp,) bool — token non-padding
-  }
-
-CFG: il contesto viene usato come conditioning signal.
-     Con prob p_uncond viene sostituito con una sequenza vuota (zeros)
-     per abilitare il training unconditional.
-"""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers di formattazione
+# SFT helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _format_turn(role: str, content: str) -> str:
-    """Formatta un singolo turno con marker di ruolo."""
     role_tag = "User" if role == "user" else "Assistant"
     return f"{role_tag}: {content.strip()}"
 
@@ -397,36 +411,16 @@ def _build_context_and_response(
     messages:      list,
     max_ctx_turns: int,
 ) -> tuple[str, str]:
-    """
-    Estrae contesto e risposta da una lista di messaggi.
-
-    Strategia:
-      - L'ultimo messaggio deve essere dell'assistente (la risposta target)
-      - Il contesto è composto dagli ultimi max_ctx_turns turni precedenti
-      - Se la conversazione è troppo corta, il contesto può essere vuoto
-
-    Returns:
-        (context_str, response_str)
-    """
-    # Trova l'ultimo turno dell'assistente
     if not messages or messages[-1].get("role") != "assistant":
         return "", ""
-
     response = messages[-1]["content"].strip()
     if not response:
         return "", ""
-
-    # Prendi gli ultimi max_ctx_turns turni PRIMA della risposta
     preceding = messages[:-1]
-    ctx_turns  = preceding[-max_ctx_turns:] if max_ctx_turns > 0 else []
-
-    context = " ".join(_format_turn(m["role"], m["content"]) for m in ctx_turns)
+    ctx_turns = preceding[-max_ctx_turns:] if max_ctx_turns > 0 else []
+    context   = " ".join(_format_turn(m["role"], m["content"]) for m in ctx_turns)
     return context, response
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Iteratori per i dataset
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _iter_ultrachat(
     tokenizer:      PreTrainedTokenizer,
@@ -437,8 +431,29 @@ def _iter_ultrachat(
     val_every:      int,
     seed:           int,
 ) -> Iterator[dict]:
-    """Iteratore per HuggingFaceH4/ultrachat_200k."""
     from datasets import load_dataset
+    
+    def to_list(obj):
+        """Convert various types to a list."""
+        if obj is None:
+            return []
+        if hasattr(obj, "tolist"):
+            return obj.tolist()
+        if isinstance(obj, (list, tuple)):
+            return list(obj)
+        if hasattr(obj, "__iter__"):
+            return list(obj)
+        return [obj]
+    
+    def extract_ids(tokenized):
+        """Extract input_ids from tokenizer output."""
+        if isinstance(tokenized, dict):
+            ids = tokenized.get("input_ids", [])
+        elif hasattr(tokenized, "input_ids"):
+            ids = tokenized.input_ids
+        else:
+            ids = tokenized if isinstance(tokenized, list) else []
+        return to_list(ids)
 
     ds = load_dataset(
         "HuggingFaceH4/ultrachat_200k",
@@ -449,7 +464,9 @@ def _iter_ultrachat(
 
     doc_idx = 0
     for example in ds:
-        messages = example.get("messages", [])
+        # Safely get and convert messages
+        messages = to_list(example.get("messages", []))
+        
         if len(messages) < 2:
             doc_idx += 1
             continue
@@ -464,24 +481,25 @@ def _iter_ultrachat(
             doc_idx += 1
             continue
 
-        prompt_ids = tokenizer(
-            context, truncation=True, max_length=max_ctx_len,
-            add_special_tokens=False, return_attention_mask=False,
-        )["input_ids"] if context else []
+        prompt_ids = []
+        if context:
+            tokenized = tokenizer(
+                context, truncation=True, max_length=max_ctx_len,
+                add_special_tokens=False, return_attention_mask=False,
+            )
+            prompt_ids = extract_ids(tokenized)
 
-        resp_ids = tokenizer(
+        tokenized_resp = tokenizer(
             response, truncation=True, max_length=max_resp_len,
             add_special_tokens=True, return_attention_mask=False,
-        )["input_ids"]
+        )
+        resp_ids = extract_ids(tokenized_resp)
 
-        if len(resp_ids) < 4: # type: ignore
+        if len(resp_ids) < 4:  
             doc_idx += 1
             continue
 
-        yield {
-            "prompt_ids":   prompt_ids,
-            "response_ids": resp_ids,
-        }
+        yield {"prompt_ids": prompt_ids, "response_ids": resp_ids}
         doc_idx += 1
 
 
@@ -493,11 +511,29 @@ def _iter_openorca(
     val_every:      int,
     seed:           int,
 ) -> Iterator[dict]:
-    """
-    Iteratore per Open-Orca/OpenOrca.
-    Formato: {"system_prompt": ..., "question": ..., "response": ...}
-    """
     from datasets import load_dataset
+    
+    def to_list(obj):
+        """Convert various types to a list."""
+        if obj is None:
+            return []
+        if hasattr(obj, "tolist"):
+            return obj.tolist()
+        if isinstance(obj, (list, tuple)):
+            return list(obj)
+        if hasattr(obj, "__iter__"):
+            return list(obj)
+        return [obj]
+    
+    def extract_ids(tokenized):
+        """Extract input_ids from tokenizer output."""
+        if isinstance(tokenized, dict):
+            ids = tokenized.get("input_ids", [])
+        elif hasattr(tokenized, "input_ids"):
+            ids = tokenized.input_ids
+        else:
+            ids = tokenized if isinstance(tokenized, list) else []
+        return to_list(ids)
 
     ds = load_dataset("Open-Orca/OpenOrca", split="train", streaming=True)
     ds = ds.shuffle(buffer_size=1000, seed=seed)
@@ -509,35 +545,41 @@ def _iter_openorca(
             doc_idx += 1
             continue
 
-        system   = (example.get("system_prompt") or "").strip()
-        question = (example.get("question") or "").strip()
-        response = (example.get("response") or "").strip()
+        # Safely get fields and convert to strings
+        system = example.get("system_prompt")
+        system = str(system).strip() if system is not None else ""
+        
+        question = example.get("question")
+        question = str(question).strip() if question is not None else ""
+        
+        response = example.get("response")
+        response = str(response).strip() if response is not None else ""
 
         if not question or not response:
             doc_idx += 1
             continue
 
-        # Contesto = system prompt + domanda
         context = f"{system} User: {question}".strip() if system else f"User: {question}"
 
-        prompt_ids = tokenizer(
+        # Tokenize context
+        tokenized_ctx = tokenizer(
             context, truncation=True, max_length=max_ctx_len,
             add_special_tokens=False, return_attention_mask=False,
-        )["input_ids"]
+        )
+        prompt_ids = extract_ids(tokenized_ctx)
 
-        resp_ids = tokenizer(
+        # Tokenize response
+        tokenized_resp = tokenizer(
             response, truncation=True, max_length=max_resp_len,
             add_special_tokens=True, return_attention_mask=False,
-        )["input_ids"]
+        )
+        resp_ids = extract_ids(tokenized_resp)
 
-        if len(resp_ids) < 4: # type: ignore
+        if len(resp_ids) < 4:
             doc_idx += 1
             continue
 
-        yield {
-            "prompt_ids":   prompt_ids,
-            "response_ids": resp_ids,
-        }
+        yield {"prompt_ids": prompt_ids, "response_ids": resp_ids}
         doc_idx += 1
 
 
@@ -549,28 +591,23 @@ class SFTDataset(IterableDataset):
     """
     Dataset SFT che mixa UltraChat e OpenOrca in streaming.
 
-    Ogni batch contiene:
-      - prompt_ids:    (B, max_ctx_len)   token del contesto, paddato a sinistra
-      - response_ids:  (B, max_resp_len)  token della risposta, paddato a destra
-      - response_mask: (B, max_resp_len)  bool — token non-padding
-
-    Il padding usa 0 (padding_idx del modello).
+    Cambiamenti v0.4:
+      - padding usa pad_token_id del tokenizer invece di 0
+        (GPT-2: pad_token_id = eos_token_id = 50256)
+      - response_mask costruita su pad_token_id, non su 0
     """
 
-    DATASET_WEIGHTS = {
-        "ultrachat": 0.5,
-        "openorca":  0.5,
-    }
+    DATASET_WEIGHTS = {"ultrachat": 0.5, "openorca": 0.5}
 
     def __init__(
         self,
         tokenizer:     PreTrainedTokenizer,
-        split:         str   = "train",
-        max_ctx_len:   int   = 128,   # lunghezza massima del contesto
-        max_resp_len:  int   = 128,   # lunghezza massima della risposta
-        max_ctx_turns: int   = 3,     # ultimi N turni come contesto
-        val_every:     int   = 200,
-        seed:          int   = 42,
+        split:         str            = "train",
+        max_ctx_len:   int            = 128,
+        max_resp_len:  int            = 128,
+        max_ctx_turns: int            = 3,
+        val_every:     int            = 200,
+        seed:          int            = 42,
         weights:       Optional[dict] = None,
     ):
         super().__init__()
@@ -583,34 +620,52 @@ class SFTDataset(IterableDataset):
         self.seed          = seed
         self.weights       = weights or self.DATASET_WEIGHTS
 
+        # Helper function to safely extract a single token ID
+        def _first(val):
+            if val is None:
+                return None
+            if isinstance(val, list):
+                return val[0] if val else None
+            return val
+
+        # [v0.4] pad_token_id per GPT-2 = eos_token_id = 50256
+        pad_token = _first(tokenizer.pad_token_id)
+        eos_token = _first(tokenizer.eos_token_id)
+        
+        self.pad_id = int(
+            pad_token
+            if pad_token is not None
+            else eos_token
+            if eos_token is not None
+            else 0
+        )
+
     def _make_iterators(self) -> dict:
         iters = {}
         if "ultrachat" in self.weights:
             iters["ultrachat"] = _iter_ultrachat(
                 self.tokenizer, self.split,
                 self.max_ctx_len, self.max_resp_len,
-                self.max_ctx_turns, self.val_every,
-                seed=self.seed,
+                self.max_ctx_turns, self.val_every, seed=self.seed,
             )
         if "openorca" in self.weights:
             iters["openorca"] = _iter_openorca(
                 self.tokenizer, self.split,
                 self.max_ctx_len, self.max_resp_len,
-                self.val_every,
-                seed=self.seed + 7,
+                self.val_every, seed=self.seed + 7,
             )
         return iters
 
     def _pad_left(self, ids: list, length: int) -> torch.Tensor:
-        """Padding a sinistra con 0 — il contesto è più leggibile così."""
-        t = torch.zeros(length, dtype=torch.long)
+        """Padding a sinistra con pad_id."""
+        t = torch.full((length,), self.pad_id, dtype=torch.long)
         n = min(len(ids), length)
         t[length - n:] = torch.tensor(ids[-n:], dtype=torch.long)
         return t
 
     def _pad_right(self, ids: list, length: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Padding a destra con 0. Ritorna (ids_padded, mask)."""
-        t    = torch.zeros(length, dtype=torch.long)
+        """Padding a destra con pad_id. Ritorna (ids_padded, mask)."""
+        t    = torch.full((length,), self.pad_id, dtype=torch.long)
         mask = torch.zeros(length, dtype=torch.bool)
         n    = min(len(ids), length)
         t[:n]    = torch.tensor(ids[:n], dtype=torch.long)
@@ -618,12 +673,11 @@ class SFTDataset(IterableDataset):
         return t, mask
 
     def __iter__(self) -> Iterator[dict]:
-        """Mixing deterministico con contatore cumulativo."""
         iters     = self._make_iterators()
         names     = list(iters.keys())
         counters  = {n: 0.0 for n in names}
         incs      = {n: 1.0 / self.weights[n] for n in names}
-        exhausted = set()
+        exhausted: set[str] = set()
 
         while len(exhausted) < len(names):
             active = [(counters[n], n) for n in names if n not in exhausted]
@@ -638,28 +692,27 @@ class SFTDataset(IterableDataset):
                 exhausted.add(chosen)
                 continue
 
-            prompt_ids   = self._pad_left(item["prompt_ids"], self.max_ctx_len)
-            resp_ids, mask = self._pad_right(item["response_ids"], self.max_resp_len)
+            prompt_ids      = self._pad_left(item["prompt_ids"], self.max_ctx_len)
+            resp_ids, mask  = self._pad_right(item["response_ids"], self.max_resp_len)
 
             yield {
-                "prompt_ids":    prompt_ids,    # (max_ctx_len,)
-                "response_ids":  resp_ids,      # (max_resp_len,)
-                "response_mask": mask,          # (max_resp_len,) bool
+                "prompt_ids":    prompt_ids,
+                "response_ids":  resp_ids,
+                "response_mask": mask,
             }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Factory
+# Factory SFT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_sft_loaders(
     train_cfg,
-    tokenizer: PreTrainedTokenizer,
-    max_ctx_len:  int = 128,
-    max_resp_len: int = 128,
+    tokenizer:     PreTrainedTokenizer,
+    max_ctx_len:   int = 128,
+    max_resp_len:  int = 128,
     max_ctx_turns: int = 3,
 ) -> tuple[DataLoader, DataLoader]:
-    """Costruisce train e val loader per il SFT."""
 
     train_ds = SFTDataset(
         tokenizer=tokenizer, split="train",
@@ -674,13 +727,8 @@ def build_sft_loaders(
         val_every=train_cfg.val_every, seed=42,
     )
 
-    train_loader = DataLoader(
-        train_ds, batch_size=train_cfg.batch_size,
-        num_workers=0, pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=train_cfg.batch_size,
-        num_workers=0, pin_memory=True,
-    )
-
+    train_loader = DataLoader(train_ds, batch_size=train_cfg.batch_size,
+                              num_workers=0, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=train_cfg.batch_size,
+                              num_workers=0, pin_memory=True)
     return train_loader, val_loader

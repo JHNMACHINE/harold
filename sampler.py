@@ -1,24 +1,7 @@
 """
-Harold v3 — sampler_v3.py
+Harold v3 — sampler.py
 ==========================
 Sampler per VP-SDE continuous diffusion con reverse SDE (Euler-Maruyama).
-
-Fix rispetto alla versione precedente:
-  [FIX S1] Tuple_ import spostato in cima — era in fondo al file, dopo l'uso
-  [FIX S2] _emb_to_tokens_ce non era usabile dall'esterno (richiedeva x_out
-           pre-head) — rimosso, si usa ce_logits direttamente ovunque
-  [FIX S3] self_cond aggiornato con eps_pred.mean invece di x_next.mean —
-           più coerente: il self-cond dovrebbe riflettere la predizione
-           del modello, non lo stato SDE
-  [FIX S4] top-k dinamico MoE ripristinato in inferenza — passa t_normalized
-           al modello attraverso forward() che già lo gestisce internamente
-  [FIX S5] generate() e generate_batch() unificate nella logica di decodifica
-           finale — evitava duplicazione e bug potenziali
-  [FIX S6] temperature=1.0 con top_p=1.0 ora fa argmax invece di sampling
-           uniforme — condizione corretta
-  [FIX S7] Prompt injection: le posizioni del prompt vengono inizializzate
-           con i loro embedding reali, non con rumore — era già così ma
-           ora è esplicitamente garantito anche dopo ogni step SDE
 """
 
 import math
@@ -29,7 +12,14 @@ from typing import Literal, Optional, List, Tuple
 from transformers import PreTrainedTokenizer, AutoTokenizer
 
 from model import Harold, build_model
-from config import SFTConfig
+
+# Import opzionale di SFTConfig — necessario per caricare checkpoint SFT
+# senza questo torch.load fallisce perché SFTConfig è serializzata nel checkpoint
+try:
+    from train_sft import SFTConfig  # noqa: F401
+except ImportError:
+    pass
+
 
 SamplingMode = Literal["argmax", "sample", "confidence"]
 
@@ -43,7 +33,7 @@ class HaroldSampler:
          (le posizioni del prompt sono fissate ai loro embedding)
       2. Per ogni step t da 1 a 0:
            a. Forward: predice ε e ce_logits
-           b. Calcola score = -ε / σ(t)
+           b. Calcola score = -ε / o(t)
            c. Integra reverse SDE: dx = drift*dt + diffusion*dW
            d. Ripristina posizioni del prompt (invarianti)
            e. Aggiorna self_cond = eps_pred.mean(dim=1)
@@ -92,52 +82,38 @@ class HaroldSampler:
 
     def _build_unused_mask(self) -> torch.Tensor:
         """
-        Costruisce una maschera booleana dei token indesiderati nel vocabolario.
-        Usa un approccio allowlist: mantiene solo i token "puliti" e blocca tutto
-        il resto.
+        Costruisce una maschera dei token da escludere dalla decodifica.
 
-        Token TENUTI (allowlist):
-          - Parole inglesi normali (solo lettere ASCII a-z)
-          - Numeri (0-9)
-          - Punteggiatura standard
-          - Subword con ## seguiti da lettere ASCII
+        GPT-2 non ha token [unused] o token speciali problematici —
+        il vocabolario è byte-level BPE quindi tutti i token sono validi.
 
-        Token BLOCCATI:
-          - Token speciali [CLS], [SEP], [PAD], [MASK], [UNK], [unused...]
-          - Caratteri non-ASCII: arabo, hindi, coreano, unicode vario
-          - Simboli matematici, caratteri CJK, ecc.
+        Maschiamo solo:
+        - Il token di padding aggiunto da Harold (idx = vocab_size = 50257)
+        - <|endoftext|> (idx 50256) usato come mask token durante la diffusione
+          ma che non deve apparire nell'output finale
 
-        Nota: parole inglesi rare come "creaked", "sparkled", ecc. NON vengono
-        bloccate — sono parole valide. La ripetizione ossessiva viene gestita
-        dalla repetition_penalty in _decode().
+        Questo è molto più semplice della versione BERT che richiedeva
+        una allowlist ASCII per filtrare [unused], [CLS], [SEP], ecc.
         """
         if hasattr(self, "_unused_mask_cache"):
             return self._unused_mask_cache
 
-        import re
-        allowed = re.compile(
-            r"^("
-            r"[a-z]+"           r"|"
-            r"[0-9]+"           r"|"
-            r"[.,!?:;'\"\-\(\)\[\]/@#&\*\+=%<>\\]+"  r"|"
-            r"##[a-z0-9]+"
-            r")$"
-        )
+        V    = self.model.emb_vocab
+        mask = torch.zeros(V, dtype=torch.bool, device=self.device)
 
-        vocab = self.tokenizer.get_vocab()
-        V     = self.model.emb_vocab
-        mask  = torch.zeros(V, dtype=torch.bool, device=self.device)
+        # Maschera il mask token (usato durante la diffusion, non nell'output)
+        mask_token_id = self.model.mask_token_id
+        if mask_token_id < V:
+            mask[mask_token_id] = True
 
-        for token_str, idx in vocab.items():
-            if idx >= V:
-                continue
-            if not allowed.match(token_str.lower()):
-                mask[idx] = True
+        # Maschera il padding token aggiunto da Harold (vocab_size)
+        pad_id = self.model.config.vocab_size
+        if pad_id < V:
+            mask[pad_id] = True
 
         self._unused_mask_cache = mask
-        n_allowed = V - int(mask.sum().item())
-        n_masked  = int(mask.sum().item())
-        print(f"[sampler] Vocabolario: {n_allowed} token attivi, {n_masked} bloccati")
+        n_masked = int(mask.sum().item())
+        print(f"[sampler] Token mascherati: {n_masked} (mask + pad)")
         return mask
 
     def _mask_unused_tokens(self, ce_logits: torch.Tensor) -> torch.Tensor:
@@ -621,7 +597,10 @@ if __name__ == "__main__":
     model.load_state_dict(state["model_state"])
     print(f"Checkpoint caricato: {ckpt_path}")
 
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    # GPT-2 non ha pad token di default — lo aggiungiamo
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     sampler   = HaroldSampler(model, tokenizer, device=device)
 
     prompt = "Once upon a time"
