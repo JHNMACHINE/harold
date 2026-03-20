@@ -1,272 +1,375 @@
 """
 dataset.py — Harold v0.4
 ==========================
-MixedStreamingDataset a 5 sorgenti:
-  - FineWeb-Edu  30%  (base accademica)
-  - Wikipedia EN 20%  (conoscenza fattuale)
-  - Books/Gutenberg 20% (narrativa, coerenza lunga)
-  - C4            15%  (testo web generico)
-  - OpenWebText   15%  (Reddit/HN, registro informale)
-
-Cambiamenti v0.4 rispetto a v0.3:
-  - sep_id: usa eos_token_id (GPT-2: 50256) invece di sep_token_id (BERT: 102)
-  - padding SFT: usa pad_token_id del tokenizer invece di 0
-    (con GPT-2, token 0 = "!" — un token valido, non padding)
-  - mask SFT: usa pad_token_id per costruire response_mask correttamente
+Dataset dinamico configurato da YAML
 """
 
-import os
+from __future__ import annotations
+from pathlib import Path
 from typing import Iterator, Optional
+import yaml
 import torch
 from transformers import BatchEncoding, PreTrainedTokenizer
 from torch.utils.data import IterableDataset, DataLoader
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Iteratori per i singoli dataset
+# Helpers generici
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _tokenize_doc(text: str, tokenizer: PreTrainedTokenizer, sep_id: int) -> list[int]:
-    """Tokenizza un documento e aggiunge il separatore finale."""
-    tokenized = tokenizer(
-        text,
-        add_special_tokens=False,
-        truncation=False,
-        return_attention_mask=False,
-    )
-    
-    # Extract input_ids safely
-    ids = None
-    
-    # Handle dict-like objects (BatchEncoding)
-    if isinstance(tokenized, dict):
-        ids = tokenized.get("input_ids")
-    # Handle objects with input_ids attribute (Encoding, BatchEncoding)
+def _to_list(obj) -> list:
+    if obj is None:
+        return []
+    if hasattr(obj, "tolist"):
+        return obj.tolist()
+    if isinstance(obj, (list, tuple)):
+        return list(obj)
+    if hasattr(obj, "__iter__"):
+        return list(obj)
+    return [obj]
+
+
+def _extract_ids(tokenized) -> list[int]:
+    if isinstance(tokenized, (dict, BatchEncoding)):
+        ids = tokenized.get("input_ids", [])
     elif hasattr(tokenized, "input_ids"):
         ids = tokenized.input_ids
     else:
-        # Fallback: use tokenized directly
-        ids = tokenized
-    
-    # If ids is still None, return just the separator
-    if ids is None:
-        return [sep_id]
-    
-    # Convert to list of ints
-    if hasattr(ids, "tolist"):
-        # PyTorch/TensorFlow tensor
-        token_ids = ids.tolist()
-    elif isinstance(ids, (list, tuple)):
-        token_ids = list(ids)
-    elif isinstance(ids, (int, float)):
-        token_ids = [int(ids)]
-    else:
-        # Try to convert iterable to list
-        try:
-            token_ids = list(ids) if hasattr(ids, "__iter__") else [ids]
-        except (TypeError, ValueError):
-            token_ids = []
-    
-    # Ensure all are ints and filter out invalid values
-    result = []
-    for x in token_ids:
-        # Skip if x is a dict or BatchEncoding or any container type
-        if isinstance(x, (dict, BatchEncoding)):
-            # Recursively extract from nested structures
-            result.extend(_extract_token_ids_from_value(x))
-        else:
-            try:
-                result.append(int(x))
-            except (TypeError, ValueError):
-                continue
-    
-    return result + [sep_id]
-
-def _extract_token_ids_from_value(value) -> list[int]:
-    """Helper to extract token IDs from nested values."""
-    if value is None:
-        return []
-    
-    if isinstance(value, (dict, BatchEncoding)):
-        ids = value.get("input_ids") if isinstance(value, dict) else getattr(value, "input_ids", None)
-        if ids is not None:
-            return _extract_token_ids_from_value(ids)
-        return []
-    
-    if isinstance(value, (list, tuple)):
-        result = []
-        for item in value:
-            result.extend(_extract_token_ids_from_value(item))
-        return result
-    
-    if hasattr(value, "tolist"):
-        return _extract_token_ids_from_value(value.tolist())
-    
-    try:
-        return [int(value)]
-    except (TypeError, ValueError):
-        return []
+        ids = tokenized if isinstance(tokenized, list) else []
+    return [int(x) for x in _to_list(ids)]
 
 
-def _iter_dataset(
-    load_kwargs:  dict,
-    text_field:   str,
-    tokenizer:    PreTrainedTokenizer,
-    sep_id:       int,
-    split:        str,
-    val_every:    int,
-    buffer_size:  int,
-    seed:         int,
+def _first_token_id(val) -> int | None:
+    if val is None:
+        return None
+    if isinstance(val, list):
+        return int(val[0]) if val else None
+    return int(val)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Caricamento configurazione YAML
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_dataset_config(yaml_path: str = "datasets_config.yaml") -> dict:
+    """
+    Carica la configurazione dei dataset dal file YAML.
+    Valida che i pesi sommino a 1.0 per ogni sezione.
+    """
+    path = Path(yaml_path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Dataset config non trovato: {yaml_path}\n"
+            f"Assicurati che datasets_v04.yaml sia nella stessa directory."
+        )
+    with open(path) as f:
+        cfg = yaml.safe_load(f)
+
+    for section in ("pretraining", "sft"):
+        if section in cfg:
+            total = sum(d["weight"] for d in cfg[section])
+            assert abs(total - 1.0) < 0.01, \
+                f"Pesi {section} devono sommare a 1.0, trovato {total:.3f}"
+
+    return cfg
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Estrazione testo
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_text(example: dict, text_field: str, fmt: str = "standard") -> str:
+    if fmt == "codecontests":
+        desc     = (example.get("description") or "").strip()
+        sols     = example.get("solutions") or {}
+        sol_list = sols.get("solution", []) if isinstance(sols, dict) else []
+        first    = sol_list[0].strip() if sol_list else ""
+        return f"{desc}\n\n{first}".strip() if first else desc
+    return (example.get(text_field) or "").strip()
+
+
+def _tokenize_doc(text: str, tokenizer: PreTrainedTokenizer, sep_id: int) -> list[int]:
+    tokenized = tokenizer(
+        text, add_special_tokens=False,
+        truncation=False, return_attention_mask=False,
+    )
+    return _extract_ids(tokenized) + [sep_id]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Iteratore pretraining — generico, guidato dal YAML
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _iter_pretraining_dataset(
+    ds_cfg:      dict,
+    tokenizer:   PreTrainedTokenizer,
+    sep_id:      int,
+    split:       str,
+    val_every:   int,
+    buffer_size: int,
+    seed:        int,
 ) -> Iterator[list[int]]:
-    """Iteratore generico per qualsiasi dataset HF con campo testo."""
     from datasets import load_dataset
+
+    load_kwargs: dict = {"path": ds_cfg["path"], "split": ds_cfg["split"]}
+    if "config" in ds_cfg:
+        load_kwargs["name"] = ds_cfg["config"]
+
+    text_field = ds_cfg.get("text_field", "text")
+    fmt        = ds_cfg.get("format", "standard")
 
     ds = load_dataset(**load_kwargs, streaming=True)
     ds = ds.shuffle(buffer_size=buffer_size, seed=seed)
 
     doc_idx = 0
     for example in ds:
-        text = (example.get(text_field) or "").strip()
+        text = _extract_text(example, text_field, fmt)
         if not text:
             continue
-
         is_val = (doc_idx % val_every == 0)
         if (split == "val") != is_val:
             doc_idx += 1
             continue
-
         ids = _tokenize_doc(text, tokenizer, sep_id)
         if ids:
             yield ids
-
         doc_idx += 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MixedStreamingDataset v0.4 — 5 sorgenti
+# Iteratore SFT — generico, guidato dal YAML
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _format_turn(role: str, content: str) -> str:
+    return f"{'User' if role == 'user' else 'Assistant'}: {content.strip()}"
+
+
+def _iter_sft_dataset(
+    ds_cfg:        dict,
+    tokenizer:     PreTrainedTokenizer,
+    split:         str,
+    max_ctx_len:   int,
+    max_resp_len:  int,
+    val_every:     int,
+    seed:          int,
+    max_ctx_turns: int = 3,
+) -> Iterator[dict]:
+    """
+    Iteratore SFT generico — guidato dai campi nel YAML.
+
+    Strutture supportate (campo "structure" nel YAML):
+      pairs       — coppie (context, response) da campi fissi
+                    richiede "fields": {context: ..., response: ...}
+      multiturn   — conversazioni multi-turn con lista messaggi
+                    richiede "fields": {messages: ..., role_field: ...,
+                                        content_field: ..., assistant_role: ...}
+      ranked_pairs — come pairs ma filtra per rank=0 (oasst2)
+                    richiede "fields": {role: ..., text: ..., rank: ...}
+
+    Esempi nel YAML:
+      # openorca
+      structure: pairs
+      fields:
+        context:  [system_prompt, question]   # lista → concatena
+        response: response
+
+      # oasst2
+      structure: ranked_pairs
+      fields:
+        role: role
+        text: text
+        rank: rank
+        prompter_role: prompter
+        assistant_role: assistant
+
+      # ultrachat / conversazioni multi-turn
+      structure: multiturn
+      fields:
+        messages:       messages
+        role_field:     role
+        content_field:  content
+        assistant_role: assistant
+    """
+    from datasets import load_dataset
+
+    structure = ds_cfg.get("structure", "pairs")
+    fields    = ds_cfg.get("fields", {})
+
+    # Determina split HF
+    split_map = ds_cfg.get("split_map", {})
+    hf_split  = split_map.get(split, ds_cfg.get("split", "train"))
+
+    load_kwargs: dict = {"path": ds_cfg["path"], "split": hf_split}
+    if "config" in ds_cfg:
+        load_kwargs["name"] = ds_cfg["config"]
+
+    ds = load_dataset(**load_kwargs, streaming=True)
+    ds = ds.shuffle(buffer_size=1000, seed=seed)
+
+    def tok_ctx(text: str) -> list[int]:
+        return _extract_ids(tokenizer(
+            text, truncation=True, max_length=max_ctx_len,
+            add_special_tokens=False, return_attention_mask=False,
+        )) if text else []
+
+    def tok_resp(text: str) -> list[int]:
+        return _extract_ids(tokenizer(
+            text, truncation=True, max_length=max_resp_len,
+            add_special_tokens=True, return_attention_mask=False,
+        ))
+
+    def emit(doc_idx: int, context: str, response: str):
+        """Emette un esempio se nel corretto split."""
+        is_val = (doc_idx % val_every == 0)
+        if (split == "val") != is_val:
+            return None
+        resp_ids = tok_resp(response)
+        if len(resp_ids) < 4:
+            return None
+        return {"prompt_ids": tok_ctx(context), "response_ids": resp_ids}
+
+    # ── Struttura: pairs ────────────────────────────────────────────────────
+    if structure == "pairs":
+        ctx_fields  = fields.get("context", [])
+        resp_field  = fields.get("response", "response")
+        separator   = fields.get("separator", " ")
+
+        if isinstance(ctx_fields, str):
+            ctx_fields = [ctx_fields]
+
+        doc_idx = 0
+        for example in ds:
+            # Costruisce il contesto concatenando i campi specificati
+            parts   = [str(example.get(f) or "").strip() for f in ctx_fields]
+            context = separator.join(p for p in parts if p)
+            response = str(example.get(resp_field) or "").strip()
+
+            if not response:
+                doc_idx += 1
+                continue
+
+            result = emit(doc_idx, context, response)
+            if result:
+                yield result
+            doc_idx += 1
+
+    # ── Struttura: ranked_pairs (es. oasst2) ────────────────────────────────
+    elif structure == "ranked_pairs":
+        role_f      = fields.get("role", "role")
+        text_f      = fields.get("text", "text")
+        rank_f      = fields.get("rank", "rank")
+        prompter    = fields.get("prompter_role", "prompter")
+        assistant   = fields.get("assistant_role", "assistant")
+
+        doc_idx = 0
+        buffer: list[dict] = []
+        for example in ds:
+            role = str(example.get(role_f) or "")
+            text = str(example.get(text_f) or "").strip()
+            if not text or example.get(rank_f, 0) != 0:
+                continue
+            buffer.append({"role": role, "text": text})
+            if (len(buffer) >= 2
+                    and buffer[-2]["role"] == prompter
+                    and buffer[-1]["role"] == assistant):
+                result = emit(doc_idx, buffer[-2]["text"], buffer[-1]["text"])
+                if result:
+                    yield result
+                doc_idx += 1
+                buffer = []
+
+    # ── Struttura: multiturn ────────────────────────────────────────────────
+    elif structure == "multiturn":
+        msg_f   = fields.get("messages", "messages")
+        role_f  = fields.get("role_field", "role")
+        cont_f  = fields.get("content_field", "content")
+        asst    = fields.get("assistant_role", "assistant")
+
+        doc_idx = 0
+        for example in ds:
+            messages = _to_list(example.get(msg_f, []))
+            if len(messages) < 2 or messages[-1].get(role_f) != asst:
+                doc_idx += 1
+                continue
+            response  = str(messages[-1].get(cont_f) or "").strip()
+            ctx_turns = messages[:-1][-max_ctx_turns:]
+            context   = " ".join(
+                _format_turn(m.get(role_f, ""), str(m.get(cont_f) or ""))
+                for m in ctx_turns
+            )
+            if not response:
+                doc_idx += 1
+                continue
+            result = emit(doc_idx, context, response)
+            if result:
+                yield result
+            doc_idx += 1
+
+    else:
+        raise ValueError(
+            f"Struttura SFT sconosciuta: {structure!r}\n"
+            f"Supportate: pairs, ranked_pairs, multiturn\n"
+            f"Controlla il campo 'structure' in datasets_config.yaml"
+        )
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MixedStreamingDataset — pretraining
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MixedStreamingDataset(IterableDataset):
-    """
-    Mescola 5 dataset HF in streaming con proporzioni configurabili.
-    Mixing deterministico con contatore cumulativo.
-    """
-
-    DATASET_CONFIGS = {
-        "fineweb": {
-            "load_kwargs": {
-                "path":  "HuggingFaceFW/fineweb-edu",
-                "name":  "CC-MAIN-2024-10",
-                "split": "train",
-            },
-            "text_field": "text",
-        },
-        "wikipedia": {
-            "load_kwargs": {
-                "path":  "wikimedia/wikipedia",
-                "name":  "20231101.en",
-                "split": "train",
-            },
-            "text_field": "text",
-        },
-        "books": {
-            "load_kwargs": {
-                "path":  "monology/pile-uncopyrighted",
-                "split": "train",
-            },
-            "text_field": "text",
-        },
-        "c4": {
-            "load_kwargs": {
-                "path":  "allenai/c4",
-                "name":  "en",
-                "split": "train",
-            },
-            "text_field": "text",
-        },
-        "owt": {
-            "load_kwargs": {
-                "path":  "Skylion007/openwebtext",
-                "split": "train",
-            },
-            "text_field": "text",
-        },
-    }
+    """Dataset di pretraining guidato da YAML."""
 
     def __init__(
         self,
-        tokenizer:    PreTrainedTokenizer,
-        seq_len:      int,
-        split:        str        = "train",
-        val_every:    int        = 200,
-        seed:         int        = 42,
-        buffer_size:  int        = 1000,
-        weights:      dict | None = None,
+        tokenizer:   PreTrainedTokenizer,
+        seq_len:     int,
+        dataset_cfg: list[dict],
+        split:       str = "train",
+        val_every:   int = 200,
+        seed:        int = 42,
+        buffer_size: int = 1000,
     ):
         super().__init__()
         self.tokenizer   = tokenizer
         self.seq_len     = seq_len
+        self.dataset_cfg = dataset_cfg
         self.split       = split
         self.val_every   = val_every
         self.seed        = seed
         self.buffer_size = buffer_size
-        self.weights = weights or {
-            "fineweb":   0.30,
-            "wikipedia": 0.20,
-            "books":     0.20,
-            "c4":        0.15,
-            "owt":       0.15,
-        }
-        total = sum(self.weights.values())
-        assert abs(total - 1.0) < 0.01, f"Pesi devono sommare a 1.0, trovato {total:.3f}"
-        for name in self.weights:
-            assert name in self.DATASET_CONFIGS, f"Dataset sconosciuto: {name!r}"
+        self.weights     = {d["name"]: d["weight"] for d in dataset_cfg}
 
     def _make_iterators(self) -> dict[str, Iterator[list[int]]]:
-        # [v0.4] GPT-2 non ha sep_token — usa eos_token_id come separatore
-        # BERT aveva sep_token_id=102 ([SEP]), GPT-2 usa eos_token_id=50256
+        # Estrai i token ID una sola volta
+        sep_token = _first_token_id(self.tokenizer.sep_token_id)
+        eos_token = _first_token_id(self.tokenizer.eos_token_id)
         
-        # Helper function to safely extract a single token ID
-        def get_token_id(token_id):
-            if token_id is None:
-                return None
-            if isinstance(token_id, list):
-                return token_id[0] if token_id else None
-            return token_id
+        # Determina sep_id con priorità
+        if sep_token is not None:
+            sep_id = int(sep_token)
+        elif eos_token is not None:
+            sep_id = int(eos_token)
+        else:
+            sep_id = 0
         
-        sep_token = get_token_id(self.tokenizer.sep_token_id)
-        eos_token = get_token_id(self.tokenizer.eos_token_id)
-        
-        sep_id = int(
-            sep_token
-            if sep_token is not None
-            else eos_token
-            if eos_token is not None
-            else 0
-        )
-
-        iters = {}
-        for i, (name, cfg) in enumerate(self.DATASET_CONFIGS.items()):
-            if name not in self.weights:
-                continue
-            iters[name] = _iter_dataset(
-                load_kwargs  = cfg["load_kwargs"],
-                text_field   = cfg["text_field"],
-                tokenizer    = self.tokenizer,
-                sep_id       = sep_id,
-                split        = self.split,
-                val_every    = self.val_every,
-                buffer_size  = self.buffer_size,
-                seed         = self.seed + i * 7,
+        return {
+            d["name"]: _iter_pretraining_dataset(
+                ds_cfg=d, tokenizer=self.tokenizer, sep_id=sep_id,
+                split=self.split, val_every=self.val_every,
+                buffer_size=self.buffer_size, seed=self.seed + i * 7,
             )
-        return iters
+            for i, d in enumerate(self.dataset_cfg)
+        }
 
     def __iter__(self) -> Iterator[dict]:
         iters     = self._make_iterators()
         names     = list(iters.keys())
         carry: list[int] = []
-        counters  = {name: 0.0 for name in names}
-        incs      = {name: 1.0 / self.weights[name] for name in names}
+        counters  = {n: 0.0 for n in names}
+        incs      = {n: 1.0 / self.weights[n] for n in names}
         exhausted: set[str] = set()
 
         while len(exhausted) < len(names):
@@ -274,329 +377,70 @@ class MixedStreamingDataset(IterableDataset):
             if not active:
                 break
             _, chosen = min(active)
-
             try:
                 ids = next(iters[chosen])
                 counters[chosen] += incs[chosen]
             except StopIteration:
                 exhausted.add(chosen)
                 continue
-
             carry.extend(ids)
-
             while len(carry) >= self.seq_len:
                 chunk = carry[:self.seq_len]
                 carry = carry[self.seq_len:]
                 input_ids = torch.tensor(chunk, dtype=torch.long)
-                yield {
-                    "input_ids":      input_ids,
-                    "attention_mask": torch.ones_like(input_ids),
-                }
+                yield {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Factory pretraining
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_loaders(train_cfg, tokenizer: PreTrainedTokenizer):
-    """Costruisce train_loader e val_loader per il pretraining v0.4."""
-    weights = {
-        "fineweb":   train_cfg.fineweb_weight,
-        "wikipedia": train_cfg.wikipedia_weight,
-        "books":     train_cfg.books_weight,
-        "c4":        train_cfg.c4_weight,
-        "owt":       train_cfg.owt_weight,
-    }
-
-    print("Dataset mix v0.4: " + ", ".join(f"{k} {v:.0%}" for k, v in weights.items()))
-
-    train_ds = MixedStreamingDataset(
-        tokenizer=tokenizer, seq_len=train_cfg.seq_len,
-        split="train", val_every=train_cfg.val_every,
-        seed=42, buffer_size=train_cfg.stream_buffer_size,
-        weights=weights,
-    )
-    val_ds = MixedStreamingDataset(
-        tokenizer=tokenizer, seq_len=train_cfg.seq_len,
-        split="val", val_every=train_cfg.val_every,
-        seed=42, buffer_size=train_cfg.stream_buffer_size,
-        weights=weights,
-    )
-
-    train_loader = DataLoader(train_ds, batch_size=train_cfg.batch_size,
-                              num_workers=0, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=train_cfg.batch_size,
-                              num_workers=0, pin_memory=True)
-    return train_loader, val_loader
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SFT helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _format_turn(role: str, content: str) -> str:
-    role_tag = "User" if role == "user" else "Assistant"
-    return f"{role_tag}: {content.strip()}"
-
-
-def _build_context_and_response(
-    messages:      list,
-    max_ctx_turns: int,
-) -> tuple[str, str]:
-    if not messages or messages[-1].get("role") != "assistant":
-        return "", ""
-    response = messages[-1]["content"].strip()
-    if not response:
-        return "", ""
-    preceding = messages[:-1]
-    ctx_turns = preceding[-max_ctx_turns:] if max_ctx_turns > 0 else []
-    context   = " ".join(_format_turn(m["role"], m["content"]) for m in ctx_turns)
-    return context, response
-
-
-def _iter_ultrachat(
-    tokenizer:      PreTrainedTokenizer,
-    split:          str,
-    max_ctx_len:    int,
-    max_resp_len:   int,
-    max_ctx_turns:  int,
-    val_every:      int,
-    seed:           int,
-) -> Iterator[dict]:
-    from datasets import load_dataset
-    
-    def to_list(obj):
-        """Convert various types to a list."""
-        if obj is None:
-            return []
-        if hasattr(obj, "tolist"):
-            return obj.tolist()
-        if isinstance(obj, (list, tuple)):
-            return list(obj)
-        if hasattr(obj, "__iter__"):
-            return list(obj)
-        return [obj]
-    
-    def extract_ids(tokenized):
-        """Extract input_ids from tokenizer output."""
-        if isinstance(tokenized, dict):
-            ids = tokenized.get("input_ids", [])
-        elif hasattr(tokenized, "input_ids"):
-            ids = tokenized.input_ids
-        else:
-            ids = tokenized if isinstance(tokenized, list) else []
-        return to_list(ids)
-
-    ds = load_dataset(
-        "HuggingFaceH4/ultrachat_200k",
-        split="train_sft" if split == "train" else "test_sft",
-        streaming=True,
-    )
-    ds = ds.shuffle(buffer_size=1000, seed=seed)
-
-    doc_idx = 0
-    for example in ds:
-        # Safely get and convert messages
-        messages = to_list(example.get("messages", []))
-        
-        if len(messages) < 2:
-            doc_idx += 1
-            continue
-
-        is_val = (doc_idx % val_every == 0)
-        if (split == "val") != is_val:
-            doc_idx += 1
-            continue
-
-        context, response = _build_context_and_response(messages, max_ctx_turns)
-        if not response:
-            doc_idx += 1
-            continue
-
-        prompt_ids = []
-        if context:
-            tokenized = tokenizer(
-                context, truncation=True, max_length=max_ctx_len,
-                add_special_tokens=False, return_attention_mask=False,
-            )
-            prompt_ids = extract_ids(tokenized)
-
-        tokenized_resp = tokenizer(
-            response, truncation=True, max_length=max_resp_len,
-            add_special_tokens=True, return_attention_mask=False,
-        )
-        resp_ids = extract_ids(tokenized_resp)
-
-        if len(resp_ids) < 4:  
-            doc_idx += 1
-            continue
-
-        yield {"prompt_ids": prompt_ids, "response_ids": resp_ids}
-        doc_idx += 1
-
-
-def _iter_openorca(
-    tokenizer:      PreTrainedTokenizer,
-    split:          str,
-    max_ctx_len:    int,
-    max_resp_len:   int,
-    val_every:      int,
-    seed:           int,
-) -> Iterator[dict]:
-    from datasets import load_dataset
-    
-    def to_list(obj):
-        """Convert various types to a list."""
-        if obj is None:
-            return []
-        if hasattr(obj, "tolist"):
-            return obj.tolist()
-        if isinstance(obj, (list, tuple)):
-            return list(obj)
-        if hasattr(obj, "__iter__"):
-            return list(obj)
-        return [obj]
-    
-    def extract_ids(tokenized):
-        """Extract input_ids from tokenizer output."""
-        if isinstance(tokenized, dict):
-            ids = tokenized.get("input_ids", [])
-        elif hasattr(tokenized, "input_ids"):
-            ids = tokenized.input_ids
-        else:
-            ids = tokenized if isinstance(tokenized, list) else []
-        return to_list(ids)
-
-    ds = load_dataset("Open-Orca/OpenOrca", split="train", streaming=True)
-    ds = ds.shuffle(buffer_size=1000, seed=seed)
-
-    doc_idx = 0
-    for example in ds:
-        is_val = (doc_idx % val_every == 0)
-        if (split == "val") != is_val:
-            doc_idx += 1
-            continue
-
-        # Safely get fields and convert to strings
-        system = example.get("system_prompt")
-        system = str(system).strip() if system is not None else ""
-        
-        question = example.get("question")
-        question = str(question).strip() if question is not None else ""
-        
-        response = example.get("response")
-        response = str(response).strip() if response is not None else ""
-
-        if not question or not response:
-            doc_idx += 1
-            continue
-
-        context = f"{system} User: {question}".strip() if system else f"User: {question}"
-
-        # Tokenize context
-        tokenized_ctx = tokenizer(
-            context, truncation=True, max_length=max_ctx_len,
-            add_special_tokens=False, return_attention_mask=False,
-        )
-        prompt_ids = extract_ids(tokenized_ctx)
-
-        # Tokenize response
-        tokenized_resp = tokenizer(
-            response, truncation=True, max_length=max_resp_len,
-            add_special_tokens=True, return_attention_mask=False,
-        )
-        resp_ids = extract_ids(tokenized_resp)
-
-        if len(resp_ids) < 4:
-            doc_idx += 1
-            continue
-
-        yield {"prompt_ids": prompt_ids, "response_ids": resp_ids}
-        doc_idx += 1
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SFTDataset — mix ultrachat + openorca
+# SFTDataset — guidato da YAML
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SFTDataset(IterableDataset):
-    """
-    Dataset SFT che mixa UltraChat e OpenOrca in streaming.
-
-    Cambiamenti v0.4:
-      - padding usa pad_token_id del tokenizer invece di 0
-        (GPT-2: pad_token_id = eos_token_id = 50256)
-      - response_mask costruita su pad_token_id, non su 0
-    """
-
-    DATASET_WEIGHTS = {"ultrachat": 0.5, "openorca": 0.5}
+    """Dataset SFT guidato da YAML."""
 
     def __init__(
         self,
         tokenizer:     PreTrainedTokenizer,
-        split:         str            = "train",
-        max_ctx_len:   int            = 128,
-        max_resp_len:  int            = 128,
-        max_ctx_turns: int            = 3,
-        val_every:     int            = 200,
-        seed:          int            = 42,
-        weights:       Optional[dict] = None,
+        dataset_cfg:   list[dict],
+        split:         str = "train",
+        max_ctx_len:   int = 128,
+        max_resp_len:  int = 128,
+        max_ctx_turns: int = 3,
+        val_every:     int = 200,
+        seed:          int = 42,
     ):
         super().__init__()
         self.tokenizer     = tokenizer
+        self.dataset_cfg   = dataset_cfg
         self.split         = split
         self.max_ctx_len   = max_ctx_len
         self.max_resp_len  = max_resp_len
         self.max_ctx_turns = max_ctx_turns
         self.val_every     = val_every
         self.seed          = seed
-        self.weights       = weights or self.DATASET_WEIGHTS
-
-        # Helper function to safely extract a single token ID
-        def _first(val):
-            if val is None:
-                return None
-            if isinstance(val, list):
-                return val[0] if val else None
-            return val
-
-        # [v0.4] pad_token_id per GPT-2 = eos_token_id = 50256
-        pad_token = _first(tokenizer.pad_token_id)
-        eos_token = _first(tokenizer.eos_token_id)
-        
-        self.pad_id = int(
-            pad_token
-            if pad_token is not None
-            else eos_token
-            if eos_token is not None
-            else 0
-        )
+        self.weights       = {d["name"]: d["weight"] for d in dataset_cfg}
+        pad = _first_token_id(tokenizer.pad_token_id)
+        eos = _first_token_id(tokenizer.eos_token_id)
+        self.pad_id = int(pad if pad is not None else eos if eos is not None else 0)
 
     def _make_iterators(self) -> dict:
-        iters = {}
-        if "ultrachat" in self.weights:
-            iters["ultrachat"] = _iter_ultrachat(
-                self.tokenizer, self.split,
-                self.max_ctx_len, self.max_resp_len,
-                self.max_ctx_turns, self.val_every, seed=self.seed,
+        return {
+            ds_cfg["name"]: _iter_sft_dataset(
+                ds_cfg=ds_cfg, tokenizer=self.tokenizer, split=self.split,
+                max_ctx_len=self.max_ctx_len, max_resp_len=self.max_resp_len,
+                val_every=self.val_every, seed=self.seed + i * 7,
+                max_ctx_turns=self.max_ctx_turns,
             )
-        if "openorca" in self.weights:
-            iters["openorca"] = _iter_openorca(
-                self.tokenizer, self.split,
-                self.max_ctx_len, self.max_resp_len,
-                self.val_every, seed=self.seed + 7,
-            )
-        return iters
+            for i, ds_cfg in enumerate(self.dataset_cfg)
+        }
 
     def _pad_left(self, ids: list, length: int) -> torch.Tensor:
-        """Padding a sinistra con pad_id."""
         t = torch.full((length,), self.pad_id, dtype=torch.long)
         n = min(len(ids), length)
         t[length - n:] = torch.tensor(ids[-n:], dtype=torch.long)
         return t
 
     def _pad_right(self, ids: list, length: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Padding a destra con pad_id. Ritorna (ids_padded, mask)."""
         t    = torch.full((length,), self.pad_id, dtype=torch.long)
         mask = torch.zeros(length, dtype=torch.bool)
         n    = min(len(ids), length)
@@ -616,27 +460,44 @@ class SFTDataset(IterableDataset):
             if not active:
                 break
             _, chosen = min(active)
-
             try:
                 item = next(iters[chosen])
                 counters[chosen] += incs[chosen]
             except StopIteration:
                 exhausted.add(chosen)
                 continue
-
-            prompt_ids      = self._pad_left(item["prompt_ids"], self.max_ctx_len)
-            resp_ids, mask  = self._pad_right(item["response_ids"], self.max_resp_len)
-
-            yield {
-                "prompt_ids":    prompt_ids,
-                "response_ids":  resp_ids,
-                "response_mask": mask,
-            }
+            prompt_ids     = self._pad_left(item["prompt_ids"], self.max_ctx_len)
+            resp_ids, mask = self._pad_right(item["response_ids"], self.max_resp_len)
+            yield {"prompt_ids": prompt_ids, "response_ids": resp_ids, "response_mask": mask}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Factory SFT
+# Factory
 # ─────────────────────────────────────────────────────────────────────────────
+
+def build_loaders(
+    train_cfg,
+    tokenizer: PreTrainedTokenizer,
+    yaml_path: str = "datasets_config.yaml",
+) -> tuple[DataLoader, DataLoader]:
+    cfg = load_dataset_config(yaml_path)
+    dataset_cfg = cfg["pretraining"]
+    print("Dataset mix pretraining: " +
+          ", ".join(f"{d['name']} {d['weight']:.0%}" for d in dataset_cfg))
+    train_ds = MixedStreamingDataset(
+        tokenizer=tokenizer, seq_len=train_cfg.seq_len, dataset_cfg=dataset_cfg,
+        split="train", val_every=train_cfg.val_every,
+        seed=42, buffer_size=train_cfg.stream_buffer_size,
+    )
+    val_ds = MixedStreamingDataset(
+        tokenizer=tokenizer, seq_len=train_cfg.seq_len, dataset_cfg=dataset_cfg,
+        split="val", val_every=train_cfg.val_every,
+        seed=42, buffer_size=train_cfg.stream_buffer_size,
+    )
+    train_loader = DataLoader(train_ds, batch_size=train_cfg.batch_size, num_workers=0, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=train_cfg.batch_size, num_workers=0, pin_memory=True)
+    return train_loader, val_loader
+
 
 def build_sft_loaders(
     train_cfg,
@@ -644,23 +505,22 @@ def build_sft_loaders(
     max_ctx_len:   int = 128,
     max_resp_len:  int = 128,
     max_ctx_turns: int = 3,
+    yaml_path:     str = "datasets_config.yaml",
 ) -> tuple[DataLoader, DataLoader]:
-
+    cfg = load_dataset_config(yaml_path)
+    dataset_cfg = cfg["sft"]
+    print("Dataset mix SFT: " +
+          ", ".join(f"{d['name']} {d['weight']:.0%}" for d in dataset_cfg))
     train_ds = SFTDataset(
-        tokenizer=tokenizer, split="train",
+        tokenizer=tokenizer, dataset_cfg=dataset_cfg, split="train",
         max_ctx_len=max_ctx_len, max_resp_len=max_resp_len,
-        max_ctx_turns=max_ctx_turns,
-        val_every=train_cfg.val_every, seed=42,
+        max_ctx_turns=max_ctx_turns, val_every=train_cfg.val_every, seed=42,
     )
     val_ds = SFTDataset(
-        tokenizer=tokenizer, split="val",
+        tokenizer=tokenizer, dataset_cfg=dataset_cfg, split="val",
         max_ctx_len=max_ctx_len, max_resp_len=max_resp_len,
-        max_ctx_turns=max_ctx_turns,
-        val_every=train_cfg.val_every, seed=42,
+        max_ctx_turns=max_ctx_turns, val_every=train_cfg.val_every, seed=42,
     )
-
-    train_loader = DataLoader(train_ds, batch_size=train_cfg.batch_size,
-                              num_workers=0, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=train_cfg.batch_size,
-                              num_workers=0, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=train_cfg.batch_size, num_workers=0, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=train_cfg.batch_size, num_workers=0, pin_memory=True)
     return train_loader, val_loader

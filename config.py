@@ -57,14 +57,14 @@ def get_model_config() -> ModelConfig:
 
 @dataclass
 class TrainConfig:
-    batch_size:    int   = 4      
-    grad_accum:    int   = 32     
-    max_iters:     int   = 20000
-    lr:            float = 1e-4   
-    seq_len:       int   = 1024
-    warmup_iters:  int   = 400
+    batch_size:    int   = 4       # ridotto per 733M (era 16 per 168M)
+    grad_accum:    int   = 32      # batch virtuale = 4×32 = 128
+    max_iters:     int   = 100000  # Chinchilla ottimale per 733M (~13B token)
+    lr:            float = 1e-4    # leggermente più basso per modello più grande
+    seq_len:       int   = 1024    # aumentato da 256
+    warmup_iters:  int   = 2000    # ~2% del training (era 400/20000 = 2%)
     min_lr:        float = 1e-5
-    eval_interval: int   = 500
+    eval_interval: int   = 1000    # eval ogni 1000 step
     eval_iters:    int   = 20
     max_grad_norm: float = 1.0
     self_cond_prob: float = 0.5
@@ -73,15 +73,19 @@ class TrainConfig:
     tokenizer_model:    str   = "gpt2"
     stream_buffer_size: int   = 1000
     val_every:          int   = 200
-    fineweb_weight:     float = 0.30
-    wikipedia_weight:   float = 0.20
-    books_weight:       float = 0.20
-    c4_weight:          float = 0.15
-    owt_weight:         float = 0.15
+    # Pretraining mix v0.4
+    # Sostituisce Books+OWT con SlimPajama — più pulito e deduplificato
+    # Aggiunge OpenMathInstruct (10%) e CodeContests (5%) per ragionamento
+    fineweb_weight:      float = 0.25
+    wikipedia_weight:    float = 0.20
+    slimpajama_weight:   float = 0.25
+    c4_weight:           float = 0.15
+    openmath_weight:     float = 0.10
+    codecontests_weight: float = 0.05
     checkpoint_dir:    str = "checkpoints_v4"
     checkpoint_prefix: str = "harold_v04"
     preload:           str = "latest"
-    save_every:        int = 1000
+    save_every:        int = 2000   # checkpoint ogni 2000 step (50 totali su 100k)
     device: str = field(init=False)
     dtype:  str = field(init=False)
 

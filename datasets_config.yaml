@@ -1,0 +1,91 @@
+# Harold v0.4 — Dataset Configuration
+# =====================================
+# Modifica questo file per cambiare dataset senza toccare il codice Python.
+#
+# Campi per ogni dataset:
+#   name:       identificatore univoco (usato nei log e nei pesi)
+#   path:       HuggingFace dataset path
+#   config:     (opzionale) nome della configurazione HF
+#   split:      split HF da usare ("train", "train[:10%]", ecc.)
+#   text_field: campo del dataset contenente il testo
+#   weight:     proporzione nel mix (devono sommare a 1.0)
+#   format:     (opzionale) handler speciale per formati non-standard
+#               valori: "standard" (default), "codecontests", "oasst2", "openorca"
+#
+# I pesi devono sommare a 1.0 per sezione (pretraining e sft separatamente).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pretraining
+# ─────────────────────────────────────────────────────────────────────────────
+
+pretraining:
+
+  - name: fineweb
+    path: HuggingFaceFW/fineweb-edu
+    config: CC-MAIN-2024-10
+    split: train
+    text_field: text
+    weight: 0.25
+
+  - name: wikipedia
+    path: wikimedia/wikipedia
+    config: 20231101.en
+    split: train
+    text_field: text
+    weight: 0.20
+
+  - name: slimpajama
+    path: cerebras/SlimPajama-627B
+    split: train
+    text_field: text
+    weight: 0.25
+
+  - name: c4
+    path: allenai/c4
+    config: en
+    split: train
+    text_field: text
+    weight: 0.15
+
+  - name: openmath
+    path: nvidia/OpenMathInstruct-1
+    split: train
+    text_field: generated_solution
+    weight: 0.10
+
+  - name: codecontests
+    path: deepmind/code_contests
+    split: train
+    text_field: description
+    weight: 0.05
+    format: codecontests
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SFT (Supervised Fine-Tuning)
+# ─────────────────────────────────────────────────────────────────────────────
+
+sft:
+
+  - name: oasst2
+    path: OpenAssistant/oasst2
+    split_map:
+      train: train
+      val: validation
+    weight: 0.60
+    structure: ranked_pairs
+    fields:
+      role: role
+      text: text
+      rank: rank
+      prompter_role: prompter
+      assistant_role: assistant
+
+  - name: openorca
+    path: Open-Orca/OpenOrca
+    split: train
+    weight: 0.40
+    structure: pairs
+    fields:
+      context: [system_prompt, question]   
+      separator: " User: "                 
+      response: response

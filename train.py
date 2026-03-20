@@ -21,7 +21,7 @@ from transformers import AutoTokenizer
 
 from config import ModelConfig, TrainConfig, get_model_config, get_train_config
 from model import Harold, build_model
-from dataset import MixedStreamingDataset, build_loaders
+from dataset import build_loaders
 
 
 # ─────────────────────────────────────────────────────────────────────────────
