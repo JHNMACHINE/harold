@@ -1,16 +1,7 @@
 """
-Harold v3 — train.py
+Harold v4 — train.py
 =====================
 Trainer per VP-SDE continuous diffusion + self-conditioning.
-
-Fix rispetto alla versione precedente:
-  [FIX #1] train_step delega compute_loss al modello (score matching)
-  [FIX #2] Rimosso MaskDiffusionSchedule, usa VPSDESchedule interno al modello
-  [FIX #4] self_cond gestito internamente da compute_loss, sempre detached
-  [FIX #6] self_cond_prob = 0.5 in config (coerente col sampler)
-  [FIX #7] estimate_loss passa fixed_t per valutazione per-timestep
-  [FIX #8] estimate_loss: tutto dentro train_cfg.ctx
-  [FIX #9] gradient accumulation: salta micro-batch con mask vuota
 """
 
 import json
@@ -30,93 +21,8 @@ from transformers import AutoTokenizer
 
 from config import ModelConfig, TrainConfig, get_model_config, get_train_config
 from model import Harold, build_model
-from dataset import MixedStreamingDataset, build_loaders
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# AsyncLogger — logging su file in background, zero impatto sul training
-# ─────────────────────────────────────────────────────────────────────────────
-
-class AsyncLogger:
-    """
-    Logger asincrono che scrive su file JSONL in un thread di background.
-
-    Il training scrive nella queue senza aspettare (non-blocking).
-    Il thread di background svuota la queue e appende al file di log.
-
-    Formato JSONL: una riga JSON per evento, facile da parsare con pandas:
-        import pandas as pd
-        df = pd.read_json("training.log", lines=True)
-
-    Uso:
-        logger = AsyncLogger("checkpoints_v3/training.log")
-        logger.log({"iter": 100, "loss": 0.45, "ce": 7.1})
-        logger.close()  # sempre chiamare alla fine
-    """
-
-    def __init__(self, log_path: str, flush_every: int = 10):
-        """
-        Args:
-            log_path:    percorso del file di log (viene appeso, non sovrascritto)
-            flush_every: scrivi su disco ogni N eventi (default 10)
-                         più alto = meno I/O, più basso = più sicuro contro crash
-        """
-        self.log_path   = log_path
-        self.flush_every = flush_every
-        self._queue     = queue.Queue()
-        self._stop      = threading.Event()
-
-        # Crea la directory se non esiste
-        os.makedirs(os.path.dirname(log_path) if os.path.dirname(log_path) else ".", exist_ok=True)
-
-        # Thread daemon: si chiude automaticamente se il processo principale muore
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
-
-    def log(self, data: dict) -> None:
-        """
-        Accoda un evento da loggare. Non-blocking — ritorna immediatamente.
-        Aggiunge automaticamente il timestamp Unix.
-        """
-        data["timestamp"] = time.time()
-        self._queue.put(data)
-
-    def _worker(self) -> None:
-        """Thread di background: svuota la queue e scrive su file."""
-        buffer = []
-        while not self._stop.is_set() or not self._queue.empty():
-            # Raccoglie eventi dalla queue con timeout
-            try:
-                item = self._queue.get(timeout=0.5)
-                buffer.append(json.dumps(item))
-                self._queue.task_done()
-            except queue.Empty:
-                pass
-
-            # Flush su disco ogni flush_every eventi o quando la queue è vuota
-            if len(buffer) >= self.flush_every or (buffer and self._queue.empty()):
-                with open(self.log_path, "a") as f:
-                    f.write("\n".join(buffer) + "\n")
-                buffer.clear()
-
-        # Flush finale di tutto quello che rimane
-        if buffer:
-            with open(self.log_path, "a") as f:
-                f.write("\n".join(buffer) + "\n")
-
-    def close(self) -> None:
-        """
-        Segnala al thread di fermarsi e aspetta che finisca di scrivere.
-        Chiamare sempre alla fine del training.
-        """
-        self._stop.set()
-        self._thread.join(timeout=10)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        self.close()
+from dataset import build_loaders
+from logger import AsyncLogger
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -277,7 +183,7 @@ def save_checkpoint(
     path:         str,
     model:        Harold,
     optimizer:    torch.optim.Optimizer,
-    scaler:       torch.amp.GradScaler,  # type: ignore
+    scaler:       torch.GradScaler, 
     iter_num:     int,
     val_loss:     float,
     model_cfg:    ModelConfig,
@@ -302,7 +208,7 @@ def load_checkpoint(
     path:      str,
     model:     Harold,
     optimizer: torch.optim.Optimizer,
-    scaler:    torch.amp.GradScaler,  # type: ignore
+    scaler:    torch.GradScaler,
     device:    str,
 ) -> Tuple[int, float, list, list]:
     print(f"Carico checkpoint: {path}")
@@ -326,7 +232,7 @@ def load_checkpoint(
 def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     device = train_cfg.device
 
-    print("Harold v3 — VP-SDE Continuous Diffusion")
+    print("Harold v4 — VP-SDE Continuous Diffusion")
     print(f"Device:         {device}")
     print(f"Dtype:          {train_cfg.dtype}  (scaler={'ON' if train_cfg.use_scaler else 'OFF'})")
     print(f"Batch virtuale: {train_cfg.batch_size} × {train_cfg.grad_accum} = {train_cfg.effective_batch_size}")
@@ -357,7 +263,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         weight_decay=0.1,
         fused=True,
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=train_cfg.use_scaler)  # type: ignore
+    scaler = torch.GradScaler("cuda", enabled=train_cfg.use_scaler)
 
     # ── Dataset ───────────────────────────────────────────────────────────
     train_loader, val_loader = build_loaders(train_cfg, tokenizer)
@@ -398,7 +304,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     train_iter = iter(train_loader)
     accum_loss = 0.0
 
-    pbar = tqdm(range(initial_iter, train_cfg.max_iters), desc="Harold v3")
+    pbar = tqdm(range(initial_iter, train_cfg.max_iters), desc="Harold v4")
 
     for iter_num in pbar:
         lr = get_lr(iter_num, train_cfg)
