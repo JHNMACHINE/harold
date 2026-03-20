@@ -1,31 +1,20 @@
 """
-Harold v3 — model.py
-=====================
+Harold v0.4 — model.py
+=======================
 Architettura con VP-SDE continuous diffusion.
 
-  Diffusion:
-    - VP-SDE (Variance Preserving SDE) con beta_min/beta_max
-    - Modello predice il rumore ε (epsilon prediction)
-    - Score matching loss sui token non-padding
-    - CE ausiliaria weight-tied per stabilizzazione e decoding
-    - compute_loss centralizzato nel modello (gestisce self-cond internamente)
-
-  Fix rispetto alla versione precedente:
-    - [FIX #1] compute_loss: score matching (MSE su ε) + CE ausiliaria
-               accetta fixed_t per valutazione per-timestep
-               gestisce self_cond_prob internamente
-    - [FIX #2] VP-SDE schedule sostituisce masking discreto
-    - [FIX #3] shared_out diviso fuori dal loop
-    - [FIX #4] self_cond sempre .detach()
-    - [FIX #5] eps_pred con init standard std=0.02
-    - [FIX #6] modello predice ε invece di x0
-    - [FIX #7] get_timestep_embedding riscalato *1000 per t in [0,1]
+  Nuovi in v0.4:
+    - YaRN RoPE scaling per context extension senza fine-tuning
+    - Flash Attention 2 con fallback automatico a SDPA
+    - Gradient checkpointing configurabile
+    - GPT-2 BPE tokenizer (50,257 vocab, no padding_idx)
 """
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 from typing import Optional, Tuple, List, Dict
 from config import ModelConfig
 
@@ -105,23 +94,17 @@ class DeepSeekMoELayer(nn.Module):
         x_flat     = x.view(-1, C)
         t_emb_flat = t_emb.unsqueeze(1).expand(B, T, C).reshape(-1, C)
 
-        # [FIX #3] divide UNA VOLTA fuori dal loop
         shared_out = torch.zeros_like(x_flat)
         for expert in self.shared_experts:
             shared_out += expert(x_flat)
         shared_out = shared_out / len(self.shared_experts)
 
         s = self._affinity(x_flat, t_emb_flat)
-        
-        # Usa router_bias direttamente, assicurandoti che sia sullo stesso dispositivo
-        # Se router_bias è un buffer, è già su un dispositivo, ma potremmo doverlo spostare
-        if hasattr(self, 'router_bias') and self.router_bias is not None:
-            # Assicurati che router_bias sia sullo stesso dispositivo di s
-            if self.router_bias.device != s.device:
-                self.router_bias = self.router_bias.to(s.device)
-            sel_scores = s + self.router_bias
-        else:
-            sel_scores = s
+
+        router_bias = getattr(self, "router_bias")
+        if router_bias.device != s.device:
+            router_bias = router_bias.to(s.device)
+        sel_scores = s + router_bias
 
         if self.training or t_normalized is None:
             topk_indices = torch.topk(sel_scores, self.top_k, dim=-1).indices
@@ -158,26 +141,72 @@ class DeepSeekMoELayer(nn.Module):
 
     @torch.no_grad()
     def update_bias(self):
+        # Controlla se router_indices è stato inizializzato
         if self.router_indices is None:
             return
+        
+        # Controlla che router_bias esista e non sia None
+        if not hasattr(self, 'router_bias') or self.router_bias is None:
+            return
+        
         valid = self.router_indices[self.router_indices >= 0]
         if valid.numel() == 0:
             return
+    
         counts = torch.bincount(valid.view(-1), minlength=self.n_routed_experts).float()
+        # Assicurati che router_bias sia sul dispositivo corretto
+        if self.router_bias.device != counts.device:
+            self.router_bias = self.router_bias.to(counts.device)
         counts = counts.to(self.router_bias.device)
         self.router_bias += self.bias_update_gamma * (counts.mean() - counts).sign()
         self.router_indices = None
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# RoPE
+# RoPE con YaRN scaling
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, head_dim: int, max_seq_len: int, theta: float = 10000.0):
+    """
+    Rotary Position Embedding con YaRN scaling.
+
+    YaRN scala le frequenze RoPE per estendere il context window oltre
+    original_max_seq_len senza fine-tuning aggiuntivo.
+    Con scale_factor=1.0 è identico al RoPE standard.
+    Con scale_factor=4.0 estende il context a 4× (es. 1024 → 4096).
+    """
+    def __init__(
+        self,
+        head_dim:             int,
+        max_seq_len:          int,
+        theta:                float = 10000.0,
+        original_max_seq_len: int   = 1024,
+        scale_factor:         float = 1.0,
+        beta_fast:            int   = 32,
+        beta_slow:            int   = 1,
+    ):
         super().__init__()
         freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        emb   = torch.outer(torch.arange(max_seq_len, dtype=torch.float32), freqs)
+
+        if scale_factor > 1.0:
+            orig_len = float(original_max_seq_len)
+            beta     = head_dim / (2 * math.pi * freqs * orig_len)
+
+            mask_high = beta > beta_fast
+            mask_low  = beta < beta_slow
+            mask_mid  = ~mask_high & ~mask_low
+
+            freqs_ntk    = freqs
+            freqs_linear = freqs / scale_factor
+            blend        = (beta - beta_slow) / (beta_fast - beta_slow + 1e-8)
+            freqs_mid    = freqs_linear * blend + freqs_ntk * (1.0 - blend)
+
+            freqs  = torch.where(mask_high, freqs_linear,
+                     torch.where(mask_low,  freqs_ntk, freqs_mid))
+            mscale = 0.1 * math.log(scale_factor) + 1.0
+        else:
+            mscale = 1.0
+
+        self.register_buffer("mscale", torch.tensor(mscale, dtype=torch.float32))
+        emb = torch.outer(torch.arange(max_seq_len, dtype=torch.float32), freqs)
         self.register_buffer("cos_cached", torch.cat([torch.cos(emb), torch.cos(emb)], dim=-1))
         self.register_buffer("sin_cached", torch.cat([torch.sin(emb), torch.sin(emb)], dim=-1))
 
@@ -187,16 +216,17 @@ class RotaryEmbedding(nn.Module):
         return torch.cat([-x[..., h:], x[..., :h]], dim=-1)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, offset: int = 0):
-        T   = q.shape[2]
-        cos_cached = getattr(self, 'cos_cached')
-        sin_cached = getattr(self, 'sin_cached')
-        cos = cos_cached[offset:offset + T].to(dtype=q.dtype).unsqueeze(0).unsqueeze(0)
-        sin = sin_cached[offset:offset + T].to(dtype=q.dtype).unsqueeze(0).unsqueeze(0)
-        return q * cos + self._rotate_half(q) * sin, k * cos + self._rotate_half(k) * sin
+        T      = q.shape[2]
+        mscale = getattr(self, "mscale").to(q.dtype)
+        cos    = getattr(self, "cos_cached")[offset:offset + T].to(q.dtype).unsqueeze(0).unsqueeze(0)
+        sin    = getattr(self, "sin_cached")[offset:offset + T].to(q.dtype).unsqueeze(0).unsqueeze(0)
+        q_rot  = (q * cos + self._rotate_half(q) * sin) * mscale
+        k_rot  = (k * cos + self._rotate_half(k) * sin) * mscale
+        return q_rot, k_rot
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BlockCausalAttention — MLA + DSA
+# BlockCausalAttention — MLA + DSA + Flash Attention 2
 # ─────────────────────────────────────────────────────────────────────────────
 
 class BlockCausalAttention(nn.Module):
@@ -210,6 +240,8 @@ class BlockCausalAttention(nn.Module):
         self.head_dim    = config.d_model // config.n_heads
         self.block_size  = config.block_size
         self.dropout     = config.dropout
+        self.window_size = config.dsa_window_size
+        self.global_every = config.dsa_global_every
 
         self.latent_dim = config.mla_latent_dim
         self.q_proj  = nn.Linear(config.d_model, config.n_heads * self.head_dim, bias=False)
@@ -218,10 +250,24 @@ class BlockCausalAttention(nn.Module):
         self.v_up    = nn.Linear(self.latent_dim, config.n_kv_heads * self.head_dim, bias=False)
         self.o_proj  = nn.Linear(config.n_heads * self.head_dim, config.d_model, bias=False)
 
-        self.window_size  = config.dsa_window_size
-        self.global_every = config.dsa_global_every
-        self.rope         = RotaryEmbedding(self.head_dim, config.max_seq_len, config.rope_theta)
-        self.resid_drop   = nn.Dropout(config.dropout)
+        self.rope = RotaryEmbedding(
+            head_dim             = self.head_dim,
+            max_seq_len          = config.max_seq_len,
+            theta                = config.rope_theta,
+            original_max_seq_len = config.rope_original_max_seq_len,
+            scale_factor         = config.rope_scale_factor,
+        )
+        self.resid_drop = nn.Dropout(config.dropout)
+
+        # Flash Attention 2 — fallback automatico a SDPA se non installato
+        self._use_flash = False
+        if config.use_flash_attention:
+            try:
+                from flash_attn import flash_attn_func as _faf
+                self._flash_attn_func = _faf
+                self._use_flash = True
+            except ImportError:
+                pass  # fallback silenzioso a SDPA
 
     def _build_sparse_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         idx            = torch.arange(seq_len, device=device)
@@ -254,20 +300,32 @@ class BlockCausalAttention(nn.Module):
         else:
             c_kv_full = c_kv
 
-        full_len  = k.shape[2]
-        k_exp     = k.repeat_interleave(self.n_kv_groups, dim=1)
-        v_exp     = v.repeat_interleave(self.n_kv_groups, dim=1)
+        full_len = k.shape[2]
+        k_exp    = k.repeat_interleave(self.n_kv_groups, dim=1)
+        v_exp    = v.repeat_interleave(self.n_kv_groups, dim=1)
 
-        mask      = self._build_sparse_mask(full_len, x.device)
-        if T < full_len:
-            mask  = mask[-T:, :]
-        attn_bias = torch.zeros(T, full_len, device=x.device, dtype=x.dtype)
-        attn_bias = attn_bias.masked_fill(mask, float("-inf")).unsqueeze(0).unsqueeze(0)
+        if self._use_flash and past_kv is None:
+            # Flash Attention 2 — richiede (B, L, H, D), window_size nativo per DSA
+            y = self._flash_attn_func(
+                q.transpose(1, 2),      # (B, T, H, D)
+                k_exp.transpose(1, 2),
+                v_exp.transpose(1, 2),
+                dropout_p=self.dropout if self.training else 0.0,
+                causal=False,
+                window_size=(self.window_size, self.window_size),
+            ).transpose(1, 2)           # → (B, H, T, D)
+        else:
+            # Fallback: SDPA con maschera DSA esplicita
+            mask      = self._build_sparse_mask(full_len, x.device)
+            if T < full_len:
+                mask  = mask[-T:, :]
+            attn_bias = torch.zeros(T, full_len, device=x.device, dtype=x.dtype)
+            attn_bias = attn_bias.masked_fill(mask, float("-inf")).unsqueeze(0).unsqueeze(0)
+            y = F.scaled_dot_product_attention(
+                q, k_exp, v_exp, attn_mask=attn_bias,
+                dropout_p=self.dropout if self.training else 0.0, is_causal=False,
+            )
 
-        y = F.scaled_dot_product_attention(
-            q, k_exp, v_exp, attn_mask=attn_bias,
-            dropout_p=self.dropout if self.training else 0.0, is_causal=False,
-        )
         out = self.resid_drop(self.o_proj(y.transpose(1, 2).contiguous().view(B, T, C)))
         return out, (c_kv_full if use_cache else None)
 
@@ -327,16 +385,8 @@ class Block(nn.Module):
 class VPSDESchedule(nn.Module):
     """
     Variance Preserving SDE schedule.
-
     Forward process: x_t = α(t)*x0 + σ(t)*ε,  ε ~ N(0,I)
-
-      β(t)  = β_min + t*(β_max - β_min)
-      α²(t) = exp(-(β_min*t + 0.5*(β_max-β_min)*t²))
-      σ²(t) = 1 - α²(t)
-
-    t ∈ [0,1]:
-      t=0 → α≈1, σ≈0  (dato pulito)
-      t=1 → α≈0, σ≈1  (rumore puro)
+    t ∈ [0,1]: t=0 → dato pulito, t=1 → rumore puro
     """
     def __init__(self, beta_min: float = 0.1, beta_max: float = 20.0):
         super().__init__()
@@ -353,12 +403,7 @@ class VPSDESchedule(nn.Module):
         sigma    = torch.sqrt((1.0 - alpha_sq).clamp(min=1e-8))
         return alpha, sigma
 
-    def add_noise(
-        self,
-        x0: torch.Tensor,   # (B, L, D)
-        t:  torch.Tensor,   # (B,) in [0,1]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """x_t = α(t)*x0 + σ(t)*ε. Ritorna (x_t, ε)."""
+    def add_noise(self, x0: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         alpha, sigma = self.get_alpha_sigma(t)
         eps = torch.randn_like(x0)
         x_t = alpha.view(-1, 1, 1) * x0 + sigma.view(-1, 1, 1) * eps
@@ -370,29 +415,18 @@ class VPSDESchedule(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Harold v3 — VP-SDE Continuous Diffusion
+# Harold v0.4 — VP-SDE Continuous Diffusion
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Harold(nn.Module):
     """
     Harold v0.4 — Continuous Diffusion con VP-SDE.
 
-    Cambiamenti rispetto a v0.3:
-      - Tokenizer: GPT-2 BPE (50,257 vocab, case-sensitive, byte-level)
-                   invece di BERT-uncased (30,522 vocab, lowercase)
-      - padding_idx rimosso — GPT-2 non ha token di padding dedicato,
-        usiamo la mask esplicita nel compute_loss
-
-    Pipeline training:
-      1. x0_emb = token_emb(x0)
-      2. x_t, ε = schedule.add_noise(x0_emb, t)    t ~ U[0,1]
-      3. ε_pred = forward(x_t, t, self_cond)
-      4. loss   = MSE(ε_pred, ε)[mask] + λ*CE(ce_logits, x0)[mask]
-
-    Pipeline inferenza:
-      - Parti da rumore puro x_1 ~ N(0,I)
-      - Integra reverse SDE con Euler-Maruyama da t=1 a t=0
-      - Decodifica finale con ce_logits.argmax
+    Novità rispetto a v0.3:
+      - GPT-2 BPE tokenizer (50,257 vocab, case-sensitive, byte-level)
+      - YaRN RoPE scaling per context extension
+      - Flash Attention 2 con fallback automatico a SDPA
+      - Gradient checkpointing configurabile
     """
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -402,7 +436,6 @@ class Harold(nn.Module):
         self.emb_vocab     = emb_vocab
         self.mask_token_id = config.vocab_size
 
-        # GPT-2: nessun padding_idx fisso — il padding è gestito dalla mask
         self.token_emb = nn.Embedding(emb_vocab, config.d_model)
         self.pos_emb   = nn.Embedding(config.max_seq_len, config.d_model)
 
@@ -415,33 +448,26 @@ class Harold(nn.Module):
         self.self_cond_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         nn.init.normal_(self.self_cond_proj.weight, std=0.02)
 
-        # CFG (Classifier-Free Guidance) — conditioning sul contesto conversazionale
-        # Proietta il context embedding (mean pooling del prompt) nello spazio di t_emb
-        # Init a zero: no-op all'inizio, il modello impara gradualmente a usarlo
-        # Viene aggiunto solo durante il SFT, durante il pretraining ctx_emb=None
         self.cfg_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         nn.init.zeros_(self.cfg_proj.weight)
 
-        # [FIX #7] Frequenze per sinusoidi — t verrà riscalato *1000
         half  = config.d_model // 2
         freqs = torch.exp(-math.log(10000) * torch.arange(half, dtype=torch.float32) / half)
         self.register_buffer("t_freqs", freqs)
 
         self.blocks   = nn.ModuleList([Block(config) for _ in range(config.n_layers)])
         self.norm_out = nn.LayerNorm(config.d_model)
-
-        # [FIX #6] Predice ε (rumore) — non x0 né logit
         self.eps_pred = nn.Linear(config.d_model, config.d_model, bias=False)
 
-        # CE head ausiliaria weight-tied con token_emb
         self.ce_head        = nn.Linear(config.d_model, emb_vocab, bias=False)
         self.ce_head.weight = self.token_emb.weight
 
-        # [FIX #2] VP-SDE schedule
         self.schedule = VPSDESchedule(
             beta_min=config.diffusion_beta_min,
             beta_max=config.diffusion_beta_max,
         )
+
+        self.gradient_checkpointing = config.gradient_checkpointing
 
         self._init_weights()
 
@@ -458,24 +484,19 @@ class Harold(nn.Module):
                 nn.init.normal_(module.weight, std=0.02)
 
     def get_timestep_embedding(self, t: torch.Tensor) -> torch.Tensor:
-        """
-        [FIX #7] Riscala t ∈ [0,1] → [0,1000] prima delle sinusoidi.
-        Senza questo, gli argomenti sarebbero quasi-zero → embedding
-        quasi costante → il modello non distingue i timestep.
-        """
-        t_freqs = getattr(self, 't_freqs')       
-        args = (t.float() * 1000.0)[:, None] * t_freqs[None]
-        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        t_freqs = getattr(self, "t_freqs")
+        args    = (t.float() * 1000.0)[:, None] * t_freqs[None]
+        emb     = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if self.d_model % 2:
             emb = F.pad(emb, (0, 1))
         return emb
 
     def forward(
         self,
-        x_t:             torch.Tensor,                   # (B, L, D)
-        t:               torch.Tensor,                   # (B,) float in [0,1]
-        self_cond:       Optional[torch.Tensor] = None,  # (B, D) già detached
-        ctx_emb:         Optional[torch.Tensor] = None,  # (B, D) context embedding per CFG
+        x_t:             torch.Tensor,
+        t:               torch.Tensor,
+        self_cond:       Optional[torch.Tensor] = None,
+        ctx_emb:         Optional[torch.Tensor] = None,
         past_key_values: Optional[List[torch.Tensor]] = None,
         use_cache:       bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[List]]:
@@ -488,128 +509,95 @@ class Harold(nn.Module):
 
         t_emb = self.time_emb(self.get_timestep_embedding(t))
 
-        # Self-conditioning — sempre detached
         if self_cond is not None:
             t_emb = t_emb + self.self_cond_proj(self_cond.detach())
 
-        # CFG conditioning — context embedding del prompt
-        # Durante il pretraining ctx_emb=None → nessun effetto
-        # Durante il SFT ctx_emb è il mean pooling degli embedding del prompt
-        # Con p_uncond=0.1 ctx_emb viene azzerato → training unconditional
         if ctx_emb is not None:
             t_emb = t_emb + self.cfg_proj(ctx_emb.detach())
 
         t_normalized = t.float().mean().item() if not self.training else None
 
-        # Inizializza present_kvs come lista solo se use_cache è True
-        present_kvs = [] if use_cache else None
-        
+        present_kvs: Optional[List] = [] if use_cache else None
+
         for i, block in enumerate(self.blocks):
             past_kv = past_key_values[i] if past_key_values is not None else None
-            x, present_kv = block(
-                x, t_emb,
-                past_kv=past_kv, use_cache=use_cache,
-                kv_offset=kv_offset, t_normalized=t_normalized,
-            )
-            # Aggiungi present_kv solo se stiamo usando cache
-            if use_cache and present_kvs is not None:
-                present_kvs.append(present_kv)
 
-        x_out    = self.norm_out(x)
-        eps_pred = self.eps_pred(x_out)     # (B, L, D)
-        ce_logits = self.ce_head(x_out)     # (B, L, V)
+            if self.gradient_checkpointing and self.training and past_kv is None:
+                # Gradient checkpointing — risparmia ~30% VRAM, +25% tempo
+                def make_fn(blk: nn.Module, kv_off: int, t_norm: Optional[float]):
+                    def fn(x_in: torch.Tensor, t_emb_in: torch.Tensor) -> torch.Tensor:
+                        out, _ = blk(x_in, t_emb_in, past_kv=None, use_cache=False,
+                                    kv_offset=kv_off, t_normalized=t_norm)
+                        return out
+                    return fn
+                
+                x = gradient_checkpoint(
+                    make_fn(block, kv_offset, t_normalized),
+                    x, t_emb,
+                    use_reentrant=False,
+                )
+            else:
+                x, present_kv = block(
+                    x, t_emb,
+                    past_kv=past_kv, use_cache=use_cache,
+                    kv_offset=kv_offset, t_normalized=t_normalized,
+                )
+                if use_cache and present_kvs is not None:
+                    present_kvs.append(present_kv)
+
+        x_out     = self.norm_out(x)
+        eps_pred  = self.eps_pred(x_out)
+        ce_logits = self.ce_head(x_out)
 
         return eps_pred, ce_logits, present_kvs
 
     def compute_loss(
         self,
-        x0:             torch.Tensor,                   # (B, L) token IDs
-        mask:           torch.Tensor,                   # (B, L) bool — token non-padding
+        x0:             torch.Tensor,
+        mask:           torch.Tensor,
         ce_weight:      float = 0.1,
-        fixed_t:        Optional[torch.Tensor] = None,  # (B,) in [0,1]
+        fixed_t:        Optional[torch.Tensor] = None,
         self_cond_prob: float = 0.0,
-        ctx_emb:        Optional[torch.Tensor] = None,  # (B, D) context per CFG
-        p_uncond:       float = 0.0,                    # prob di zerare ctx_emb (CFG)
+        ctx_emb:        Optional[torch.Tensor] = None,
+        p_uncond:       float = 0.0,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Score matching loss per VP-SDE con SNR weighting.
-
-        Struttura:
-          1. t ~ U[0,1]  (o fixed_t per valutazione per-timestep)
-          2. x0_emb = token_emb(x0)
-          3. x_t, ε = schedule.add_noise(x0_emb, t)
-          4. (opz.) self-cond: primo forward senza hint → hint detached
-          5. ε_pred = forward(x_t, t, self_cond)
-          6. loss_score = SNR-weighted MSE(ε_pred, ε)[mask]
-          7. loss_ce    = CE(ce_logits[mask], x0[mask])
-          8. total = loss_score + ce_weight * loss_ce
-
-        SNR weighting (Min-SNR, Hang et al. 2023):
-          w(t) = SNR(t) / (SNR(t) + 1)  ∈ (0, 1)
-
-          - t alto (tanto rumore, SNR≈0) → w≈0 → contribuisce poco
-          - t basso (poco rumore, SNR>>1) → w→1 → contribuisce normalmente
-
-          Razionale: a t alto la loss MSE è naturalmente rumorosa perché
-          il segnale è quasi completamente corrotto. Pesarla meno stabilizza
-          i gradienti e fa convergere più velocemente i timestep bassi
-          (quelli che contano di più per la qualità finale della generazione).
-        """
         device = x0.device
 
         if mask.sum() == 0:
             zero = torch.tensor(0.0, device=device, requires_grad=True)
             return zero, {"score": 0.0, "ce": 0.0, "total": 0.0}
 
-        # ── Timestep ────────────────────────────────────────────────────────
         B = x0.shape[0]
         t = fixed_t if fixed_t is not None else torch.rand(B, device=device)
 
-        # ── Forward process ──────────────────────────────────────────────────
         with torch.no_grad():
-            x0_emb = self.token_emb(x0)             # (B, L, D)
+            x0_emb = self.token_emb(x0)
         x_t, eps = self.schedule.add_noise(x0_emb, t)
 
-        # ── Self-conditioning ────────────────────────────────────────────────
         self_cond: Optional[torch.Tensor] = None
         if self_cond_prob > 0 and torch.rand(1).item() < self_cond_prob:
             with torch.no_grad():
                 eps_prev, _, _ = self.forward(x_t, t, self_cond=None, ctx_emb=None)
-            self_cond = eps_prev.mean(dim=1).detach()   # (B, D)
+            self_cond = eps_prev.mean(dim=1).detach()
 
-        # ── CFG dropout ──────────────────────────────────────────────────────
-        # Con prob p_uncond azzera il context embedding → training unconditional
-        # Necessario per abilitare CFG in inferenza: guida = uncond + scale*(cond-uncond)
         cfg_emb: Optional[torch.Tensor] = None
         if ctx_emb is not None:
             if p_uncond > 0 and torch.rand(1).item() < p_uncond:
-                cfg_emb = torch.zeros_like(ctx_emb)   # unconditional
+                cfg_emb = torch.zeros_like(ctx_emb)
             else:
                 cfg_emb = ctx_emb
 
-        # ── Predizione ───────────────────────────────────────────────────────
         eps_pred, ce_logits, _ = self.forward(x_t, t, self_cond=self_cond, ctx_emb=cfg_emb)
 
-        # ── SNR weighting ────────────────────────────────────────────────────
-        # w(t) = SNR(t) / (SNR(t) + 1)
-        # Clampato a snr_clip per evitare che t≈0 domini con peso enorme
         snr_clip = 5.0
-        snr      = self.schedule.get_snr(t).clamp(max=snr_clip)   # (B,)
-        snr_w    = (snr / (snr + 1.0)).to(eps_pred.dtype)         # (B,) ∈ (0, 1)
+        snr      = self.schedule.get_snr(t).clamp(max=snr_clip)
+        snr_w    = (snr / (snr + 1.0)).to(eps_pred.dtype)
 
-        # ── Score matching con SNR weighting ─────────────────────────────────
-        # MSE per token: (B, L, D) → media su D → (B, L)
         per_token_mse = F.mse_loss(eps_pred, eps, reduction="none").mean(dim=-1)
-
-        # Applica peso SNR per batch item, poi media sui token mascherati
-        # snr_w: (B,) → (B, 1) per broadcasting su L
-        weighted_mse = per_token_mse * snr_w.unsqueeze(1)         # (B, L)
-        loss_score   = weighted_mse[mask].mean()
-
-        # ── CE ausiliaria ─────────────────────────────────────────────────────
-        loss_ce = F.cross_entropy(ce_logits[mask], x0[mask], reduction="mean")
-
-        total = loss_score + ce_weight * loss_ce
+        weighted_mse  = per_token_mse * snr_w.unsqueeze(1)
+        loss_score    = weighted_mse[mask].mean()
+        loss_ce       = F.cross_entropy(ce_logits[mask], x0[mask], reduction="mean")
+        total         = loss_score + ce_weight * loss_ce
 
         return total, {
             "score": loss_score.item(),
@@ -619,7 +607,6 @@ class Harold(nn.Module):
 
     @torch.no_grad()
     def decode_tokens(self, x: torch.Tensor) -> torch.Tensor:
-        """Nearest neighbor lookup: cosine similarity con il vocabolario."""
         emb_norm = F.normalize(self.token_emb.weight, dim=-1)
         x_norm   = F.normalize(x, dim=-1)
         return torch.einsum("bld,vd->blv", x_norm, emb_norm).argmax(dim=-1)
@@ -627,9 +614,9 @@ class Harold(nn.Module):
     @torch.no_grad()
     def update_router_biases(self):
         for block in self.blocks:
-            # Controlla che sia il tipo giusto
             if isinstance(block.moe, DeepSeekMoELayer):
                 block.moe.update_bias()
-                
+
+
 def build_model(model_cfg: ModelConfig) -> Harold:
     return Harold(model_cfg)

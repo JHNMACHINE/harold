@@ -49,7 +49,19 @@ class ModelConfig:
     dropout: float = 0.0
 
     # ── RoPE ──────────────────────────────────────────────────────────────
-    rope_theta: float = 500000.0
+    rope_theta:                float = 500000.0
+    rope_original_max_seq_len: int   = 1024   # seq_len originale del pretraining
+    rope_scale_factor:         float = 1.0    # >1.0 attiva YaRN per context extension
+
+    # ── Flash Attention 2 ─────────────────────────────────────────────────
+    # True: usa flash_attn se installato, fallback automatico a SDPA
+    # Installa con: pip install flash-attn --no-build-isolation
+    use_flash_attention: bool = True
+
+    # ── Gradient Checkpointing ────────────────────────────────────────────
+    # True: risparmia ~30% VRAM ricalcolando attivazioni nel backward
+    # Rallenta il training di ~25% — utile se si è vicini al limite VRAM
+    gradient_checkpointing: bool = False
 
 def get_model_config() -> ModelConfig:
     return ModelConfig()
