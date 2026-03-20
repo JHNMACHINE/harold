@@ -9,25 +9,46 @@ from typing import Optional
 
 @dataclass
 class ModelConfig:
-    vocab_size:     int   = 50257
-    mask_token_id:  int   = 50256
-    d_model:    int = 768
-    n_layers:   int = 12
-    n_heads:    int = 12
+    # ── Vocabolario ───────────────────────────────────────────────────────
+    # Harold v0.4: GPT-2 BPE tokenizer (byte-level, case-sensitive)
+    # Sostituisce BERT-uncased (30,522, lowercase) con GPT-2 (50,257, case-sensitive)
+    vocab_size:     int   = 50257   # gpt2
+    mask_token_id:  int   = 50256   # <|endoftext|> usato come mask token
+
+    # ── Architettura — 733M ───────────────────────────────────────────────
+    # Harold v0.3: d=768,  L=12, h=12, kv=4  → 168M
+    # Harold v0.4: d=1024, L=32, h=16, kv=4  → 733M
+    d_model:    int = 1024
+    n_layers:   int = 32
+    n_heads:    int = 16
     n_kv_heads: int = 4
-    d_ff:       int = 2048
+    d_ff:       int = 2816
+
+    # ── MoE ───────────────────────────────────────────────────────────────
     moe_n_routed_experts:    int = 4
     moe_top_k:               int = 2
     ds_moe_n_shared_experts: int = 2
-    mla_latent_dim: int = 96
+
+    # ── MLA ───────────────────────────────────────────────────────────────
+    mla_latent_dim: int = 128   # proporzionale a d_model (era 96 per d=768)
+
+    # ── DSA ───────────────────────────────────────────────────────────────
     dsa_window_size:  int = 256
     dsa_global_every: int = 64
-    max_seq_len: int = 512
-    block_size:  int = 512
+
+    # ── Sequenza ──────────────────────────────────────────────────────────
+    max_seq_len: int = 1024   # aumentato da 512 — più contesto
+    block_size:  int = 1024
+
+    # ── Diffusion VP-SDE ──────────────────────────────────────────────────
     diffusion_beta_min: float = 0.1
     diffusion_beta_max: float = 20.0
     diffusion_T:        int   = 64
+
+    # ── Training ──────────────────────────────────────────────────────────
     dropout: float = 0.0
+
+    # ── RoPE ──────────────────────────────────────────────────────────────
     rope_theta: float = 500000.0
 
 def get_model_config() -> ModelConfig:
@@ -36,13 +57,13 @@ def get_model_config() -> ModelConfig:
 
 @dataclass
 class TrainConfig:
-    batch_size:    int   = 16
-    grad_accum:    int   = 8
+    batch_size:    int   = 4      
+    grad_accum:    int   = 32     
     max_iters:     int   = 20000
-    lr:            float = 2e-4
-    seq_len:       int   = 256
+    lr:            float = 1e-4   
+    seq_len:       int   = 1024
     warmup_iters:  int   = 400
-    min_lr:        float = 2e-5
+    min_lr:        float = 1e-5
     eval_interval: int   = 500
     eval_iters:    int   = 20
     max_grad_norm: float = 1.0
@@ -81,7 +102,7 @@ class TrainConfig:
     def ctx(self):
         if self.device == "cpu":
             return nullcontext()
-        return torch.amp.autocast("cuda", dtype=self.ptdtype) # type: ignore
+        return torch.autocast("cuda", dtype=self.ptdtype)
 
     @property
     def use_scaler(self) -> bool:
@@ -177,7 +198,7 @@ class SFTConfig:
     def ctx(self):
         if self.device == "cpu":
             return nullcontext()
-        return torch.amp.autocast("cuda", dtype=self.ptdtype) # type: ignore
+        return torch.autocast("cuda", dtype=self.ptdtype)
 
     @property
     def use_scaler(self) -> bool:
