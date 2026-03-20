@@ -69,7 +69,7 @@ def get_model_config() -> ModelConfig:
 
 @dataclass
 class TrainConfig:
-    batch_size:    int   = 4       # ridotto per 733M (era 16 per 168M)
+    batch_size:    int   = 6       # ridotto per 733M (era 16 per 168M)
     grad_accum:    int   = 32      # batch virtuale = 4×32 = 128
     max_iters:     int   = 100000  # Chinchilla ottimale per 733M (~13B token)
     lr:            float = 1e-4    # leggermente più basso per modello più grande
