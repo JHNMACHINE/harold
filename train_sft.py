@@ -1,12 +1,12 @@
 """
-Harold v3 — train_sft.py
-=========================
+Harold v0.4 — train_sft.py
+===========================
 Supervised Fine-Tuning con Classifier-Free Guidance (CFG).
 
 Pipeline:
-  1. Carica checkpoint del pretraining (harold_200m_v3_final.pt)
-  2. Strato 1: UltraChat 200k (conversazioni multi-turn)
-  3. Strato 2: OpenOrca (Q&A con chain-of-thought)
+  1. Carica checkpoint del pretraining (harold_v04_final.pt)
+  2. Strato 1: oasst2 60% + OpenOrca 40% (mix YAML)
+  3. Strato 2: OpenOrca 100% (Q&A chain-of-thought)
 
 CFG:
   - ctx_emb = mean pooling degli embedding del prompt (context)
@@ -14,10 +14,17 @@ CFG:
   - In inferenza: ε_guided = ε_uncond + cfg_scale*(ε_cond - ε_uncond)
 
 Differenze rispetto al pretraining:
-  - lr molto più basso (2e-5 invece di 2e-4) — adattamento, non riscrittura
+  - lr molto più basso (2e-5 invece di 1e-4) — adattamento, non riscrittura
   - Loss solo sulla risposta (mask = response_mask, non padding mask)
   - ctx_emb passato a compute_loss per il conditioning
-  - cfg_proj trainabile, tutti gli altri parametri anche (full fine-tuning)
+  - cfg_proj trainabile con lr 10× rispetto al resto (nuovo layer, parte da zero)
+
+Differenze rispetto a v3:
+  - GPT-2 tokenizer — pad_token_id = eos_token_id (50256), non 0
+  - encode_context usa pad_token_id del tokenizer invece di padding_idx=0
+  - Dataset da YAML (datasets_config.yaml): oasst2 + OpenOrca invece di UltraChat
+  - Strato 2: filtra dataset_cfg per nome invece di ricostruire SFTDataset a mano
+  - yaml_path passato a build_sft_loaders per coerenza con train.py
 """
 
 import math
@@ -35,7 +42,7 @@ from transformers import AutoTokenizer
 from config import ModelConfig, SFTConfig
 from logger import AsyncLogger
 from model import Harold, build_model
-from dataset import SFTDataset, build_sft_loaders
+from dataset import SFTDataset, build_sft_loaders, load_dataset_config
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -43,26 +50,28 @@ from dataset import SFTDataset, build_sft_loaders
 # ─────────────────────────────────────────────────────────────────────────────
 
 def encode_context(
-    model:      Harold,
-    prompt_ids: torch.Tensor,   # (B, L_ctx)
+    model:        Harold,
+    prompt_ids:   torch.Tensor,  # (B, L_ctx)
+    pad_token_id: int = 50256,   # GPT-2 eos usato come pad
 ) -> torch.Tensor:
     """
     Encoda il contesto (prompt) come mean pooling degli embedding.
 
     Usiamo direttamente token_emb — non un encoder separato.
-    Questo è semplice, efficiente, e coerente con lo spazio embedding
-    in cui opera già il modello.
+    Coerente con lo spazio embedding in cui opera già il modello,
+    e con _encode_context() in sampler.py.
+
+    GPT-2 non ha padding_idx=0 fisso — usiamo pad_token_id del tokenizer
+    (eos_token_id=50256 configurato in __main__ come pad).
 
     Returns:
-        ctx_emb: (B, D) — context embedding normalizzato
+        ctx_emb: (B, D) — context embedding, media sui token non-padding
     """
     with torch.no_grad():
-        # Maschera il padding (padding_idx=0)
-        pad_mask  = (prompt_ids != 0).float()               # (B, L_ctx)
-        emb       = model.token_emb(prompt_ids)              # (B, L_ctx, D)
-        # Mean pooling sui token non-padding
-        n_tokens  = pad_mask.sum(dim=1, keepdim=True).clamp(min=1)  # (B, 1)
-        ctx_emb   = (emb * pad_mask.unsqueeze(-1)).sum(dim=1) / n_tokens  # (B, D)
+        pad_mask = (prompt_ids != pad_token_id).float()          # (B, L_ctx)
+        emb      = model.token_emb(prompt_ids)                    # (B, L_ctx, D)
+        n_tokens = pad_mask.sum(dim=1, keepdim=True).clamp(min=1)
+        ctx_emb  = (emb * pad_mask.unsqueeze(-1)).sum(dim=1) / n_tokens  # (B, D)
     return ctx_emb
 
 
@@ -85,11 +94,12 @@ def get_lr(it: int, cfg: SFTConfig, max_iters: int, base_lr: float, min_lr: floa
 
 @torch.no_grad()
 def estimate_sft_loss(
-    model:      Harold,
-    sft_cfg:    SFTConfig,
-    val_loader: DataLoader,
-    iter_num:   int = 0,
-    logger:     Optional[AsyncLogger] = None,
+    model:        Harold,
+    sft_cfg:      SFTConfig,
+    val_loader:   DataLoader,
+    pad_token_id: int,
+    iter_num:     int = 0,
+    logger:       Optional[AsyncLogger] = None,
 ) -> float:
     device = next(model.parameters()).device
     model.eval()
@@ -106,15 +116,14 @@ def estimate_sft_loss(
         except StopIteration:
             break
 
-        prompt_ids   = batch["prompt_ids"].to(device)    # (B, L_ctx)
-        response_ids = batch["response_ids"].to(device)  # (B, L_resp)
-        resp_mask    = batch["response_mask"].to(device)  # (B, L_resp)
+        prompt_ids   = batch["prompt_ids"].to(device)
+        response_ids = batch["response_ids"].to(device)
+        resp_mask    = batch["response_mask"].to(device)
 
         if resp_mask.sum() == 0:
             continue
 
-        # Encoda il contesto — sempre condizionato in val (no CFG dropout)
-        ctx_emb = encode_context(model, prompt_ids)
+        ctx_emb = encode_context(model, prompt_ids, pad_token_id)
 
         B = response_ids.shape[0]
         for t_val in t_values:
@@ -224,6 +233,7 @@ def run_stage(
     scaler:       torch.amp.GradScaler,  # type: ignore
     train_loader: DataLoader,
     val_loader:   DataLoader,
+    pad_token_id: int,
     max_iters:    int,
     base_lr:      float,
     initial_iter: int,
@@ -272,8 +282,7 @@ def run_stage(
                     break
                 continue
 
-            # Encoda il contesto per CFG
-            ctx_emb = encode_context(model, prompt_ids)   # (B, D)
+            ctx_emb = encode_context(model, prompt_ids, pad_token_id)
 
             with sft_cfg.ctx:
                 loss, loss_dict = model.compute_loss(
@@ -333,7 +342,7 @@ def run_stage(
             if iter_num == 0:
                 continue
 
-            val_loss  = estimate_sft_loss(model, sft_cfg, val_loader, iter_num, logger)
+            val_loss   = estimate_sft_loss(model, sft_cfg, val_loader, pad_token_id, iter_num, logger)
             val_losses.append(val_loss)
             avg_train  = accum_loss / max(sft_cfg.eval_interval, 1)
             accum_loss = 0.0
@@ -394,7 +403,7 @@ def run_stage(
 def run_sft(sft_cfg: SFTConfig) -> dict:
     device = sft_cfg.device
 
-    print("Harold v3 — SFT con CFG")
+    print("Harold v0.4 — SFT con CFG")
     print(f"Device:         {device}")
     print(f"Dtype:          {sft_cfg.dtype}")
     print(f"Batch virtuale: {sft_cfg.batch_size} × {sft_cfg.grad_accum} = {sft_cfg.effective_batch_size}")
@@ -403,18 +412,21 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
 
     # ── Tokenizer ─────────────────────────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(sft_cfg.tokenizer_model)
+    # GPT-2 non ha pad token di default — usa eos come pad (coerente con train.py)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    pad_token_id: int = int(tokenizer.pad_token_id)  # 50256
 
     # ── Modello: carica dal checkpoint di pretraining ─────────────────────
     print(f"\nCarico pretraining checkpoint: {sft_cfg.pretrain_ckpt}")
     state     = torch.load(sft_cfg.pretrain_ckpt, map_location="cpu", weights_only=False)
     model_cfg = state["model_cfg"]
 
-    # cfg_proj non è nel checkpoint del pretraining — verrà inizializzato
+    # cfg_proj non è nel checkpoint del pretraining — viene inizializzato
     # a zero da build_model (come definito in Harold.__init__)
     model = build_model(model_cfg).to(device)
 
-    # Carica i pesi del pretraining — strict=False permette a cfg_proj
-    # di essere inizializzato a zero anche se non è nel checkpoint
+    # strict=False: cfg_proj inizializzato a zero anche se assente nel checkpoint
     missing, unexpected = model.load_state_dict(state["model_state"], strict=False)
     if missing:
         print(f"Pesi mancanti (nuovi layer): {missing}")
@@ -423,17 +435,17 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
     del state
 
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"Harold v3 SFT — {n_params:.1f}M parametri")
+    print(f"Harold v0.4 SFT — {n_params:.1f}M parametri")
 
     # ── Optimizer ─────────────────────────────────────────────────────────
-    # cfg_proj ha lr più alto degli altri — deve imparare da zero
+    # cfg_proj ha lr 10× — parte da zero, deve imparare velocemente
     cfg_params   = list(model.cfg_proj.parameters())
     other_params = [p for n, p in model.named_parameters()
                     if "cfg_proj" not in n and p.requires_grad]
 
     optimizer = torch.optim.AdamW(
         [
-            {"params": cfg_params,   "lr": sft_cfg.lr * 10},  # cfg_proj: 10x lr
+            {"params": cfg_params,   "lr": sft_cfg.lr * 10},
             {"params": other_params, "lr": sft_cfg.lr},
         ],
         betas=(0.9, 0.95),
@@ -471,10 +483,10 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
         else:
             print("Nessun SFT checkpoint trovato, parto dal pretraining.")
 
-    # ── Strato 1: UltraChat ────────────────────────────────────────────────
+    # ── Strato 1: oasst2 60% + OpenOrca 40% ──────────────────────────────
     if initial_stage <= 1:
         print(f"\n{'='*60}")
-        print(f"Strato 1: UltraChat 200k — {sft_cfg.max_iters} step")
+        print(f"Strato 1: oasst2 + OpenOrca — {sft_cfg.max_iters} step")
         print(f"{'='*60}\n")
 
         train_loader, val_loader = build_sft_loaders(
@@ -482,6 +494,7 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
             max_ctx_len=sft_cfg.max_ctx_len,
             max_resp_len=sft_cfg.max_resp_len,
             max_ctx_turns=sft_cfg.max_ctx_turns,
+            yaml_path="datasets_config.yaml",
         )
 
         model.train()
@@ -490,6 +503,7 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
             model=model, model_cfg=model_cfg, sft_cfg=sft_cfg,
             optimizer=optimizer, scaler=scaler,
             train_loader=train_loader, val_loader=val_loader,
+            pad_token_id=pad_token_id,
             max_iters=sft_cfg.max_iters,
             base_lr=sft_cfg.lr,
             initial_iter=initial_iter if initial_stage == 1 else 0,
@@ -498,7 +512,6 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
             logger=logger,
         )
 
-        # Checkpoint fine strato 1
         s1_final = os.path.join(sft_cfg.checkpoint_dir, f"{sft_cfg.checkpoint_prefix}_s1_final.pt")
         save_sft_checkpoint(
             s1_final, model, optimizer, scaler,
@@ -507,33 +520,33 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
         )
         print(f"\nStrato 1 completato → {s1_final}")
 
-    # ── Strato 2: OpenOrca ─────────────────────────────────────────────────
+    # ── Strato 2: OpenOrca 100% ────────────────────────────────────────────
     print(f"\n{'='*60}")
     print(f"Strato 2: OpenOrca — {sft_cfg.stage2_max_iters} step")
     print(f"{'='*60}\n")
 
-    # Dataset solo OpenOrca per strato 2
+    # Carica dataset_cfg dal YAML e filtra solo openorca per strato 2
+    full_cfg  = load_dataset_config("datasets_config.yaml")
+    s2_ds_cfg = [d for d in full_cfg["sft"] if d["name"] == "openorca"]
+    for d in s2_ds_cfg:
+        d["weight"] = 1.0   # unico dataset, peso normalizzato
+
     train_ds2 = SFTDataset(
-        tokenizer=tokenizer, split="train",
-        max_ctx_len=sft_cfg.max_ctx_len,
-        max_resp_len=sft_cfg.max_resp_len,
+        tokenizer=tokenizer, dataset_cfg=s2_ds_cfg, split="train",
+        max_ctx_len=sft_cfg.max_ctx_len, max_resp_len=sft_cfg.max_resp_len,
         max_ctx_turns=sft_cfg.max_ctx_turns,
         val_every=sft_cfg.val_every, seed=43,
-        weights={"openorca": 1.0},
     )
     val_ds2 = SFTDataset(
-        tokenizer=tokenizer, split="val",
-        max_ctx_len=sft_cfg.max_ctx_len,
-        max_resp_len=sft_cfg.max_resp_len,
+        tokenizer=tokenizer, dataset_cfg=s2_ds_cfg, split="val",
+        max_ctx_len=sft_cfg.max_ctx_len, max_resp_len=sft_cfg.max_resp_len,
         max_ctx_turns=sft_cfg.max_ctx_turns,
         val_every=sft_cfg.val_every, seed=43,
-        weights={"openorca": 1.0},
     )
-    from torch.utils.data import DataLoader
     train_loader2 = DataLoader(train_ds2, batch_size=sft_cfg.batch_size, num_workers=0, pin_memory=True)
     val_loader2   = DataLoader(val_ds2,   batch_size=sft_cfg.batch_size, num_workers=0, pin_memory=True)
 
-    # LR più basso per strato 2
+    # LR ridotto per strato 2
     for pg in optimizer.param_groups:
         pg["lr"] = sft_cfg.stage2_lr
 
@@ -543,6 +556,7 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
         model=model, model_cfg=model_cfg, sft_cfg=sft_cfg,
         optimizer=optimizer, scaler=scaler,
         train_loader=train_loader2, val_loader=val_loader2,
+        pad_token_id=pad_token_id,
         max_iters=sft_cfg.stage2_max_iters,
         base_lr=sft_cfg.stage2_lr,
         initial_iter=initial_iter if initial_stage == 2 else 0,
@@ -551,7 +565,6 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
         logger=logger,
     )
 
-    # Checkpoint finale
     final_path = os.path.join(sft_cfg.checkpoint_dir, f"{sft_cfg.checkpoint_prefix}_final.pt")
     save_sft_checkpoint(
         final_path, model, optimizer, scaler,
