@@ -12,13 +12,7 @@ from typing import Literal, Optional, List, Tuple
 from transformers import PreTrainedTokenizer, AutoTokenizer
 
 from model import Harold, build_model
-
-# Import opzionale di SFTConfig — necessario per caricare checkpoint SFT
-# senza questo torch.load fallisce perché SFTConfig è serializzata nel checkpoint
-try:
-    from train_sft import SFTConfig  # noqa: F401
-except ImportError:
-    pass
+from config import SFTConfig
 
 
 SamplingMode = Literal["argmax", "sample", "confidence"]

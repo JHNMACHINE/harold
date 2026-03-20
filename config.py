@@ -78,7 +78,6 @@ class TrainConfig:
     books_weight:       float = 0.20
     c4_weight:          float = 0.15
     owt_weight:         float = 0.15
-    token_weights_path: str = "token_weights/token_weights.pt"
     checkpoint_dir:    str = "checkpoints_v4"
     checkpoint_prefix: str = "harold_v04"
     preload:           str = "latest"
