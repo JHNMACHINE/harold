@@ -84,16 +84,7 @@ class TrainConfig:
     dataset_name:       str   = "v4"
     tokenizer_model:    str   = "gpt2"
     stream_buffer_size: int   = 1000
-    val_every:          int   = 200
-    # Pretraining mix v0.4
-    # Sostituisce Books+OWT con SlimPajama — più pulito e deduplificato
-    # Aggiunge OpenMathInstruct (10%) e CodeContests (5%) per ragionamento
-    fineweb_weight:      float = 0.25
-    wikipedia_weight:    float = 0.20
-    slimpajama_weight:   float = 0.25
-    c4_weight:           float = 0.15
-    openmath_weight:     float = 0.10
-    codecontests_weight: float = 0.05
+    val_every:          int   = 500
     checkpoint_dir:    str = "checkpoints_v4"
     checkpoint_prefix: str = "harold_v04"
     preload:           str = "latest"
