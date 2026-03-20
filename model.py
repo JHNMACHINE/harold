@@ -111,8 +111,17 @@ class DeepSeekMoELayer(nn.Module):
             shared_out += expert(x_flat)
         shared_out = shared_out / len(self.shared_experts)
 
-        s          = self._affinity(x_flat, t_emb_flat)
-        sel_scores = s + self.router_bias.to(s.device)  # type: ignore
+        s = self._affinity(x_flat, t_emb_flat)
+        
+        # Usa router_bias direttamente, assicurandoti che sia sullo stesso dispositivo
+        # Se router_bias è un buffer, è già su un dispositivo, ma potremmo doverlo spostare
+        if hasattr(self, 'router_bias') and self.router_bias is not None:
+            # Assicurati che router_bias sia sullo stesso dispositivo di s
+            if self.router_bias.device != s.device:
+                self.router_bias = self.router_bias.to(s.device)
+            sel_scores = s + self.router_bias
+        else:
+            sel_scores = s
 
         if self.training or t_normalized is None:
             topk_indices = torch.topk(sel_scores, self.top_k, dim=-1).indices
@@ -155,7 +164,7 @@ class DeepSeekMoELayer(nn.Module):
         if valid.numel() == 0:
             return
         counts = torch.bincount(valid.view(-1), minlength=self.n_routed_experts).float()
-        counts = counts.to(self.router_bias.device)  # type: ignore
+        counts = counts.to(self.router_bias.device)
         self.router_bias += self.bias_update_gamma * (counts.mean() - counts).sign()
         self.router_indices = None
 
@@ -179,8 +188,10 @@ class RotaryEmbedding(nn.Module):
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, offset: int = 0):
         T   = q.shape[2]
-        cos = self.cos_cached[offset:offset + T].to(q.dtype).unsqueeze(0).unsqueeze(0)  # type: ignore
-        sin = self.sin_cached[offset:offset + T].to(q.dtype).unsqueeze(0).unsqueeze(0)  # type: ignore
+        cos_cached = getattr(self, 'cos_cached')
+        sin_cached = getattr(self, 'sin_cached')
+        cos = cos_cached[offset:offset + T].to(dtype=q.dtype).unsqueeze(0).unsqueeze(0)
+        sin = sin_cached[offset:offset + T].to(dtype=q.dtype).unsqueeze(0).unsqueeze(0)
         return q * cos + self._rotate_half(q) * sin, k * cos + self._rotate_half(k) * sin
 
 
@@ -452,8 +463,9 @@ class Harold(nn.Module):
         Senza questo, gli argomenti sarebbero quasi-zero → embedding
         quasi costante → il modello non distingue i timestep.
         """
-        args = (t.float() * 1000.0)[:, None] * self.t_freqs[None]  # type: ignore
-        emb  = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        t_freqs = getattr(self, 't_freqs')       
+        args = (t.float() * 1000.0)[:, None] * t_freqs[None]
+        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if self.d_model % 2:
             emb = F.pad(emb, (0, 1))
         return emb
@@ -489,7 +501,9 @@ class Harold(nn.Module):
 
         t_normalized = t.float().mean().item() if not self.training else None
 
+        # Inizializza present_kvs come lista solo se use_cache è True
         present_kvs = [] if use_cache else None
+        
         for i, block in enumerate(self.blocks):
             past_kv = past_key_values[i] if past_key_values is not None else None
             x, present_kv = block(
@@ -497,8 +511,9 @@ class Harold(nn.Module):
                 past_kv=past_kv, use_cache=use_cache,
                 kv_offset=kv_offset, t_normalized=t_normalized,
             )
-            if use_cache:
-                present_kvs.append(present_kv)  # type: ignore
+            # Aggiungi present_kv solo se stiamo usando cache
+            if use_cache and present_kvs is not None:
+                present_kvs.append(present_kv)
 
         x_out    = self.norm_out(x)
         eps_pred = self.eps_pred(x_out)     # (B, L, D)
@@ -612,8 +627,9 @@ class Harold(nn.Module):
     @torch.no_grad()
     def update_router_biases(self):
         for block in self.blocks:
-            block.moe.update_bias()  # type: ignore
-
-
+            # Controlla che sia il tipo giusto
+            if isinstance(block.moe, DeepSeekMoELayer):
+                block.moe.update_bias()
+                
 def build_model(model_cfg: ModelConfig) -> Harold:
     return Harold(model_cfg)
