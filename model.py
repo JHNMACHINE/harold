@@ -94,10 +94,7 @@ class DeepSeekMoELayer(nn.Module):
         x_flat     = x.view(-1, C)
         t_emb_flat = t_emb.unsqueeze(1).expand(B, T, C).reshape(-1, C)
 
-        shared_out = torch.zeros_like(x_flat)
-        for expert in self.shared_experts:
-            shared_out += expert(x_flat)
-        shared_out = shared_out / len(self.shared_experts)
+        shared_out = torch.stack([e(x_flat) for e in self.shared_experts]).mean(dim=0)
 
         s = self._affinity(x_flat, t_emb_flat)
 
