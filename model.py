@@ -139,7 +139,7 @@ class DeepSeekMoELayer(nn.Module):
 
         # Flatten slot: (N*K,) — ogni slot è un (token, k) pair
         slot_expert = topk_indices.view(-1)           # (N*K,) indice expert (-1 = invalido)
-        slot_token  = torch.arange(N, device=x_flat.device).unsqueeze(1).expand(N, K).reshape(-1)
+        slot_token = torch.arange(N, device=x_flat.device).repeat_interleave(K)
         slot_gate   = gates.view(-1)                  # (N*K,) peso del gate
 
         # Maschera slot validi (expert != -1)
