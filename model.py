@@ -92,7 +92,7 @@ class DeepSeekMoELayer(nn.Module):
     ) -> torch.Tensor:
         B, T, C    = x.shape
         x_flat     = x.view(-1, C)
-        t_emb_flat = t_emb.unsqueeze(1).expand(B, T, C).reshape(-1, C)
+        t_emb_flat = t_emb.repeat_interleave(T, dim=0)
 
         shared_out = torch.stack([e(x_flat) for e in self.shared_experts]).mean(dim=0)
 
