@@ -205,7 +205,7 @@ class RotaryEmbedding(nn.Module):
     YaRN scala le frequenze RoPE per estendere il context window oltre
     original_max_seq_len senza fine-tuning aggiuntivo.
     Con scale_factor=1.0 è identico al RoPE standard.
-    Con scale_factor=4.0 estende il context a 4x (es. 1024 → 4096).
+    Con scale_factor=4.0 estende il context a 4× (es. 1024 → 4096).
     """
     def __init__(
         self,
@@ -292,7 +292,8 @@ class BlockCausalAttention(nn.Module):
             scale_factor         = config.rope_scale_factor,
         )
         self.resid_drop = nn.Dropout(config.dropout)
-        self._sparse_mask_cache: dict = {}  # cache: seq_len → mask
+        self._sparse_mask_cache: dict = {}   # cache: seq_len → bool mask
+        self._attn_bias_cache:   dict = {}   # cache: seq_len → float attn_bias
 
         # Flash Attention 2 — fallback automatico a SDPA se non installato
         self._use_flash = False
@@ -341,27 +342,34 @@ class BlockCausalAttention(nn.Module):
             k = torch.cat([k[..., :-T, :], k_cur], dim=2)
 
         full_len = k.shape[2]
-        k_exp    = k.repeat_interleave(self.n_kv_groups, dim=1)
-        v_exp    = v.repeat_interleave(self.n_kv_groups, dim=1)
 
         if self._use_flash and past_kv is None:
+            # Flash Attention 2 con GQA nativo — nessun repeat_interleave
             y = self._flash_attn_func(
                 q.transpose(1, 2),
-                k_exp.transpose(1, 2),
-                v_exp.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
                 dropout_p=self.dropout if self.training else 0.0,
                 causal=False,
                 window_size=(self.window_size, self.window_size),
             ).transpose(1, 2)
         else:
-            mask      = self._build_sparse_mask(full_len, x.device)
+            # SDPA con GQA nativo (PyTorch ≥ 2.5) — evita repeat_interleave
+            # Recupera attn_bias dalla cache o la costruisce una volta sola
+            if full_len not in self._attn_bias_cache:
+                mask = self._build_sparse_mask(full_len, x.device)
+                bias = torch.zeros(full_len, full_len, device=x.device, dtype=x.dtype)
+                bias.masked_fill_(mask, float("-inf"))
+                self._attn_bias_cache[full_len] = bias
+            attn_bias = self._attn_bias_cache[full_len]
             if T < full_len:
-                mask  = mask[-T:, :]
-            attn_bias = torch.zeros(T, full_len, device=x.device, dtype=x.dtype)
-            attn_bias = attn_bias.masked_fill(mask, float("-inf")).unsqueeze(0).unsqueeze(0)
+                attn_bias = attn_bias[-T:, :]
+            attn_bias = attn_bias.unsqueeze(0).unsqueeze(0)
+
             y = F.scaled_dot_product_attention(
-                q, k_exp, v_exp, attn_mask=attn_bias,
-                dropout_p=self.dropout if self.training else 0.0, is_causal=False,
+                q, k, v, attn_mask=attn_bias,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=False, enable_gqa=True,
             )
 
         out = self.resid_drop(self.o_proj(y.transpose(1, 2).contiguous().view(B, T, C)))
