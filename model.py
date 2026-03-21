@@ -223,7 +223,6 @@ class RotaryEmbedding(nn.Module):
 
             mask_high = beta > beta_fast
             mask_low  = beta < beta_slow
-            mask_mid  = ~mask_high & ~mask_low
 
             freqs_ntk    = freqs
             freqs_linear = freqs / scale_factor
