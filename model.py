@@ -167,9 +167,9 @@ class DeepSeekMoELayer(nn.Module):
                 token_idx  = valid_token[mask_i]       # token da processare
                 gate_i     = valid_gate[mask_i]        # gate corrispondenti
 
-                expert_in  = x_flat[token_idx]         # (m, C)
-                expert_out = self.routed_experts[i](expert_in)   # (m, C)
-                weighted   = expert_out * gate_i.to(expert_out.dtype).unsqueeze(1)
+                expert_in  = x_flat[token_idx]                              # (m, C)
+                expert_out = self.routed_experts[i](expert_in).to(x_flat.dtype)  # (m, C)
+                weighted   = expert_out * gate_i.to(x_flat.dtype).unsqueeze(1)
 
                 routed_out.index_add_(0, token_idx, weighted)
 
@@ -202,7 +202,7 @@ class RotaryEmbedding(nn.Module):
     YaRN scala le frequenze RoPE per estendere il context window oltre
     original_max_seq_len senza fine-tuning aggiuntivo.
     Con scale_factor=1.0 è identico al RoPE standard.
-    Con scale_factor=4.0 estende il context a 4× (es. 1024 → 4096).
+    Con scale_factor=4.0 estende il context a 4x (es. 1024 → 4096).
     """
     def __init__(
         self,
@@ -266,6 +266,7 @@ class BlockCausalAttention(nn.Module):
         assert config.n_heads % config.n_kv_heads == 0
 
         self.n_heads     = config.n_heads
+        self.n_kv_heads  = config.n_kv_heads
         self.n_kv_groups = config.n_heads // config.n_kv_heads
         self.head_dim    = config.d_model // config.n_heads
         self.block_size  = config.block_size
@@ -288,8 +289,7 @@ class BlockCausalAttention(nn.Module):
             scale_factor         = config.rope_scale_factor,
         )
         self.resid_drop = nn.Dropout(config.dropout)
-        self._sparse_mask_cache: dict = {}   # cache: seq_len → bool mask
-        self._attn_bias_cache:   dict = {}   # cache: seq_len → float attn_bias
+        self._sparse_mask_cache: dict = {}   # cache: seq_len → bool mask (CPU)
 
         # Flash Attention 2 — fallback automatico a SDPA se non installato
         self._use_flash = False
@@ -329,8 +329,8 @@ class BlockCausalAttention(nn.Module):
         # k_up/v_up due volte quando past_kv è presente (era sprecato).
         c_kv_full = torch.cat([past_kv, c_kv], dim=1) if past_kv is not None else c_kv
 
-        k = self.k_up(c_kv_full).view(B, -1, -1, self.head_dim).transpose(1, 2)
-        v = self.v_up(c_kv_full).view(B, -1, -1, self.head_dim).transpose(1, 2)
+        k = self.k_up(c_kv_full).view(B, -1, self.n_heads // self.n_kv_groups, self.head_dim).transpose(1, 2)
+        v = self.v_up(c_kv_full).view(B, -1, self.n_heads // self.n_kv_groups, self.head_dim).transpose(1, 2)
 
         # RoPE applicato solo sulle posizioni nuove di q e k correnti
         q, k_cur = self.rope(q, k[..., -T:, :] if past_kv is not None else k, offset=kv_offset)
@@ -351,15 +351,11 @@ class BlockCausalAttention(nn.Module):
             ).transpose(1, 2)
         else:
             # SDPA con GQA nativo (PyTorch ≥ 2.5) — evita repeat_interleave
-            # Recupera attn_bias dalla cache o la costruisce una volta sola
-            if full_len not in self._attn_bias_cache:
-                mask = self._build_sparse_mask(full_len, x.device)
-                bias = torch.zeros(full_len, full_len, device=x.device, dtype=x.dtype)
-                bias.masked_fill_(mask, float("-inf"))
-                self._attn_bias_cache[full_len] = bias
-            attn_bias = self._attn_bias_cache[full_len]
+            mask      = self._build_sparse_mask(full_len, x.device)
             if T < full_len:
-                attn_bias = attn_bias[-T:, :]
+                mask  = mask[-T:, :]
+            attn_bias = torch.zeros(T, full_len, device=x.device, dtype=x.dtype)
+            attn_bias.masked_fill_(mask, float("-inf"))
             attn_bias = attn_bias.unsqueeze(0).unsqueeze(0)
 
             y = F.scaled_dot_product_attention(
@@ -636,8 +632,17 @@ class Harold(nn.Module):
         per_token_mse = F.mse_loss(eps_pred, eps, reduction="none").mean(dim=-1)
         weighted_mse  = per_token_mse * snr_w.unsqueeze(1)
         loss_score    = weighted_mse[mask].mean()
-        loss_ce       = F.cross_entropy(ce_logits[mask], x0[mask], reduction="mean")
-        total         = loss_score + ce_weight * loss_ce
+
+        # CE loss con ignore_index invece di boolean masking — evita di
+        # materializzare ce_logits[mask] che alloca (N_valid, vocab_size) ≈ 600MB
+        x0_for_ce = x0.masked_fill(~mask, -100)
+        loss_ce   = F.cross_entropy(
+            ce_logits.view(-1, ce_logits.size(-1)),
+            x0_for_ce.view(-1),
+            ignore_index=-100,
+            reduction="mean",
+        )
+        total = loss_score + ce_weight * loss_ce
 
         return total, {
             "score": loss_score.item(),

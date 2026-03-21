@@ -351,33 +351,28 @@ class MixedStreamingDataset(IterableDataset):
         self.seed        = seed
         self.buffer_size = buffer_size
         self.weights     = {d["name"]: d["weight"] for d in dataset_cfg}
+        # sep_id calcolato una volta in __init__ — non cambia mai
+        sep_token = _first_token_id(tokenizer.sep_token_id)
+        eos_token = _first_token_id(tokenizer.eos_token_id)
+        self.sep_id = int(sep_token if sep_token is not None
+                          else eos_token if eos_token is not None
+                          else 0)
 
     def _make_iterators(self) -> dict[str, Iterator[list[int]]]:
-            # Estrai i token ID una sola volta
-            sep_token = _first_token_id(self.tokenizer.sep_token_id)
-            eos_token = _first_token_id(self.tokenizer.eos_token_id)
-            
-            # Determina sep_id con priorità
-            if sep_token is not None:
-                sep_id = int(sep_token)
-            elif eos_token is not None:
-                sep_id = int(eos_token)
-            else:
-                sep_id = 0
-            
-            return {
-                d["name"]: _iter_pretraining_dataset(
-                    ds_cfg=d, tokenizer=self.tokenizer, sep_id=sep_id,
-                    split=self.split, val_every=self.val_every,
-                    buffer_size=self.buffer_size, seed=self.seed + i * 7,
-                )
-                for i, d in enumerate(self.dataset_cfg)
-            }
+        return {
+            d["name"]: _iter_pretraining_dataset(
+                ds_cfg=d, tokenizer=self.tokenizer, sep_id=self.sep_id,
+                split=self.split, val_every=self.val_every,
+                buffer_size=self.buffer_size, seed=self.seed + i * 7,
+            )
+            for i, d in enumerate(self.dataset_cfg)
+        }
 
     def __iter__(self) -> Iterator[dict]:
         iters     = self._make_iterators()
         names     = list(iters.keys())
         carry: list[int] = []
+        offset    = 0   # puntatore — evita slicing O(n) sulla carry
         counters  = {n: 0.0 for n in names}
         incs      = {n: 1.0 / self.weights[n] for n in names}
         exhausted: set[str] = set()
@@ -394,11 +389,15 @@ class MixedStreamingDataset(IterableDataset):
                 exhausted.add(chosen)
                 continue
             carry.extend(ids)
-            while len(carry) >= self.seq_len:
-                chunk = carry[:self.seq_len]
-                carry = carry[self.seq_len:]
+            while len(carry) - offset >= self.seq_len:
+                chunk  = carry[offset:offset + self.seq_len]
+                offset += self.seq_len
+                # Compatta periodicamente per evitare crescita illimitata
+                if offset > 100_000:
+                    carry  = carry[offset:]
+                    offset = 0
                 input_ids = torch.tensor(chunk, dtype=torch.long)
-                yield {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
+                yield {"input_ids": input_ids}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -506,13 +505,14 @@ def build_loaders(
     )
     def worker_init_fn(_: int) -> None:
         """Partiziona lo stream tra i worker per evitare duplicati."""
+        import torch
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is not None:
             ds = worker_info.dataset
             current_seed = getattr(ds, 'seed', 42)
             setattr(ds, 'seed', current_seed + worker_info.id * 31)
 
-    num_workers = 2
+    num_workers = 4
     train_loader = DataLoader(
         train_ds, batch_size=train_cfg.batch_size,
         num_workers=num_workers, pin_memory=True,
