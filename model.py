@@ -129,30 +129,62 @@ class DeepSeekMoELayer(nn.Module):
             torch.full_like(s_sel, 1.0 / self.top_k),
         ).to(x.dtype)
 
-        routed_out = torch.zeros_like(x_flat)
-        for i in range(self.n_routed_experts):
-            row_idx, which_k = (topk_indices == i).nonzero(as_tuple=True)
-            if row_idx.numel() == 0:
-                continue
-            expert_out = self.routed_experts[i](x_flat.index_select(0, row_idx))
-            routed_out.index_add_(0, row_idx, expert_out * gates[row_idx, which_k].unsqueeze(1))
+        # ── Expert routing vettorializzato ───────────────────────────────────
+        # Invece di iterare su ogni expert sequenzialmente, processiamo tutti
+        # i token in un unico batch per expert e ricombiniamo con scatter.
+        #
+        # Shape: topk_indices (N, K), gates (N, K) dove N = B*T, K = top_k
+        # Per ogni slot (token, k) valido troviamo quale expert serve,
+        # raggruppiamo i token per expert e facciamo un unico forward per ognuno.
+
+        N = x_flat.shape[0]  # B * T
+        K = topk_indices.shape[1]  # top_k (o k_max in inferenza)
+
+        # Flatten slot: (N*K,) — ogni slot è un (token, k) pair
+        slot_expert = topk_indices.view(-1)           # (N*K,) indice expert (-1 = invalido)
+        slot_token  = torch.arange(N, device=x_flat.device).unsqueeze(1).expand(N, K).reshape(-1)
+        slot_gate   = gates.view(-1)                  # (N*K,) peso del gate
+
+        # Maschera slot validi (expert != -1)
+        valid = slot_expert >= 0                      # (N*K,) bool
+
+        routed_out = torch.zeros_like(x_flat)         # (N, C)
+
+        if valid.any():
+            # Raggruppa slot validi per expert
+            valid_expert = slot_expert[valid]          # (M,) indici expert validi
+            valid_token  = slot_token[valid]           # (M,) indici token corrispondenti
+            valid_gate   = slot_gate[valid]            # (M,) gate corrispondenti
+
+            # Ordina per expert per minimizzare i gather (opzionale ma cache-friendly)
+            sort_idx     = valid_expert.argsort(stable=True)
+            valid_expert = valid_expert[sort_idx]
+            valid_token  = valid_token[sort_idx]
+            valid_gate   = valid_gate[sort_idx]
+
+            # Processa ogni expert su tutti i suoi token in un unico forward
+            for i in range(self.n_routed_experts):
+                mask_i = valid_expert == i             # slot assegnati all'expert i
+                if not mask_i.any():
+                    continue
+                token_idx  = valid_token[mask_i]       # token da processare
+                gate_i     = valid_gate[mask_i]        # gate corrispondenti
+
+                expert_in  = x_flat[token_idx]         # (m, C)
+                expert_out = self.routed_experts[i](expert_in)   # (m, C)
+                weighted   = expert_out * gate_i.to(expert_out.dtype).unsqueeze(1)
+
+                routed_out.index_add_(0, token_idx, weighted)
 
         return ((shared_out + routed_out) / (len(self.shared_experts) + self.top_k)).view(B, T, C)
 
     @torch.no_grad()
     def update_bias(self):
-        # Controlla se router_indices è stato inizializzato
         if self.router_indices is None:
             return
-        
-        # Controlla che router_bias esista e non sia None
-        if not hasattr(self, 'router_bias') or self.router_bias is None:
-            return
-        
         valid = self.router_indices[self.router_indices >= 0]
         if valid.numel() == 0:
             return
-    
         counts = torch.bincount(valid.view(-1), minlength=self.n_routed_experts).float()
         # Assicurati che router_bias sia sul dispositivo corretto
         if self.router_bias.device != counts.device:
@@ -160,6 +192,8 @@ class DeepSeekMoELayer(nn.Module):
         counts = counts.to(self.router_bias.device)
         self.router_bias += self.bias_update_gamma * (counts.mean() - counts).sign()
         self.router_indices = None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # RoPE con YaRN scaling
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,7 +205,7 @@ class RotaryEmbedding(nn.Module):
     YaRN scala le frequenze RoPE per estendere il context window oltre
     original_max_seq_len senza fine-tuning aggiuntivo.
     Con scale_factor=1.0 è identico al RoPE standard.
-    Con scale_factor=4.0 estende il context a 4× (es. 1024 → 4096).
+    Con scale_factor=4.0 estende il context a 4x (es. 1024 → 4096).
     """
     def __init__(
         self,
@@ -258,24 +292,29 @@ class BlockCausalAttention(nn.Module):
             scale_factor         = config.rope_scale_factor,
         )
         self.resid_drop = nn.Dropout(config.dropout)
+        self._sparse_mask_cache: dict = {}  # cache: seq_len → mask
 
         # Flash Attention 2 — fallback automatico a SDPA se non installato
         self._use_flash = False
         if config.use_flash_attention:
             try:
-                from flash_attn import flash_attn_func as _faf
+                from flash_attn import flash_attn_func as _faf # type: ignore
                 self._flash_attn_func = _faf
                 self._use_flash = True
             except ImportError:
                 pass  # fallback silenzioso a SDPA
 
     def _build_sparse_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        if seq_len in self._sparse_mask_cache:
+            return self._sparse_mask_cache[seq_len]
         idx            = torch.arange(seq_len, device=device)
         block_idx      = idx // self.block_size
         future_block   = block_idx.unsqueeze(0) > block_idx.unsqueeze(1)
         outside_window = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs() > self.window_size
         global_visible = (idx % self.global_every == 0).unsqueeze(0).expand(seq_len, seq_len)
-        return (outside_window & ~global_visible) | future_block
+        mask = (outside_window & ~global_visible) | future_block
+        self._sparse_mask_cache[seq_len] = mask
+        return mask
 
     def forward(
         self,
@@ -288,34 +327,33 @@ class BlockCausalAttention(nn.Module):
 
         q    = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         c_kv = self.kv_down(x)
-        k    = self.k_up(c_kv).view(B, T, -1, self.head_dim).transpose(1, 2)
-        v    = self.v_up(c_kv).view(B, T, -1, self.head_dim).transpose(1, 2)
 
-        q, k = self.rope(q, k, offset=kv_offset)
+        # Costruisce c_kv_full prima di proiettare k e v — evita di chiamare
+        # k_up/v_up due volte quando past_kv è presente (era sprecato).
+        c_kv_full = torch.cat([past_kv, c_kv], dim=1) if past_kv is not None else c_kv
 
+        k = self.k_up(c_kv_full).view(B, -1, -1, self.head_dim).transpose(1, 2)
+        v = self.v_up(c_kv_full).view(B, -1, -1, self.head_dim).transpose(1, 2)
+
+        # RoPE applicato solo sulle posizioni nuove di q e k correnti
+        q, k_cur = self.rope(q, k[..., -T:, :] if past_kv is not None else k, offset=kv_offset)
         if past_kv is not None:
-            c_kv_full = torch.cat([past_kv, c_kv], dim=1)
-            k = self.k_up(c_kv_full).view(B, -1, -1, self.head_dim).transpose(1, 2)
-            v = self.v_up(c_kv_full).view(B, -1, -1, self.head_dim).transpose(1, 2)
-        else:
-            c_kv_full = c_kv
+            k = torch.cat([k[..., :-T, :], k_cur], dim=2)
 
         full_len = k.shape[2]
         k_exp    = k.repeat_interleave(self.n_kv_groups, dim=1)
         v_exp    = v.repeat_interleave(self.n_kv_groups, dim=1)
 
         if self._use_flash and past_kv is None:
-            # Flash Attention 2 — richiede (B, L, H, D), window_size nativo per DSA
             y = self._flash_attn_func(
-                q.transpose(1, 2),      # (B, T, H, D)
+                q.transpose(1, 2),
                 k_exp.transpose(1, 2),
                 v_exp.transpose(1, 2),
                 dropout_p=self.dropout if self.training else 0.0,
                 causal=False,
                 window_size=(self.window_size, self.window_size),
-            ).transpose(1, 2)           # → (B, H, T, D)
+            ).transpose(1, 2)
         else:
-            # Fallback: SDPA con maschera DSA esplicita
             mask      = self._build_sparse_mask(full_len, x.device)
             if T < full_len:
                 mask  = mask[-T:, :]
@@ -527,14 +565,12 @@ class Harold(nn.Module):
                 def make_fn(blk: nn.Module, kv_off: int, t_norm: Optional[float]):
                     def fn(x_in: torch.Tensor, t_emb_in: torch.Tensor) -> torch.Tensor:
                         out, _ = blk(x_in, t_emb_in, past_kv=None, use_cache=False,
-                                    kv_offset=kv_off, t_normalized=t_norm)
+                                     kv_offset=kv_off, t_normalized=t_norm)
                         return out
                     return fn
-                
                 x = gradient_checkpoint(
                     make_fn(block, kv_offset, t_normalized),
-                    x, t_emb,
-                    use_reentrant=False,
+                    x, t_emb, use_reentrant=False,
                 )
             else:
                 x, present_kv = block(
