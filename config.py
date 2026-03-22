@@ -56,11 +56,6 @@ class ModelConfig:
     # Installa con: pip install flash-attn --no-build-isolation
     use_flash_attention: bool = True
 
-    # ── Gradient Checkpointing ────────────────────────────────────────────
-    # True: risparmia ~30% VRAM ricalcolando attivazioni nel backward
-    # Rallenta il training di ~25% — utile se si è vicini al limite VRAM
-    gradient_checkpointing: bool = False
-
 def get_model_config() -> ModelConfig:
     return ModelConfig()
 

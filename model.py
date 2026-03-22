@@ -92,16 +92,16 @@ class DeepSeekMoELayer(nn.Module):
     ) -> torch.Tensor:
         B, T, C    = x.shape
         x_flat     = x.view(-1, C)
-        t_emb_flat = t_emb.repeat_interleave(T, dim=0)
+        t_emb_flat = t_emb.unsqueeze(1).expand(B, T, C).reshape(-1, C)
 
-        shared_out = torch.stack([e(x_flat) for e in self.shared_experts]).mean(dim=0)
+        shared_out = torch.zeros_like(x_flat)
+        for expert in self.shared_experts:
+            shared_out += expert(x_flat)
+        shared_out = shared_out / len(self.shared_experts)
 
         s = self._affinity(x_flat, t_emb_flat)
 
-        router_bias = getattr(self, "router_bias")
-        if router_bias.device != s.device:
-            router_bias = router_bias.to(s.device)
-        sel_scores = s + router_bias
+        sel_scores = s + self.router_bias
 
         if self.training or t_normalized is None:
             topk_indices = torch.topk(sel_scores, self.top_k, dim=-1).indices
@@ -126,52 +126,13 @@ class DeepSeekMoELayer(nn.Module):
             torch.full_like(s_sel, 1.0 / self.top_k),
         ).to(x.dtype)
 
-        # ── Expert routing vettorializzato ───────────────────────────────────
-        # Invece di iterare su ogni expert sequenzialmente, processiamo tutti
-        # i token in un unico batch per expert e ricombiniamo con scatter.
-        #
-        # Shape: topk_indices (N, K), gates (N, K) dove N = B*T, K = top_k
-        # Per ogni slot (token, k) valido troviamo quale expert serve,
-        # raggruppiamo i token per expert e facciamo un unico forward per ognuno.
-
-        N = x_flat.shape[0]  # B * T
-        K = topk_indices.shape[1]  # top_k (o k_max in inferenza)
-
-        # Flatten slot: (N*K,) — ogni slot è un (token, k) pair
-        slot_expert = topk_indices.view(-1)           # (N*K,) indice expert (-1 = invalido)
-        slot_token = torch.arange(N, device=x_flat.device).repeat_interleave(K)
-        slot_gate   = gates.view(-1)                  # (N*K,) peso del gate
-
-        # Maschera slot validi (expert != -1)
-        valid = slot_expert >= 0                      # (N*K,) bool
-
-        routed_out = torch.zeros_like(x_flat)         # (N, C)
-
-        if valid.any():
-            # Raggruppa slot validi per expert
-            valid_expert = slot_expert[valid]          # (M,) indici expert validi
-            valid_token  = slot_token[valid]           # (M,) indici token corrispondenti
-            valid_gate   = slot_gate[valid]            # (M,) gate corrispondenti
-
-            # Ordina per expert per minimizzare i gather (opzionale ma cache-friendly)
-            sort_idx     = valid_expert.argsort(stable=True)
-            valid_expert = valid_expert[sort_idx]
-            valid_token  = valid_token[sort_idx]
-            valid_gate   = valid_gate[sort_idx]
-
-            # Processa ogni expert su tutti i suoi token in un unico forward
-            for i in range(self.n_routed_experts):
-                mask_i = valid_expert == i             # slot assegnati all'expert i
-                if not mask_i.any():
-                    continue
-                token_idx  = valid_token[mask_i]       # token da processare
-                gate_i     = valid_gate[mask_i]        # gate corrispondenti
-
-                expert_in  = x_flat[token_idx]                              # (m, C)
-                expert_out = self.routed_experts[i](expert_in).to(x_flat.dtype)  # (m, C)
-                weighted   = expert_out * gate_i.to(x_flat.dtype).unsqueeze(1)
-
-                routed_out.index_add_(0, token_idx, weighted)
+        routed_out = torch.zeros_like(x_flat)
+        for i in range(self.n_routed_experts):
+            row_idx, which_k = (topk_indices == i).nonzero(as_tuple=True)
+            if row_idx.numel() == 0:
+                continue
+            expert_out = self.routed_experts[i](x_flat[row_idx]).to(x_flat.dtype)
+            routed_out.index_add_(0, row_idx, expert_out * gates[row_idx, which_k].to(x_flat.dtype).unsqueeze(1))
 
         return ((shared_out + routed_out) / (len(self.shared_experts) + self.top_k)).view(B, T, C)
 
@@ -183,10 +144,6 @@ class DeepSeekMoELayer(nn.Module):
         if valid.numel() == 0:
             return
         counts = torch.bincount(valid.view(-1), minlength=self.n_routed_experts).float()
-        # Assicurati che router_bias sia sul dispositivo corretto
-        if self.router_bias.device != counts.device:
-            self.router_bias = self.router_bias.to(counts.device)
-        counts = counts.to(self.router_bias.device)
         self.router_bias += self.bias_update_gamma * (counts.mean() - counts).sign()
         self.router_indices = None
 
@@ -202,7 +159,7 @@ class RotaryEmbedding(nn.Module):
     YaRN scala le frequenze RoPE per estendere il context window oltre
     original_max_seq_len senza fine-tuning aggiuntivo.
     Con scale_factor=1.0 è identico al RoPE standard.
-    Con scale_factor=4.0 estende il context a 4x (es. 1024 → 4096).
+    Con scale_factor=4.0 estende il context a 4× (es. 1024 → 4096).
     """
     def __init__(
         self,
@@ -247,11 +204,11 @@ class RotaryEmbedding(nn.Module):
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, offset: int = 0):
         T      = q.shape[2]
-        mscale = getattr(self, "mscale").to(q.dtype)
-        cos    = getattr(self, "cos_cached")[offset:offset + T].to(q.dtype).unsqueeze(0).unsqueeze(0)
-        sin    = getattr(self, "sin_cached")[offset:offset + T].to(q.dtype).unsqueeze(0).unsqueeze(0)
-        q_rot  = (q * cos + self._rotate_half(q) * sin) * mscale
-        k_rot  = (k * cos + self._rotate_half(k) * sin) * mscale
+        mscale = self.mscale.to(q.dtype)
+        cos    = self.cos_cached[offset:offset + T].to(q.dtype).unsqueeze(0).unsqueeze(0) # type: ignore
+        sin    = self.sin_cached[offset:offset + T].to(q.dtype).unsqueeze(0).unsqueeze(0) # type: ignore
+        q_rot  = (q * cos + self._rotate_half(q) * sin) * mscale # type: ignore
+        k_rot  = (k * cos + self._rotate_half(k) * sin) * mscale # type: ignore
         return q_rot, k_rot
 
 
@@ -295,11 +252,12 @@ class BlockCausalAttention(nn.Module):
         self._use_flash = False
         if config.use_flash_attention:
             try:
-                from flash_attn import flash_attn_func as _faf # type: ignore
-                self._flash_attn_func = _faf
+                from flash_attn import flash_attn_func # type: ignore
+                # Versione ottimizzata per training
+                self._flash_attn_func = flash_attn_func
                 self._use_flash = True
             except ImportError:
-                pass  # fallback silenzioso a SDPA
+                pass
 
     def _build_sparse_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         if seq_len in self._sparse_mask_cache:
@@ -327,30 +285,36 @@ class BlockCausalAttention(nn.Module):
 
         # Costruisce c_kv_full prima di proiettare k e v — evita di chiamare
         # k_up/v_up due volte quando past_kv è presente (era sprecato).
-        c_kv_full = torch.cat([past_kv, c_kv], dim=1) if past_kv is not None else c_kv
+        k    = self.k_up(c_kv).view(B, T, -1, self.head_dim).transpose(1, 2)
+        v    = self.v_up(c_kv).view(B, T, -1, self.head_dim).transpose(1, 2)
 
-        k = self.k_up(c_kv_full).view(B, -1, self.n_heads // self.n_kv_groups, self.head_dim).transpose(1, 2)
-        v = self.v_up(c_kv_full).view(B, -1, self.n_heads // self.n_kv_groups, self.head_dim).transpose(1, 2)
+        q, k = self.rope(q, k, offset=kv_offset)
 
-        # RoPE applicato solo sulle posizioni nuove di q e k correnti
-        q, k_cur = self.rope(q, k[..., -T:, :] if past_kv is not None else k, offset=kv_offset)
         if past_kv is not None:
-            k = torch.cat([k[..., :-T, :], k_cur], dim=2)
+            c_kv_full = torch.cat([past_kv, c_kv], dim=1)
+            k = self.k_up(c_kv_full).view(B, -1, -1, self.head_dim).transpose(1, 2)
+            v = self.v_up(c_kv_full).view(B, -1, -1, self.head_dim).transpose(1, 2)
+        else:
+            c_kv_full = c_kv
 
         full_len = k.shape[2]
 
         if self._use_flash and past_kv is None:
             # Flash Attention 2 con GQA nativo — nessun repeat_interleave
+            k_exp = k.repeat_interleave(self.n_kv_groups, dim=1)
+            v_exp = v.repeat_interleave(self.n_kv_groups, dim=1)
             y = self._flash_attn_func(
                 q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
+                k_exp.transpose(1, 2),
+                v_exp.transpose(1, 2),
                 dropout_p=self.dropout if self.training else 0.0,
                 causal=False,
                 window_size=(self.window_size, self.window_size),
             ).transpose(1, 2)
         else:
             # SDPA con GQA nativo (PyTorch ≥ 2.5) — evita repeat_interleave
+            k_exp = k.repeat_interleave(self.n_kv_groups, dim=1)
+            v_exp = v.repeat_interleave(self.n_kv_groups, dim=1)
             mask      = self._build_sparse_mask(full_len, x.device)
             if T < full_len:
                 mask  = mask[-T:, :]
@@ -359,9 +323,9 @@ class BlockCausalAttention(nn.Module):
             attn_bias = attn_bias.unsqueeze(0).unsqueeze(0)
 
             y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_bias,
+                q, k_exp, v_exp, attn_mask=attn_bias,
                 dropout_p=self.dropout if self.training else 0.0,
-                is_causal=False, enable_gqa=True,
+                is_causal=False,
             )
 
         out = self.resid_drop(self.o_proj(y.transpose(1, 2).contiguous().view(B, T, C)))
@@ -505,8 +469,6 @@ class Harold(nn.Module):
             beta_max=config.diffusion_beta_max,
         )
 
-        self.gradient_checkpointing = config.gradient_checkpointing
-
         self._init_weights()
 
     def _init_weights(self):
@@ -522,8 +484,7 @@ class Harold(nn.Module):
                 nn.init.normal_(module.weight, std=0.02)
 
     def get_timestep_embedding(self, t: torch.Tensor) -> torch.Tensor:
-        t_freqs = getattr(self, "t_freqs")
-        args    = (t.float() * 1000.0)[:, None] * t_freqs[None]
+        args    = (t.float() * 1000.0)[:, None] * self.t_freqs[None] # type: ignore
         emb     = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if self.d_model % 2:
             emb = F.pad(emb, (0, 1))
@@ -559,27 +520,13 @@ class Harold(nn.Module):
 
         for i, block in enumerate(self.blocks):
             past_kv = past_key_values[i] if past_key_values is not None else None
-
-            if self.gradient_checkpointing and self.training and past_kv is None:
-                # Gradient checkpointing — risparmia ~30% VRAM, +25% tempo
-                def make_fn(blk: nn.Module, kv_off: int, t_norm: Optional[float]):
-                    def fn(x_in: torch.Tensor, t_emb_in: torch.Tensor) -> torch.Tensor:
-                        out, _ = blk(x_in, t_emb_in, past_kv=None, use_cache=False,
-                                     kv_offset=kv_off, t_normalized=t_norm)
-                        return out
-                    return fn
-                x = gradient_checkpoint(
-                    make_fn(block, kv_offset, t_normalized),
-                    x, t_emb, use_reentrant=False,
-                )
-            else:
-                x, present_kv = block(
-                    x, t_emb,
-                    past_kv=past_kv, use_cache=use_cache,
-                    kv_offset=kv_offset, t_normalized=t_normalized,
-                )
-                if use_cache and present_kvs is not None:
-                    present_kvs.append(present_kv)
+            x, present_kv = block(
+                x, t_emb,
+                past_kv=past_kv, use_cache=use_cache,
+                kv_offset=kv_offset, t_normalized=t_normalized,
+            )
+            if present_kvs is not None:
+                present_kvs.append(present_kv)
 
         x_out     = self.norm_out(x)
         eps_pred  = self.eps_pred(x_out)

@@ -13,11 +13,8 @@ Fix rispetto alla versione precedente:
   [FIX #9] gradient accumulation: salta micro-batch con mask vuota
 """
 
-import json
 import math
 import os
-import queue
-import threading
 import time
 import warnings
 from typing import Dict, Tuple, Optional
@@ -61,8 +58,7 @@ class DiffusionTrainer:
         """
         # Maschera token validi (non-padding)
         # GPT-2 usa eos_token come pad (id=50256) — usiamo pad_token_id dal trainer
-        pad_id = getattr(self, "pad_token_id", 0)
-        mask = (batch != pad_id)   # (B, L)
+        mask = (batch != self.pad_token_id)   # (B, L)
 
         # [FIX #9] Salta batch completamente vuoti
         if mask.sum() == 0:
@@ -192,7 +188,7 @@ def save_checkpoint(
     path:         str,
     model:        Harold,
     optimizer:    torch.optim.Optimizer,
-    scaler:       torch.GradScaler,
+    scaler:       torch.GradScaler,  # type: ignore
     iter_num:     int,
     val_loss:     float,
     model_cfg:    ModelConfig,
@@ -217,15 +213,14 @@ def load_checkpoint(
     path:      str,
     model:     Harold,
     optimizer: torch.optim.Optimizer,
-    scaler:    torch.GradScaler,
+    scaler:    torch.GradScaler,  # type: ignore
     device:    str,
 ) -> Tuple[int, float, list, list]:
     print(f"Carico checkpoint: {path}")
     state = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(state["model_state"])
     optimizer.load_state_dict(state["optimizer_state"])
-    if "scaler_state" in state:
-        scaler.load_state_dict(state["scaler_state"])
+    scaler.load_state_dict(state["scaler_state"])
     iter_num     = state.get("iter_num", 0) + 1
     best_val     = state.get("val_loss", float("inf"))
     train_losses = state.get("train_losses", [])
@@ -261,6 +256,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
     # ── Modello ───────────────────────────────────────────────────────────
     model    = build_model(model_cfg).to(device)
+    
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Harold v0.4 — {n_params:.1f}M parametri totali")
 
@@ -378,7 +374,6 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         pbar.set_postfix({
             "loss":  f"{avg_loss:.4f}",
             "score": f"{avg_score:.4f}",
-            "ce":    f"{avg_ce:.4f}",
             "lr":    f"{lr:.2e}",
             "grad":  f"{grad_norm:.2f}",
         })
