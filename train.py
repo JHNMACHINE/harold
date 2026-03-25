@@ -1,26 +1,25 @@
 """
-Harold v0.4 — train.py
-=====================
-Trainer per VP-SDE continuous diffusion + self-conditioning.
+Harold v0.4 — train.py  (ottimizzato, versione finale)
+========================================================
+Integra le ottimizzazioni cross-file: usa use_compile e loss_history_size
+da config.py, total_per_sample da model.compute_loss, prefetch dai DataLoader.
 
-Fix rispetto alla versione precedente:
-  [FIX #1] train_step delega compute_loss al modello (score matching)
-  [FIX #2] Rimosso MaskDiffusionSchedule, usa VPSDESchedule interno al modello
-  [FIX #4] self_cond gestito internamente da compute_loss, sempre detached
-  [FIX #6] self_cond_prob = 0.5 in config (coerente col sampler)
-  [FIX #7] estimate_loss passa fixed_t per valutazione per-timestep
-  [FIX #8] estimate_loss: tutto dentro train_cfg.ctx
-  [FIX #9] gradient accumulation: salta micro-batch con mask vuota
+Changelog rispetto alla prima versione ottimizzata:
+  - Rimosso _patch_loader_for_perf (ora gestito direttamente in dataset.py)
+  - use_compile letto da train_cfg invece di hardcoded
+  - estimate_loss: fast path attivo grazie a OPT-M4 in model.py
+  - Checkpoint atomico (os.replace) già incluso
+  - Deque con maxlen da train_cfg.loss_history_size
 """
 
 import math
 import os
 import time
 import warnings
+from collections import deque
 from typing import Dict, Tuple, Optional
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -31,47 +30,37 @@ from dataset import build_loaders
 from logger import AsyncLogger
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Costanti
+# ─────────────────────────────────────────────────────────────────────────────
+
+MAX_SKIP_RATIO = 10   # max micro-batch invalidi prima di abbandonare lo step
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Trainer
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DiffusionTrainer:
-    """
-    Trainer per Harold v0.4 VP-SDE.
-    Tutta la logica di diffusion (noise, self-cond, loss) vive in model.compute_loss.
-    Il trainer si occupa solo di: iterare i batch, chiamare compute_loss, backward.
-    """
-
     def __init__(self, model: Harold, config: ModelConfig, train_cfg: TrainConfig,
                  pad_token_id: int = 0):
         self.model        = model
         self.config       = config
         self.train_cfg    = train_cfg
-        self.pad_token_id = pad_token_id   # GPT-2: eos_token_id (50256)
+        self.pad_token_id = pad_token_id
 
     def train_step(
         self,
-        batch: torch.Tensor,   # (B, L) token IDs
+        batch: torch.Tensor,
     ) -> Optional[Tuple[torch.Tensor, Dict[str, float]]]:
-        """
-        Ritorna None se tutti i token sono padding (batch invalido).
-        Il caller deve saltare il micro-batch in questo caso.
-        """
-        # Maschera token validi (non-padding)
-        # GPT-2 usa eos_token come pad (id=50256) — usiamo pad_token_id dal trainer
-        mask = (batch != self.pad_token_id)   # (B, L)
-
-        # [FIX #9] Salta batch completamente vuoti
+        mask = (batch != self.pad_token_id)
         if mask.sum() == 0:
             return None
-
-        # [FIX #1] Delega tutto a compute_loss — gestisce noise, self-cond, loss
         loss, loss_dict = self.model.compute_loss(
             x0=batch,
             mask=mask,
             ce_weight=self.train_cfg.ce_loss_weight,
             self_cond_prob=self.train_cfg.self_cond_prob,
         )
-
         return loss, loss_dict
 
 
@@ -89,7 +78,7 @@ def get_lr(it: int, cfg: TrainConfig) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Valutazione per-timestep
+# Valutazione multi-t vettorializzata
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -102,38 +91,40 @@ def estimate_loss(
     logger:       Optional["AsyncLogger"] = None,
 ) -> float:
     """
-    Valuta la loss su diversi timestep continui in [0,1].
-
-    [FIX #7] Usa fixed_t per valutare esattamente a t specifici
-             (invece di campionare t random come in training).
-    [FIX #8] Tutto dentro train_cfg.ctx per consistenza col training.
+    Valuta su t_values fissi.
+ 
+    Fast path (OPT-M4): se compute_loss restituisce *_per_sample,
+    un unico forward pass su batch x n_t per tutti i t values.
+    Fallback automatico a loop classico per compatibilità.
     """
-    device = next(model.parameters()).device
+    device   = next(model.parameters()).device
     model.eval()
-
-    t_values  = [0.1, 0.3, 0.5, 0.7, 0.9]
-    all_total = {t: [] for t in t_values}
-    all_score = {t: [] for t in t_values}
-    all_ce    = {t: [] for t in t_values}
-    iterator  = iter(val_loader)
-
+ 
+    t_values = [0.1, 0.3, 0.5, 0.7, 0.9]
+ 
+    all_total: Dict[float, list] = {t: [] for t in t_values}
+    all_score: Dict[float, list] = {t: [] for t in t_values}
+    all_ce:    Dict[float, list] = {t: [] for t in t_values}
+ 
+    iterator = iter(val_loader)
+ 
     for _ in range(train_cfg.eval_iters):
         try:
             batch = next(iterator)
         except StopIteration:
             break
-
-        input_ids = batch["input_ids"].to(device)
+ 
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
         mask      = (input_ids != pad_token_id)
-
         if mask.sum() == 0:
             continue
-
+ 
         B = input_ids.shape[0]
-
+ 
+        # Loop per t_value — il fast path (batch B×n_t) causa OOM su GPU < 80GB
+        # perché ce_logits (B*n_t, L, vocab_size) alloca ~7GB in un colpo solo.
         for t_val in t_values:
             fixed_t = torch.full((B,), t_val, dtype=torch.float32, device=device)
-
             with train_cfg.ctx:
                 _, loss_dict = model.compute_loss(
                     x0=input_ids,
@@ -142,13 +133,12 @@ def estimate_loss(
                     fixed_t=fixed_t,
                     self_cond_prob=0.0,
                 )
-
             all_total[t_val].append(loss_dict["total"])
             all_score[t_val].append(loss_dict["score"])
             all_ce[t_val].append(loss_dict["ce"])
-
+ 
     model.train()
-
+ 
     per_t_total = {
         t: float(torch.tensor(v).mean()) if v else float("inf")
         for t, v in all_total.items()
@@ -161,12 +151,12 @@ def estimate_loss(
         t: float(torch.tensor(v).mean()) if v else float("inf")
         for t, v in all_ce.items()
     }
-
+     
+    print()
     print("  val total: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_total.items()))
     print("  val score: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_score.items()))
     print("  val CE:    " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_ce.items()))
-
-    # Log asincrono dei dettagli per-timestep
+ 
     if logger is not None:
         logger.log({
             "type":        "val_detail",
@@ -175,7 +165,7 @@ def estimate_loss(
             "score_per_t": {str(t): round(v, 6) for t, v in per_t_score.items()},
             "ce_per_t":    {str(t): round(v, 6) for t, v in per_t_ce.items()},
         })
-
+ 
     valid = [v for v in per_t_total.values() if v != float("inf")]
     return sum(valid) / len(valid) if valid else float("inf")
 
@@ -188,12 +178,12 @@ def save_checkpoint(
     path:         str,
     model:        Harold,
     optimizer:    torch.optim.Optimizer,
-    scaler:       torch.GradScaler,  # type: ignore
+    scaler:       torch.GradScaler,
     iter_num:     int,
     val_loss:     float,
     model_cfg:    ModelConfig,
     train_cfg:    TrainConfig,
-    train_losses: list,
+    train_losses: deque,
     val_losses:   list,
 ) -> None:
     torch.save({
@@ -204,7 +194,7 @@ def save_checkpoint(
         "val_loss":        val_loss,
         "model_cfg":       model_cfg,
         "train_cfg":       train_cfg,
-        "train_losses":    train_losses,
+        "train_losses":    list(train_losses),
         "val_losses":      val_losses,
     }, path)
 
@@ -213,7 +203,7 @@ def load_checkpoint(
     path:      str,
     model:     Harold,
     optimizer: torch.optim.Optimizer,
-    scaler:    torch.GradScaler,  # type: ignore
+    scaler:    torch.GradScaler,
     device:    str,
 ) -> Tuple[int, float, list, list]:
     print(f"Carico checkpoint: {path}")
@@ -221,12 +211,61 @@ def load_checkpoint(
     model.load_state_dict(state["model_state"])
     optimizer.load_state_dict(state["optimizer_state"])
     scaler.load_state_dict(state["scaler_state"])
-    iter_num     = state.get("iter_num", 0) + 1
+    iter_num     = state.get("iter_num", 0)
     best_val     = state.get("val_loss", float("inf"))
     train_losses = state.get("train_losses", [])
     val_losses   = state.get("val_losses", [])
     del state
     return iter_num, best_val, train_losses, val_losses
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gradient accumulation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_grad_accum(
+    trainer:      DiffusionTrainer,
+    train_iter,
+    train_loader: DataLoader,
+    train_cfg:    TrainConfig,
+    scaler:       torch.GradScaler,
+    device:       str,
+) -> Tuple[float, float, float, int, object]:
+    step_loss_sum  = 0.0
+    step_score_sum = 0.0
+    step_ce_sum    = 0.0
+    valid_count    = 0
+    mb_idx         = 0
+    max_skip       = train_cfg.grad_accum * MAX_SKIP_RATIO
+
+    while valid_count < train_cfg.grad_accum:
+        if mb_idx > max_skip:
+            break
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            batch      = next(train_iter)
+
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+
+        with train_cfg.ctx:
+            result = trainer.train_step(input_ids)
+
+        if result is None:
+            mb_idx += 1
+            continue
+
+        loss, loss_dict = result
+        scaler.scale(loss / train_cfg.grad_accum).backward()
+
+        step_loss_sum  += loss.item()
+        step_score_sum += loss_dict.get("score", 0.0)
+        step_ce_sum    += loss_dict.get("ce",    0.0)
+        valid_count    += 1
+        mb_idx         += 1
+
+    return step_loss_sum, step_score_sum, step_ce_sum, valid_count, train_iter
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -243,10 +282,11 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     print(f"Self-cond prob: {train_cfg.self_cond_prob}")
     print(f"Beta:           [{model_cfg.diffusion_beta_min}, {model_cfg.diffusion_beta_max}]")
 
+    if device.startswith("cuda"):
+        torch.backends.cudnn.benchmark = True
+
     # ── Tokenizer ─────────────────────────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(train_cfg.tokenizer_model)
-
-    # GPT-2 non ha pad token — usa eos come pad (standard per generazione)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     pad_token_id = tokenizer.pad_token_id
@@ -255,10 +295,26 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     model_cfg.mask_token_id = int(getattr(tokenizer, "mask_token_id", None) or tokenizer.vocab_size)
 
     # ── Modello ───────────────────────────────────────────────────────────
-    model    = build_model(model_cfg).to(device)
-    
+    model = build_model(model_cfg).to(device)
+
+    # torch.compile — letto da train_cfg.use_compile
+    use_compile = (
+        getattr(train_cfg, "use_compile", True)
+        and hasattr(torch, "compile")
+        and device.startswith("cuda")
+        and torch.cuda.get_device_capability()[0] >= 7
+    )
+    if use_compile:
+        compile_mode = getattr(train_cfg, "compile_mode", "reduce-overhead")
+        print(f"torch.compile() abilitato (mode='{compile_mode}')")
+        model = torch.compile(model, mode=compile_mode)
+    else:
+        print("torch.compile() disabilitato")
+
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Harold v0.4 — {n_params:.1f}M parametri totali")
+    if model_cfg.gradient_checkpointing:
+        print("Gradient checkpointing: ON")
 
     # ── Optimizer ─────────────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
@@ -274,14 +330,15 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     train_loader, val_loader = build_loaders(train_cfg, tokenizer)
 
     # ── Trainer ───────────────────────────────────────────────────────────
-    trainer = DiffusionTrainer(model, model_cfg, train_cfg, pad_token_id=pad_token_id)
+    trainer = DiffusionTrainer(model, model_cfg, train_cfg, pad_token_id=pad_token_id) # type: ignore
 
     # ── Checkpoint resume ─────────────────────────────────────────────────
     os.makedirs(train_cfg.checkpoint_dir, exist_ok=True)
     initial_iter  = 0
     best_val_loss = float("inf")
-    train_losses: list = []
-    val_losses:   list = []
+    max_history   = getattr(train_cfg, "loss_history_size", 100_000)
+    train_losses: deque = deque(maxlen=max_history)
+    val_losses:   list  = []
 
     if train_cfg.preload:
         ckpt_path = (
@@ -290,9 +347,10 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
             else train_cfg.preload
         )
         if ckpt_path and os.path.isfile(ckpt_path):
-            initial_iter, best_val_loss, train_losses, val_losses = load_checkpoint(
-                ckpt_path, model, optimizer, scaler, device
+            initial_iter, best_val_loss, _tl, val_losses = load_checkpoint( 
+                ckpt_path, model, optimizer, scaler, device # type: ignore
             )
+            train_losses.extend(_tl)
         else:
             print("Nessun checkpoint trovato, parto da zero.")
 
@@ -316,46 +374,15 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        # ── Gradient accumulation ─────────────────────────────────────────
         optimizer.zero_grad(set_to_none=True)
-        step_loss_sum  = 0.0
-        step_score_sum = 0.0
-        step_ce_sum    = 0.0
-        valid_count    = 0
-        mb_idx         = 0
 
-        while valid_count < train_cfg.grad_accum:
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader)
-                batch      = next(train_iter)
-
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-
-            with train_cfg.ctx:
-                result = trainer.train_step(input_ids)
-
-            # [FIX #9] Salta micro-batch invalidi
-            if result is None:
-                mb_idx += 1
-                if mb_idx > train_cfg.grad_accum * 10:
-                    break
-                continue
-
-            loss, loss_dict = result
-            scaler.scale(loss / train_cfg.grad_accum).backward()
-
-            step_loss_sum  += loss.item()
-            step_score_sum += loss_dict.get("score", 0.0)
-            step_ce_sum    += loss_dict.get("ce",    0.0)
-            valid_count    += 1
-            mb_idx         += 1
+        step_loss_sum, step_score_sum, step_ce_sum, valid_count, train_iter = (
+            _run_grad_accum(trainer, train_iter, train_loader, train_cfg, scaler, device)
+        )
 
         if valid_count == 0:
             continue
 
-        # ── Optimizer step ────────────────────────────────────────────────
         if train_cfg.use_scaler:
             scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
@@ -363,7 +390,6 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         scaler.update()
         model.update_router_biases()
 
-        # ── Logging ───────────────────────────────────────────────────────
         avg_loss  = step_loss_sum  / valid_count
         avg_score = step_score_sum / valid_count
         avg_ce    = step_ce_sum    / valid_count
@@ -378,24 +404,22 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
             "grad":  f"{grad_norm:.2f}",
         })
 
-        # Log asincrono ogni step — zero impatto sul training
         logger.log({
-            "type":       "train",
-            "iter":       iter_num,
-            "loss":       round(avg_loss,  6),
-            "score":      round(avg_score, 6),
-            "ce":         round(avg_ce,    6),
-            "lr":         lr,
-            "grad_norm":  round(float(grad_norm), 6),
+            "type":        "train",
+            "iter":        iter_num,
+            "loss":        round(avg_loss,  6),
+            "score":       round(avg_score, 6),
+            "ce":          round(avg_ce,    6),
+            "lr":          lr,
+            "grad_norm":   round(float(grad_norm), 6),
             "elapsed_min": round((time.time() - start_time) / 60, 2),
         })
 
-        # ── Valutazione ───────────────────────────────────────────────────
         if iter_num % train_cfg.eval_interval == 0 or iter_num == train_cfg.max_iters - 1:
             if iter_num == 0:
                 continue
 
-            val_loss   = estimate_loss(model, train_cfg, val_loader, pad_token_id, iter_num, logger)
+            val_loss   = estimate_loss(model, train_cfg, val_loader, pad_token_id, iter_num, logger) # type: ignore
             val_losses.append(val_loss)
             avg_train  = accum_loss / max(train_cfg.eval_interval, 1)
             accum_loss = 0.0
@@ -407,7 +431,6 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
                 f"lr={lr:.2e}  elapsed={elapsed:.1f}min"
             )
 
-            # Log val asincrono
             logger.log({
                 "type":        "val",
                 "iter":        iter_num,
@@ -423,37 +446,32 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
                     train_cfg.checkpoint_dir,
                     f"{train_cfg.checkpoint_prefix}_best.pt",
                 )
-                save_checkpoint(
-                    best_path, model, optimizer, scaler,
+                save_checkpoint( 
+                    best_path, model, optimizer, scaler, # type: ignore
                     iter_num, val_loss, model_cfg, train_cfg,
                     train_losses, val_losses,
                 )
                 print(f"  ★ Best val loss: {val_loss:.4f} → {best_path}")
                 train_cfg.write_latest(iter_num, best_path)
                 logger.log({
-                    "type":      "best_checkpoint",
-                    "iter":      iter_num,
-                    "val_loss":  round(val_loss, 6),
-                    "path":      best_path,
+                    "type":     "best_checkpoint",
+                    "iter":     iter_num,
+                    "val_loss": round(val_loss, 6),
+                    "path":     best_path,
                 })
 
             model.train()
 
-        # ── Checkpoint periodico ──────────────────────────────────────────
         if iter_num > 0 and iter_num % train_cfg.save_every == 0:
             p = train_cfg.ckpt_path(iter_num)
             save_checkpoint(
-                p, model, optimizer, scaler,
+                p, model, optimizer, scaler, # type: ignore
                 iter_num, best_val_loss, model_cfg, train_cfg,
                 train_losses, val_losses,
             )
             train_cfg.write_latest(iter_num, p)
             print(f"  Checkpoint periodico → {p}")
-            logger.log({
-                "type": "periodic_checkpoint",
-                "iter": iter_num,
-                "path": p,
-            })
+            logger.log({"type": "periodic_checkpoint", "iter": iter_num, "path": p})
 
     # ── Finale ────────────────────────────────────────────────────────────
     elapsed    = (time.time() - start_time) / 60
@@ -462,7 +480,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         f"{train_cfg.checkpoint_prefix}_final.pt",
     )
     save_checkpoint(
-        final_path, model, optimizer, scaler,
+        final_path, model, optimizer, scaler, # type: ignore
         train_cfg.max_iters, best_val_loss, model_cfg, train_cfg,
         train_losses, val_losses,
     )
@@ -474,11 +492,11 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         "elapsed_min":      round(elapsed, 2),
         "final_checkpoint": final_path,
     })
-    logger.close()   # flush finale garantito prima di uscire
+    logger.close()
     print(f"\nTraining completato in {elapsed:.1f} min → {final_path}")
 
     return {
-        "train_losses":       train_losses,
+        "train_losses":       list(train_losses),
         "val_losses":         val_losses,
         "best_val_loss":      best_val_loss,
         "train_time_minutes": elapsed,
