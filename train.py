@@ -34,7 +34,6 @@ from logger import AsyncLogger
 
 MAX_SKIP_RATIO = 10   # max micro-batch invalidi prima di abbandonare lo step
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Trainer
 # ─────────────────────────────────────────────────────────────────────────────
@@ -91,35 +90,35 @@ def estimate_loss(
 ) -> float:
     """
     Valuta su t_values fissi.
- 
+
     Fast path (OPT-M4): se compute_loss restituisce *_per_sample,
     un unico forward pass su batch x n_t per tutti i t values.
     Fallback automatico a loop classico per compatibilità.
     """
     device   = next(model.parameters()).device
     model.eval()
- 
+
     t_values = [0.1, 0.3, 0.5, 0.7, 0.9]
- 
+
     all_total: Dict[float, list] = {t: [] for t in t_values}
     all_score: Dict[float, list] = {t: [] for t in t_values}
     all_ce:    Dict[float, list] = {t: [] for t in t_values}
- 
+
     iterator = iter(val_loader)
- 
+
     for _ in range(train_cfg.eval_iters):
         try:
             batch = next(iterator)
         except StopIteration:
             break
- 
+
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         mask      = (input_ids != pad_token_id)
         if mask.sum() == 0:
             continue
- 
+
         B = input_ids.shape[0]
- 
+
         # Loop per t_value — il fast path (batch B×n_t) causa OOM su GPU < 80GB
         # perché ce_logits (B*n_t, L, vocab_size) alloca ~7GB in un colpo solo.
         for t_val in t_values:
@@ -135,9 +134,9 @@ def estimate_loss(
             all_total[t_val].append(loss_dict["total"])
             all_score[t_val].append(loss_dict["score"])
             all_ce[t_val].append(loss_dict["ce"])
- 
+
     model.train()
- 
+
     per_t_total = {
         t: float(torch.tensor(v).mean()) if v else float("inf")
         for t, v in all_total.items()
@@ -150,12 +149,11 @@ def estimate_loss(
         t: float(torch.tensor(v).mean()) if v else float("inf")
         for t, v in all_ce.items()
     }
-     
-    print()
+
     print("  val total: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_total.items()))
     print("  val score: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_score.items()))
     print("  val CE:    " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_ce.items()))
- 
+
     if logger is not None:
         logger.log({
             "type":        "val_detail",
@@ -164,7 +162,7 @@ def estimate_loss(
             "score_per_t": {str(t): round(v, 6) for t, v in per_t_score.items()},
             "ce_per_t":    {str(t): round(v, 6) for t, v in per_t_ce.items()},
         })
- 
+
     valid = [v for v in per_t_total.values() if v != float("inf")]
     return sum(valid) / len(valid) if valid else float("inf")
 
@@ -184,6 +182,7 @@ def save_checkpoint(
     train_cfg:    TrainConfig,
     train_losses: deque,
     val_losses:   list,
+    push_hf:      bool = False,
 ) -> None:
     torch.save({
         "iter_num":        iter_num,
@@ -196,6 +195,9 @@ def save_checkpoint(
         "train_losses":    list(train_losses),
         "val_losses":      val_losses,
     }, path)
+
+    if push_hf:
+        push_to_huggingface(path)
 
 
 def load_checkpoint(
@@ -210,7 +212,7 @@ def load_checkpoint(
     model.load_state_dict(state["model_state"])
     optimizer.load_state_dict(state["optimizer_state"])
     scaler.load_state_dict(state["scaler_state"])
-    iter_num     = state.get("iter_num", 0)
+    iter_num     = state.get("iter_num", 0) + 1
     best_val     = state.get("val_loss", float("inf"))
     train_losses = state.get("train_losses", [])
     val_losses   = state.get("val_losses", [])
@@ -277,7 +279,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     print("Harold v0.4 — VP-SDE Continuous Diffusion")
     print(f"Device:         {device}")
     print(f"Dtype:          {train_cfg.dtype}  (scaler={'ON' if train_cfg.use_scaler else 'OFF'})")
-    print(f"Batch virtuale: {train_cfg.batch_size} × {train_cfg.grad_accum} = {train_cfg.effective_batch_size}")
+    print(f"Batch virtuale: {train_cfg.batch_size} x {train_cfg.grad_accum} = {train_cfg.effective_batch_size}")
     print(f"Self-cond prob: {train_cfg.self_cond_prob}")
     print(f"Beta:           [{model_cfg.diffusion_beta_min}, {model_cfg.diffusion_beta_max}]")
 
@@ -346,7 +348,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
             else train_cfg.preload
         )
         if ckpt_path and os.path.isfile(ckpt_path):
-            initial_iter, best_val_loss, _tl, val_losses = load_checkpoint( 
+            initial_iter, best_val_loss, _tl, val_losses = load_checkpoint(
                 ckpt_path, model, optimizer, scaler, device # type: ignore
             )
             train_losses.extend(_tl)
@@ -366,7 +368,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     train_iter = iter(train_loader)
     accum_loss = 0.0
 
-    pbar = tqdm(range(initial_iter, train_cfg.max_iters), desc="Harold v0.4")
+    pbar = tqdm(range(initial_iter, train_cfg.max_iters + 1), desc="Harold v0.4")
 
     for iter_num in pbar:
         lr = get_lr(iter_num, train_cfg)
@@ -445,12 +447,13 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
                     train_cfg.checkpoint_dir,
                     f"{train_cfg.checkpoint_prefix}_best.pt",
                 )
-                save_checkpoint( 
+                save_checkpoint(
                     best_path, model, optimizer, scaler, # type: ignore
                     iter_num, val_loss, model_cfg, train_cfg,
                     train_losses, val_losses,
+                    push_hf=True,
                 )
-                print(f"  ★ Best val loss: {val_loss:.4f} → {best_path}")
+                print(f"Best val loss: {val_loss:.4f} → {best_path}")
                 train_cfg.write_latest(iter_num, best_path)
                 logger.log({
                     "type":     "best_checkpoint",
@@ -482,6 +485,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         final_path, model, optimizer, scaler, # type: ignore
         train_cfg.max_iters, best_val_loss, model_cfg, train_cfg,
         train_losses, val_losses,
+        push_hf=True,
     )
     train_cfg.write_latest(train_cfg.max_iters, final_path)
     logger.log({
@@ -507,9 +511,50 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
+def push_to_huggingface(
+    path: str,
+    repo_id:    str = "JHN-MACHINE/harold-v0.4",
+) -> None:
+    """
+    Pusha i checkpoint finali su HuggingFace Hub.
+    Chiamato automaticamente alla fine del training.
+    Se token=None, usa la variabile d'ambiente HF_TOKEN.
+    """
+    import os
+    try:
+        from huggingface_hub import HfApi
+        hf_token = os.environ.get("HF_TOKEN")
+        if not hf_token:
+            print("HF_TOKEN non trovato — skip push HuggingFace.")
+            return
+        api = HfApi()
+        # Crea il repo se non esiste
+        api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, token=hf_token)
+        print(f"\nPush su HuggingFace → {repo_id}")
+        # Upload final checkpoint
+        if os.path.isfile(path):
+            print(f"Uploading {path}...")
+            api.upload_file(
+                path_or_fileobj=final_path,
+                path_in_repo="harold-v0.4-700M.pt",
+                repo_id=repo_id,
+                repo_type="model",
+                token=hf_token,
+            )
+            print(f"{os.path.basename(path)} pushato")
+        print(f"Push completato → https://huggingface.co/{repo_id}")
+    except Exception as e:
+        print(f"Errore push HuggingFace: {e}")
+        print("Checkpoint salvato localmente — fai il push manualmente.")
+
+
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
     model_cfg = get_model_config()
     train_cfg = get_train_config()
     results   = run_training(model_cfg, train_cfg)
     print(f"Best val loss: {results['best_val_loss']:.4f}")
+
+    # ── Push automatico su HuggingFace ────────────────────────────────────────
+    final_path = results["checkpoint_path"]
+    push_to_huggingface(final_path)
