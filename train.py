@@ -8,7 +8,6 @@ Changelog rispetto alla prima versione ottimizzata:
   - Rimosso _patch_loader_for_perf (ora gestito direttamente in dataset.py)
   - use_compile letto da train_cfg invece di hardcoded
   - estimate_loss: fast path attivo grazie a OPT-M4 in model.py
-  - Checkpoint atomico (os.replace) già incluso
   - Deque con maxlen da train_cfg.loss_history_size
 """
 
