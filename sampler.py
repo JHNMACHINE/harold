@@ -5,7 +5,7 @@ Sampler per VP-SDE continuous diffusion.
 
 Novità v0.4:
   [S8] DPM-Solver++ al posto di Euler-Maruyama
-       - 2° ordine: stesso risultato in 20 step invece di 100 (5× più veloce)
+       - 2° ordine: stesso risultato in 20 step invece di 100 (5x più veloce)
        - _dpm_step() sostituisce _reverse_sde_step() nel loop principale
        - _reverse_sde_step() rimane disponibile per CFG (generate_conditioned)
          dove serve accesso diretto a eps separati cond/uncond
@@ -24,13 +24,23 @@ Fix rispetto a v0.3:
   [FIX S5] generate() e generate_batch() logica decodifica unificata
   [FIX S6] temperature=1.0 con top_p=1.0 ora fa argmax
   [FIX S7] Prompt injection con embedding reali, non rumore
+
+Fix v0.4 sampler:
+  [FIX S8]  Rimosso @torch.no_grad() duplicato su generate_batch
+  [FIX S9]  generate_batch: t_next dell'ultimo step corretto a 0.0
+  [FIX S10] _encode_context: pad_mask usa tokenizer.pad_token_id invece di 0
+  [FIX S11] generate: eliminato forward pass ridondante alla fine del loop DPM
+             — ce_logits dell'ultimo step viene usato direttamente
+  [FIX S12] generate_conditioned: dt_abs esplicito per chiarezza
+  [FIX S13] Rimosso model.update_router_biases() — non necessario in inferenza,
+             il router bias è già nel checkpoint
 """
 
 import math
 import sys
 import torch
 import torch.nn.functional as F
-from typing import Literal, Optional, List, Tuple
+from typing import Any, Literal, Optional, List, Tuple
 from transformers import PreTrainedTokenizer, AutoTokenizer
 
 from model import Harold, build_model
@@ -58,7 +68,7 @@ class HaroldSampler:
            b. Aggiorna x con lo schema DPM-Solver++ 2° ordine
            c. Ripristina posizioni del prompt (invarianti)
            d. Aggiorna self_cond e locked_mask (anchoring)
-      3. Decodifica finale con ce_logits (argmax o top-p sampling)
+      3. Decodifica finale con ce_logits dell'ultimo step DPM
 
     generate_conditioned usa Euler-Maruyama perché richiede due forward
     pass separati (cond + uncond) che non si integrano nativamente con
@@ -116,9 +126,6 @@ class HaroldSampler:
         - Il token di padding aggiunto da Harold (idx = vocab_size = 50257)
         - <|endoftext|> (idx 50256) usato come mask token durante la diffusione
           ma che non deve apparire nell'output finale
-
-        Questo è molto più semplice della versione BERT che richiedeva
-        una allowlist ASCII per filtrare [unused], [CLS], [SEP], ecc.
         """
         if hasattr(self, "_unused_mask_cache"):
             return self._unused_mask_cache
@@ -142,10 +149,7 @@ class HaroldSampler:
         return mask
 
     def _mask_unused_tokens(self, ce_logits: torch.Tensor) -> torch.Tensor:
-        """
-        Azzera i logit dei token [unused] e subword rumorosi.
-        Usa il tokenizer per identificare tutti i token indesiderati.
-        """
+        """Azzera i logit dei token [unused] e subword rumorosi."""
         mask = self._build_unused_mask()                    # (V,) bool
         ce_logits = ce_logits.clone()
         ce_logits[..., mask] = float("-inf")
@@ -159,15 +163,7 @@ class HaroldSampler:
     ) -> torch.Tensor:
         """
         Penalizza i token già presenti nella sequenza generata.
-        penalty > 1.0: riduce la probabilità dei token già visti
-        penalty = 1.0: nessun effetto
-
-        Se generated_ids è fornito, penalizza quei token specifici.
-        Altrimenti usa argmax come proxy dei token correnti.
-
-        Implementazione standard (HuggingFace style):
-          logit > 0 → logit / penalty
-          logit < 0 → logit * penalty
+        penalty > 1.0: riduce la probabilità dei token già visti.
         """
         if penalty == 1.0:
             return ce_logits
@@ -217,57 +213,28 @@ class HaroldSampler:
         prev_conf:   Optional[torch.Tensor] = None,  # (B, L) confidenza passo prec.
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Confidence-guided anchoring migliorato (v0.4).
+        Confidence-guided anchoring (v0.4).
 
-        Miglioramenti rispetto a v0.3:
-          1. Soglia dinamica esponenziale:
-               dyn = 1 - (1 - threshold) * exp(-k * (1 - t))
-             Cresce più lentamente a t alto → meno falsi ancoraggi precoci.
-             A t=1 (rumore puro): dyn ≈ threshold (quasi niente ancorato)
-             A t=0 (segnale pulito): dyn → 0.99 (quasi tutto ancorato)
-
-          2. Smoothing della confidenza:
-               conf_smooth = 0.7 * conf_cur + 0.3 * prev_conf
-             Riduce le oscillazioni nella stima della confidenza durante
-             il sampling stocastico — evita di ancorare token per un picco
-             accidentale di confidenza in un singolo step.
-
-          3. Locked mask — once locked, always locked:
-             I token già ancorati nei passi precedenti vengono mantenuti
-             ancorati indipendentemente dalla confidenza corrente. Questo
-             previene il "flickering" (token che entrano ed escono dall'anchor).
-
-        Args:
-            x_next:      stato SDE dopo il passo corrente
-            ce_logits:   logit ausiliari del modello
-            prompt_mask: maschera del prompt (mai ancorato)
-            threshold:   soglia base di confidenza
-            t:           timestep corrente
-            locked_mask: posizioni già ancorate nei passi precedenti
-            prev_conf:   confidenza dal passo precedente (per smoothing)
-
-        Returns:
-            (x_next aggiornato, locked_mask aggiornata, conf_smooth corrente)
+        1. Soglia dinamica esponenziale:
+             dyn = 1 - (1 - threshold) * exp(-k * (1 - t))
+        2. Smoothing della confidenza:
+             conf_smooth = 0.7 * conf_cur + 0.3 * prev_conf
+        3. Locked mask — once locked, always locked.
         """
         ce_logits_clean = self._mask_unused_tokens(ce_logits)
         probs      = F.softmax(ce_logits_clean, dim=-1)   # (B, L, V)
         conf, toks = probs.max(dim=-1)                     # (B, L)
 
-        # Smoothing: media pesata con la confidenza del passo precedente
         if prev_conf is not None:
             conf_smooth = 0.7 * conf + 0.3 * prev_conf
         else:
             conf_smooth = conf
 
-        # Soglia esponenziale: lenta a t alto, rapida a t basso
-        # k=4 calibrato per 20 step DPM-Solver++ (threshold≈0.7 tipico)
         k = 4.0
         dynamic_threshold = min(1.0 - (1.0 - threshold) * math.exp(-k * (1.0 - t)), 0.99)
 
-        # Token da ancorare: confidenza sopra soglia E non nel prompt
         to_anchor_new = (conf_smooth > dynamic_threshold) & ~prompt_mask
 
-        # Aggiorna la locked mask — mai rilasciare un token già ancorato
         if locked_mask is None:
             locked_mask = to_anchor_new
         else:
@@ -279,48 +246,41 @@ class HaroldSampler:
 
         return x_next, locked_mask, conf_smooth
 
-    # ── Reverse SDE step (Euler-Maruyama) ────────────────────────────────────
+    # ── Reverse SDE step (Euler-Maruyama) — usato solo da generate_conditioned
 
     def _reverse_sde_step(
         self,
-        x_t:       torch.Tensor,           # (B, L, D)
-        t:         float,                   # timestep corrente in (0,1]
-        dt:        float,                   # passo negativo (-1/steps)
-        self_cond: Optional[torch.Tensor], # (B, D) detached o None
+        x_t:       torch.Tensor,
+        t:         float,
+        dt_abs:    float,                      # [FIX S12] dt_abs esplicito
+        self_cond: Optional[torch.Tensor],
+        eps_override: Optional[torch.Tensor] = None,  # se fornito, usa questo eps invece del forward
+        ctx_emb:   Optional[torch.Tensor] = None,     # per CFG conditioning
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Un passo di reverse SDE (Euler-Maruyama).
 
-        Reverse SDE (Anderson 1982):
-          dx = [-0.5*β(t)*x - β(t)*score(x,t)] dt + √β(t) dW
-
-        score(x,t) = ∇ log p_t(x) ≈ -ε_θ(x,t) / σ(t)
-
-        Ritorna (x_next, ce_logits, eps_pred).
+        Se eps_override è fornito (es. eps guidato da CFG), viene usato
+        al posto del forward interno — il forward viene comunque eseguito
+        per ottenere ce_logits, ma eps_override sovrascrive eps_pred per x_next.
+        ctx_emb è passato al forward condizionato.
         """
         B        = x_t.shape[0]
         t_tensor = self._t_tensor(t, B)
 
-        # Forward del modello
-        # [FIX S4] t_normalized viene calcolato internamente in Harold.forward
-        #          dal valore di t — il top-k dinamico del MoE è automatico
-        eps_pred, ce_logits, _ = self.model(x_t, t_tensor, self_cond=self_cond)
+        eps_pred, ce_logits, _ = self.model(x_t, t_tensor, self_cond=self_cond, ctx_emb=ctx_emb)
 
-        # Parametri SDE al tempo t
-        beta_t           = self.model.schedule.get_beta(t_tensor)           # (B,)
-        _, sigma_t       = self.model.schedule.get_alpha_sigma(t_tensor)    # (B,)
+        # Usa eps_override se fornito (CFG), altrimenti eps del modello
+        eps = eps_override if eps_override is not None else eps_pred
 
-        # Score: ∇ log p_t(x) = -ε / σ(t)
-        score     = -eps_pred / sigma_t.view(-1, 1, 1).clamp(min=1e-8)
-
-        # Reverse SDE drift e diffusion
-        b         = beta_t.view(-1, 1, 1)
-        drift     = -0.5 * b * x_t - b * score
-        diffusion = b.sqrt()
-
-        # Nessun rumore all'ultimo step (t ≈ 0) per decodifica stabile
-        noise  = torch.randn_like(x_t) if t > 1e-5 else torch.zeros_like(x_t)
-        x_next = x_t + drift * dt + diffusion * noise * math.sqrt(abs(dt))
+        beta_t           = self.model.schedule.get_beta(t_tensor)
+        _, sigma_t       = self.model.schedule.get_alpha_sigma(t_tensor)
+        score            = -eps / sigma_t.view(-1, 1, 1).clamp(min=1e-8)
+        b                = beta_t.view(-1, 1, 1)
+        drift            = -0.5 * b * x_t - b * score
+        diffusion        = b.sqrt()
+        noise            = torch.randn_like(x_t) if t > 1e-5 else torch.zeros_like(x_t)
+        x_next           = x_t - drift * dt_abs + diffusion * noise * math.sqrt(dt_abs)
 
         return x_next, ce_logits, eps_pred
 
@@ -328,72 +288,39 @@ class HaroldSampler:
 
     def _dpm_step(
         self,
-        x_t:        torch.Tensor,            # (B, L, D) stato corrente
-        t:          float,                   # timestep corrente in (0,1]
-        t_next:     float,                   # timestep successivo in [0,1)
-        self_cond:  Optional[torch.Tensor],  # (B, D) hint o None
-        eps_prev:   Optional[torch.Tensor] = None,  # (B, L, D) pred. passo prec.
+        x_t:        torch.Tensor,
+        t:          float,
+        t_next:     float,
+        self_cond:  Optional[torch.Tensor],
+        eps_prev:   Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         DPM-Solver++ 2° ordine (Lu et al. 2022, Algo. 2).
 
-        Vantaggi su Euler-Maruyama:
-          - 2° ordine: errore O(h²) invece di O(h) → stessa qualità in
-            ~1/5 degli step (20 invece di 100)
-          - Deterministico: nessun termine di rumore → più stabile e
-            riproducibile (no dW)
-
-        Schema:
-          Primo step (o eps_prev=None):
-            x_{t-1} = (σ_{t-1}/σ_t) * x_t
-                    - α_{t-1} * (e^{-h} - 1) * eps_θ(x_t, t)
-            → equivalente a Euler su log-SNR (1° ordine)
-
-          Step successivi (eps_prev disponibile):
-            D = (1 + 1/(2r)) * eps_cur - (1/(2r)) * eps_prev
-            x_{t-1} = (σ_{t-1}/σ_t) * x_t - α_{t-1} * (e^{-h} - 1) * D
-            dove r = h_{prev}/h  (rapporto degli step in log-SNR)
-            → 2° ordine con correzione multistep
-
-        Note:
-          - Lavora in log-SNR (lambda = log α/σ) come da paper
-          - eps_prev viene aggiornato a eps_cur per il passo successivo
-
-        Args:
-            x_t:       stato corrente
-            t:         timestep corrente
-            t_next:    timestep successivo (< t)
-            self_cond: self-conditioning hint
-            eps_prev:  eps_pred del passo precedente (None al primo step)
-
-        Returns:
-            (x_next, ce_logits, eps_cur)
+        Primo step (eps_prev=None): 1° ordine (Euler su log-SNR)
+        Step successivi: 2° ordine con correzione multistep
         """
-        B        = x_t.shape[0]
-        t_tensor = self._t_tensor(t,      B)
-        tn_tensor= self._t_tensor(t_next, B)
+        B         = x_t.shape[0]
+        t_tensor  = self._t_tensor(t,      B)
+        tn_tensor = self._t_tensor(t_next, B)
 
         eps_cur, ce_logits, _ = self.model(x_t, t_tensor, self_cond=self_cond)
 
         alpha_t,  sigma_t  = self.model.schedule.get_alpha_sigma(t_tensor)
         alpha_tn, sigma_tn = self.model.schedule.get_alpha_sigma(tn_tensor)
 
-        # log-SNR: λ = log(α/σ)
         lam_t  = torch.log(alpha_t  / sigma_t.clamp(min=1e-8)).mean().item()
         lam_tn = torch.log(alpha_tn / sigma_tn.clamp(min=1e-8)).mean().item()
         h      = lam_tn - lam_t   # negativo: λ decresce con t
 
-        # Scalari per update — shape (B,) → (B,1,1)
         s_ratio  = (sigma_tn / sigma_t.clamp(min=1e-8)).view(-1, 1, 1)
         a_tn     = alpha_tn.view(-1, 1, 1)
-        exp_mh   = math.exp(-h)   # e^{-h}
+        exp_mh   = math.exp(-h)
 
         if eps_prev is None:
-            # Primo step — 1° ordine
             D = eps_cur
         else:
-            # Step successivi — 2° ordine (r = h_prev/h ≈ 1 per step uniformi)
-            r = 0.5   # semplificazione: assume step uniformi in log-SNR
+            r = 0.5   # step uniformi in log-SNR
             D = (1.0 + 1.0 / (2.0 * r)) * eps_cur - (1.0 / (2.0 * r)) * eps_prev
 
         x_next = s_ratio * x_t - a_tn * (exp_mh - 1.0) * D
@@ -420,20 +347,17 @@ class HaroldSampler:
         Genera testo con DPM-Solver++ (2° ordine).
 
         Args:
-            prompt:               testo iniziale (posizioni fissate, non modificate)
-            gen_len:              lunghezza totale della sequenza (prompt + generazione)
-            steps:                passi DPM-Solver++ — default 20 (era 100 con E-M)
+            prompt:               testo iniziale (posizioni fissate)
+            gen_len:              lunghezza totale (prompt + generazione)
+            steps:                passi DPM-Solver++ (default 20)
             mode:                 "argmax" | "sample" | "confidence"
-            temperature:          temperatura per mode="sample"
+            temperature:          per mode="sample"
             top_p:                nucleus threshold per mode="sample"
-            confidence_threshold: soglia base per mode="confidence" [0,1]
-                                  valori tipici: 0.6-0.8
+            confidence_threshold: soglia base per mode="confidence"
             anchor_every:         ogni quanti step applicare l'anchoring
-                                  (default 1 — DPM ha meno step quindi anchor sempre)
             use_self_cond:        passa hint al passo successivo
             verbose:              stampa decodifica intermedia ogni 5 step
         """
-        # ── Tokenizza il prompt ─────────────────────────────────────────────
         prompt_ids = (
             self.tokenizer.encode(
                 prompt, add_special_tokens=True,
@@ -442,13 +366,11 @@ class HaroldSampler:
         )
         prompt_len = len(prompt_ids)
 
-        # ── Inizializza da rumore puro ──────────────────────────────────────
         x_t = torch.zeros(1, gen_len, self.d_model, device=self.device)
         if prompt_len < gen_len:
             x_t[0, prompt_len:] = torch.randn(
                 gen_len - prompt_len, self.d_model, device=self.device
             )
-
         if prompt_len > 0:
             prompt_tensor       = torch.tensor(prompt_ids, dtype=torch.long, device=self.device)
             x_t[0, :prompt_len] = self.model.token_emb(prompt_tensor)
@@ -456,24 +378,22 @@ class HaroldSampler:
         prompt_mask = torch.zeros(1, gen_len, dtype=torch.bool, device=self.device)
         prompt_mask[0, :prompt_len] = True
 
-        # ── Loop DPM-Solver++ ────────────────────────────────────────────────
         self_cond:   Optional[torch.Tensor] = None
         eps_prev:    Optional[torch.Tensor] = None
         locked_mask: Optional[torch.Tensor] = None
         prev_conf:   Optional[torch.Tensor] = None
+        ce_logits:   Optional[torch.Tensor] = None   # [FIX S11] tenuto dal loop
 
-        for step in range(steps):
-            t      = 1.0 - step / steps
-            t_next = 1.0 - (step + 1) / steps
+        ts = [1.0 - i / steps for i in range(steps)]
+
+        for step, (t, t_next) in enumerate(zip(ts, ts[1:] + [0.0])):  # [FIX S9] t_next finale = 0.0
 
             x_next, ce_logits, eps_cur = self._dpm_step(
-                x_t, t, t_next, self_cond, eps_prev
+                x_t, t, max(t_next, 1e-5), self_cond, eps_prev
             )
 
-            # Ripristina le posizioni del prompt
             x_next = torch.where(prompt_mask.unsqueeze(-1), x_t, x_next)
 
-            # Confidence anchoring con locked mask e smoothing
             if mode == "confidence" and step % anchor_every == 0:
                 x_next, locked_mask, prev_conf = self._anchor_confident_tokens(
                     x_next, ce_logits, prompt_mask,
@@ -491,23 +411,22 @@ class HaroldSampler:
             x_t      = x_next
 
             if verbose and step % 5 == 0:
-                tokens = clean_logits.argmax(dim=-1)[0].tolist() if use_self_cond else \
-                         self._mask_unused_tokens(ce_logits).argmax(dim=-1)[0].tolist()
+                tokens = self._mask_unused_tokens(ce_logits).argmax(dim=-1)[0].tolist()
                 text   = self.tokenizer.decode(tokens, skip_special_tokens=True)
                 n_anchored = 0
                 if mode == "confidence" and locked_mask is not None:
                     n_anchored = int((locked_mask[0] & ~prompt_mask[0]).sum().item())
                 print(f"  step {step+1:3d}/{steps} | t={t:.3f} | anchored={n_anchored} | {text[:70]}")
 
-        # ── Decodifica finale ───────────────────────────────────────────────
-        t_final        = self._t_tensor(1.0 / steps, batch=1)
-        _, ce_final, _ = self.model(x_t, t_final, self_cond=self_cond)
-        token_ids      = self._decode(ce_final, mode, temperature, top_p)[0]
+        # [FIX S11] Usa ce_logits dell'ultimo step DPM — nessun forward ridondante
+        assert ce_logits is not None
+        token_ids = self._decode(ce_logits, mode, temperature, top_p)[0]
 
         return self.tokenizer.decode(token_ids.tolist(), skip_special_tokens=True)  # type: ignore
 
-    @torch.no_grad()
-    @torch.no_grad()
+    # ── Generate batch ───────────────────────────────────────────────────────
+
+    @torch.no_grad()  # [FIX S8] rimosso il decoratore duplicato
     def generate_batch(
         self,
         prompts:              List[str],
@@ -522,15 +441,14 @@ class HaroldSampler:
     ) -> List[str]:
         """
         Versione batch di generate — DPM-Solver++ vettorializzato su B sequenze.
-        Stessa logica di generate() ma processa tutti i prompt in parallelo.
         """
         B   = len(prompts)
         enc = self.tokenizer(
             prompts, padding="max_length", truncation=True,
             max_length=gen_len, return_tensors="pt",
         )
-        input_ids      = enc["input_ids"].to(self.device)             # type: ignore
-        attention_mask = enc["attention_mask"].to(self.device).bool() # type: ignore
+        input_ids      = enc["input_ids"].to(self.device)              # type: ignore
+        attention_mask = enc["attention_mask"].to(self.device).bool()  # type: ignore
 
         x_t = torch.zeros(B, gen_len, self.d_model, device=self.device)
         noise_mask = ~attention_mask
@@ -544,13 +462,15 @@ class HaroldSampler:
         eps_prev:    Optional[torch.Tensor] = None
         locked_mask: Optional[torch.Tensor] = None
         prev_conf:   Optional[torch.Tensor] = None
+        ce_logits:   Optional[torch.Tensor] = None
 
         ts = [1.0 - i / steps for i in range(steps)]
 
-        for step, (t, t_next) in enumerate(zip(ts, ts[1:] + [1.0 / steps])):
+        # [FIX S9] t_next dell'ultimo step = 0.0, non 1/steps
+        for step, (t, t_next) in enumerate(zip(ts, ts[1:] + [0.0])):
 
             x_next, ce_logits, eps_cur = self._dpm_step(
-                x_t, t, t_next, self_cond, eps_prev
+                x_t, t, max(t_next, 1e-5), self_cond, eps_prev
             )
             eps_prev = eps_cur
 
@@ -570,9 +490,8 @@ class HaroldSampler:
 
             x_t = x_next
 
-        t_final         = self._t_tensor(1.0 / steps, batch=B)
-        _, ce_final, _  = self.model(x_t, t_final, self_cond=self_cond)
-        token_ids_batch = self._decode(ce_final, mode, temperature, top_p)
+        assert ce_logits is not None
+        token_ids_batch = self._decode(ce_logits, mode, temperature, top_p)
 
         return [
             self.tokenizer.decode(token_ids_batch[b].tolist(), skip_special_tokens=True)
@@ -583,43 +502,53 @@ class HaroldSampler:
 
     def _to_tensor(self, tokenized, device=None) -> torch.Tensor:
         """Converte l'output del tokenizer in un tensor sul dispositivo corretto."""
-        # Estrai input_ids
         if hasattr(tokenized, "input_ids"):
             ids = tokenized.input_ids
         elif isinstance(tokenized, dict):
             ids = tokenized.get("input_ids")
         else:
             ids = tokenized
-        
-        # Converti in tensor se necessario
         if not isinstance(ids, torch.Tensor):
             ids = torch.tensor(ids)
-        
-        # Sposta sul dispositivo
         if device is not None and hasattr(ids, "to"):
             ids = ids.to(device)
-        
         return ids
 
     def _encode_context(self, context: str) -> torch.Tensor:
         """
         Encoda un testo di contesto come mean pooling degli embedding.
-        Identico a encode_context() in train_sft.py.
-
-        Returns:
-            ctx_emb: (1, D)
+        Returns: ctx_emb (1, D)
         """
         tokenized = self.tokenizer(
             context, return_tensors="pt",
             truncation=True, max_length=128,
         )
-        
         ids = self._to_tensor(tokenized, self.device)  # (1, L)
+
+        # [FIX S16] Gestione completa di tutti i possibili tipi di pad_token_id
+        pad_token_val = self.tokenizer.pad_token_id
         
-        pad_mask = (ids != 0).float()                         # (1, L)
-        emb      = self.model.token_emb(ids)                  # (1, L, D)
-        n        = pad_mask.sum(dim=1, keepdim=True).clamp(min=1)
+        # Funzione helper per estrarre un int
+        def _extract_int(val: Any) -> int:
+            if val is None:
+                return 0
+            if isinstance(val, (int, str)):
+                try:
+                    return int(val)
+                except (ValueError, TypeError):
+                    return 0
+            if isinstance(val, (list, tuple)) and len(val) > 0:
+                return _extract_int(val[0])
+            return 0
+        
+        pad_id = _extract_int(pad_token_val)
+        
+        ids = ids.long()
+        pad_mask = (ids != pad_id).float()             # (1, L)
+        emb = self.model.token_emb(ids)                # (1, L, D)
+        n = pad_mask.sum(dim=1, keepdim=True).clamp(min=1)
         return (emb * pad_mask.unsqueeze(-1)).sum(dim=1) / n  # (1, D)
+
     @torch.no_grad()
     def generate_conditioned(
         self,
@@ -635,63 +564,34 @@ class HaroldSampler:
         verbose:            bool  = False,
     ) -> str:
         """
-        Genera testo condizionato sul contesto usando CFG.
+        Genera testo condizionato sul contesto usando CFG + Euler-Maruyama.
 
-        A differenza di generate(), qui:
-          - Il contesto NON viene iniettato come token nella sequenza
-          - Il contesto viene encodato come ctx_emb e usato per guidare la SDE
-          - Ogni step fa DUE forward pass: uno condizionato, uno no
-          - La guida è: ε_guided = ε_uncond + cfg_scale * (ε_cond - ε_uncond)
-
-        Usare questo metodo per testare il SFT con CFG.
-        Usare generate() per generazione non condizionata (pretraining).
-
-        Args:
-            context:     prompt conversazionale (es. "What is the capital of France?")
-            gen_len:     lunghezza della risposta
-            steps:       passi di integrazione (50 è sufficiente per test)
-            cfg_scale:   forza del conditioning. 1.0 = nessuna guida (come uncond).
-                         Valori tipici: 2.0-5.0. Troppo alto → testo ripetitivo.
-            mode:        modalità decodifica finale
-            temperature: per mode="sample"
-            top_p:       per mode="sample"
-            use_self_cond: usa self-conditioning
-            verbose:     stampa progresso ogni 10 step
+        Usa Euler-Maruyama (non DPM-Solver++) perché richiede due forward
+        pass separati (cond + uncond) per il CFG.
         """
-        # Encoda il contesto — usato per entrambi i forward pass
         ctx_emb   = self._encode_context(context)  # (1, D)
-
-        # Parti da rumore puro — nessun token della sequenza è noto
         x_t       = torch.randn(1, gen_len, self.d_model, device=self.device)
         self_cond: Optional[torch.Tensor] = None
-        dt        = -1.0 / steps
+        dt_abs    = 1.0 / steps   # [FIX S12] dt_abs esplicito, sempre positivo
+        ce_logits: Optional[torch.Tensor] = None
 
         for step in range(steps):
             t        = 1.0 - step / steps
             t_tensor = self._t_tensor(t, batch=1)
 
-            # Forward condizionato (con ctx_emb)
-            eps_cond, ce_logits, _ = self.model(
-                x_t, t_tensor, self_cond=self_cond, ctx_emb=ctx_emb
-            )
-            # Forward incondizionato (ctx_emb=None)
-            eps_uncond, _, _ = self.model(
-                x_t, t_tensor, self_cond=self_cond, ctx_emb=None
-            )
+            # Due forward per CFG: condizionato e incondizionato
+            eps_cond,   _, _ = self.model(x_t, t_tensor, self_cond=self_cond, ctx_emb=ctx_emb)
+            eps_uncond, _, _ = self.model(x_t, t_tensor, self_cond=self_cond, ctx_emb=None)
+            eps_guided = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
 
-            # CFG: interpola tra condizionato e incondizionato
-            eps = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
-
-            # Parametri SDE
-            beta_t        = self.model.schedule.get_beta(t_tensor)
-            _, sigma_t    = self.model.schedule.get_alpha_sigma(t_tensor)
-            score         = -eps / sigma_t.view(-1, 1, 1).clamp(min=1e-8)
-            b             = beta_t.view(-1, 1, 1)
-            noise         = torch.randn_like(x_t) if t > 1e-5 else torch.zeros_like(x_t)
-            x_t           = x_t + (-0.5*b*x_t - b*score)*dt + b.sqrt()*noise*math.sqrt(abs(dt))
+            # _reverse_sde_step con eps guidato e ctx_emb per ce_logits
+            x_t, ce_logits, _ = self._reverse_sde_step(
+                x_t, t, dt_abs, self_cond,
+                eps_override=eps_guided,
+                ctx_emb=ctx_emb,
+            )
 
             if use_self_cond:
-                # Self-cond: embedding dei token puliti, non eps_pred grezzo
                 clean_logits_sc = self._mask_unused_tokens(ce_logits)
                 clean_logits_sc = self._apply_repetition_penalty(clean_logits_sc, 1.5)
                 clean_ids_sc    = clean_logits_sc.argmax(dim=-1)
@@ -703,14 +603,13 @@ class HaroldSampler:
                 print(f"  step {step+1:3d}/{steps} | t={t:.3f} | cfg={cfg_scale} | {text[:70]}")
 
         # Decodifica finale — forward condizionato a t≈0
-        t_final           = self._t_tensor(1.0 / steps, batch=1)
-        _, ce_final, _    = self.model(x_t, t_final, self_cond=self_cond, ctx_emb=ctx_emb)
-        # Usa i token intermedi come riferimento per la repetition penalty
-        intermediate_ids  = self._mask_unused_tokens(ce_final).argmax(dim=-1)
-        token_ids         = self._decode(
+        t_final        = self._t_tensor(1.0 / steps, batch=1)
+        _, ce_final, _ = self.model(x_t, t_final, self_cond=self_cond, ctx_emb=ctx_emb)
+        intermediate   = self._mask_unused_tokens(ce_final).argmax(dim=-1)
+        token_ids      = self._decode(
             ce_final, mode, temperature, top_p,
             repetition_penalty=repetition_penalty,
-            generated_ids=intermediate_ids,
+            generated_ids=intermediate,
         )[0]
 
         return self.tokenizer.decode(token_ids.tolist(), skip_special_tokens=True)  # type: ignore
@@ -736,10 +635,9 @@ if __name__ == "__main__":
     print(f"Checkpoint caricato: {ckpt_path}")
 
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    # GPT-2 non ha pad token di default — lo aggiungiamo
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    sampler   = HaroldSampler(model, tokenizer, device=device)
+    sampler = HaroldSampler(model, tokenizer, device=device)
 
     prompt = "Once upon a time"
     print(f"\nPrompt: {prompt!r}\n")
@@ -769,8 +667,6 @@ if __name__ == "__main__":
         print(f"[sample t={temp}] {out}")
 
     # CFG conditioned — per testare il SFT
-    # Confronta cfg_scale=1.0 (no guidance) vs 3.0 vs 5.0
-    # Se il SFT funziona, le risposte devono essere tematicamente coerenti col prompt
     print("\n--- CFG Conditioned (SFT test) ---")
     cfg_prompts = [
         "What is the capital of France?",
@@ -787,7 +683,7 @@ if __name__ == "__main__":
             )
             print(f"  [cfg={scale:.1f}] {out}")
 
-    # Batch non condizionato
+    # Batch
     print("\n--- Batch ---")
     outs = sampler.generate_batch(
         prompts=["Once upon a time", "The quick brown fox"],
