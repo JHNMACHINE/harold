@@ -85,7 +85,7 @@ class TrainConfig:
 
     # torch.compile
     use_compile:  bool = True
-    compile_mode: str  = "reduce-overhead"  # OR "max-autotune"
+    compile_mode: str  = "max-autotune"  #  "max-autotune" OR "reduce-overhead"
 
     # Storico loss
     loss_history_size: int = 100_000
