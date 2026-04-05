@@ -206,6 +206,7 @@ def save_checkpoint(
     push_hf:      bool = False,
     hf_repo_id:   str  = "JHN-MACHINE/harold-v0.5",
     full:         bool = True,
+    wait_hf:      bool = False,   # True per final checkpoint — aspetta upload prima di uscire
 ) -> None:
     ckpt = {
         "iter_num":     iter_num,
@@ -222,7 +223,7 @@ def save_checkpoint(
     tmp_path = path + ".tmp"
     torch.save(ckpt, tmp_path)
     os.replace(tmp_path, path)
-
+ 
     if push_hf:
         import threading
         def _push():
@@ -230,7 +231,7 @@ def save_checkpoint(
                 from huggingface_hub import HfApi
                 hf_token = os.environ.get("HF_TOKEN")
                 if not hf_token:
-                    print("HF_TOKEN non trovato — skip push HuggingFace.")
+                    print("⚠ HF_TOKEN non trovato — skip push HuggingFace.")
                     return
                 api = HfApi()
                 api.create_repo(repo_id=hf_repo_id, repo_type="model", exist_ok=True, token=hf_token)
@@ -239,10 +240,14 @@ def save_checkpoint(
                     path_in_repo="harold-v0.5-1B.pt",
                     repo_id=hf_repo_id, repo_type="model", token=hf_token,
                 )
-                print(f"HuggingFace -> {hf_repo_id}/harold-v0.5-1B.pt")
-            except Exception as e:
-                print(f"Errore push HuggingFace: {e}")
-        threading.Thread(target=_push, daemon=True).start()
+                print(f"  ✓ HuggingFace → {hf_repo_id}/harold-v0.5-1B.pt")
+            except BaseException as e:
+                print(f"  ⚠ Errore push HuggingFace: {e}")
+        t = threading.Thread(target=_push, daemon=True)
+        t.start()
+        if wait_hf:
+            print("  Attendo upload HuggingFace...")
+            t.join()
 
 
 def load_checkpoint(
@@ -533,7 +538,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     if main:
         save_checkpoint(final_path, raw_model, optimizer, scaler,
                         train_cfg.max_iters, best_val_loss, model_cfg, train_cfg,
-                        train_losses, val_losses, push_hf=True)
+                        train_losses, val_losses, push_hf=True, wait_hf=True)
         train_cfg.write_latest(train_cfg.max_iters, final_path)
         if logger:
             logger.log({"type": "finished", "total_iters": train_cfg.max_iters,
