@@ -306,7 +306,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         print(f"Device:         {device}")
         print(f"Dtype:          {train_cfg.dtype}  (scaler={'ON' if train_cfg.use_scaler else 'OFF'})")
         eff = train_cfg.batch_size * train_cfg.grad_accum * world_size
-        print(f"Batch effettivo:{eff}  ({train_cfg.batch_size} × {train_cfg.grad_accum} × {world_size} GPU)")
+        print(f"Batch effettivo:{eff}  ({train_cfg.batch_size} x {train_cfg.grad_accum} x {world_size} GPU)")
         print(f"Beta:           [{model_cfg.diffusion_beta_min}, {model_cfg.diffusion_beta_max}]")
 
     if device.startswith("cuda"):
