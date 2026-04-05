@@ -175,7 +175,7 @@ def save_sft_checkpoint(
     path:         str,
     model:        Harold,
     optimizer:    torch.optim.Optimizer,
-    scaler:       torch.amp.GradScaler,  # type: ignore
+    scaler:       torch.GradScaler,
     stage:        int,
     iter_num:     int,
     val_loss:     float,
@@ -202,7 +202,7 @@ def load_sft_checkpoint(
     path:      str,
     model:     Harold,
     optimizer: torch.optim.Optimizer,
-    scaler:    torch.amp.GradScaler,  # type: ignore
+    scaler:    torch.GradScaler,
     device:    str,
 ) -> Tuple[int, int, float, list, list]:
     print(f"Carico SFT checkpoint: {path}")
@@ -230,7 +230,7 @@ def run_stage(
     model_cfg:    ModelConfig,
     sft_cfg:      SFTConfig,
     optimizer:    torch.optim.Optimizer,
-    scaler:       torch.amp.GradScaler,  # type: ignore
+    scaler:       torch.GradScaler,
     train_loader: DataLoader,
     val_loader:   DataLoader,
     pad_token_id: int,
@@ -452,7 +452,7 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
         weight_decay=0.1,
         fused=True,
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=sft_cfg.use_scaler)  # type: ignore
+    scaler = torch.GradScaler("cuda", enabled=sft_cfg.use_scaler)
 
     # ── AsyncLogger ────────────────────────────────────────────────────────
     os.makedirs(sft_cfg.checkpoint_dir, exist_ok=True)

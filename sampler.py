@@ -42,7 +42,7 @@ import torch
 import torch.nn.functional as F
 from typing import Any, Literal, Optional, List, Tuple
 from transformers import PreTrainedTokenizer, AutoTokenizer
-
+from typing import cast
 from model import Harold, build_model
 
 # Import opzionale di SFTConfig — necessario per caricare checkpoint SFT
@@ -422,7 +422,7 @@ class HaroldSampler:
         assert ce_logits is not None
         token_ids = self._decode(ce_logits, mode, temperature, top_p)[0]
 
-        return self.tokenizer.decode(token_ids.tolist(), skip_special_tokens=True)  # type: ignore
+        return cast(str, self.tokenizer.decode(token_ids.tolist(), skip_special_tokens=True))
 
     # ── Generate batch ───────────────────────────────────────────────────────
 
@@ -447,8 +447,8 @@ class HaroldSampler:
             prompts, padding="max_length", truncation=True,
             max_length=gen_len, return_tensors="pt",
         )
-        input_ids      = enc["input_ids"].to(self.device)              # type: ignore
-        attention_mask = enc["attention_mask"].to(self.device).bool()  # type: ignore
+        input_ids      = cast(torch.Tensor, enc["input_ids"]).to(self.device)
+        attention_mask = cast(torch.Tensor, enc["attention_mask"]).to(self.device).bool()
 
         x_t = torch.zeros(B, gen_len, self.d_model, device=self.device)
         noise_mask = ~attention_mask
@@ -494,9 +494,9 @@ class HaroldSampler:
         token_ids_batch = self._decode(ce_logits, mode, temperature, top_p)
 
         return [
-            self.tokenizer.decode(token_ids_batch[b].tolist(), skip_special_tokens=True)
+            cast(str, self.tokenizer.decode(token_ids_batch[b].tolist(), skip_special_tokens=True))
             for b in range(B)
-        ]  # type: ignore
+        ]
 
     # ── CFG conditioned generation ───────────────────────────────────────────
 
@@ -612,7 +612,7 @@ class HaroldSampler:
             generated_ids=intermediate,
         )[0]
 
-        return self.tokenizer.decode(token_ids.tolist(), skip_special_tokens=True)  # type: ignore
+        return cast(str, self.tokenizer.decode(token_ids.tolist(), skip_special_tokens=True))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
