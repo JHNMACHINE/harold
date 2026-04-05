@@ -81,7 +81,7 @@ class TrainConfig:
     checkpoint_dir:    str = "checkpoints_v4"
     checkpoint_prefix: str = "harold_v04"
     preload:           str = "latest"
-    save_every:        int = 500
+    save_every:        int = 2000
 
     # torch.compile
     use_compile:  bool = True

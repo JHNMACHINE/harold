@@ -358,10 +358,10 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     # ── AsyncLogger ───────────────────────────────────────────────────────
     log_path = os.path.join(train_cfg.checkpoint_dir, "training.log")
     logger   = AsyncLogger(log_path, flush_every=10)
-    print(f"Log asincrono → {log_path}")
+    print(f"Log asincrono -> {log_path}")
 
     # ── Loop principale ────────────────────────────────────────────────────
-    print(f"\nAvvio training — {train_cfg.max_iters} optimizer steps\n")
+    print(f"\nAvvio training -> {train_cfg.max_iters} optimizer steps\n")
 
     model.train()
     start_time = time.time()
