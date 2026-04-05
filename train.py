@@ -310,7 +310,7 @@ def _run_grad_accum(
 def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     device = train_cfg.device
 
-    print("Harold v0.4 — VP-SDE Continuous Diffusion")
+    print("Harold v0.4 - VP-SDE Continuous Diffusion")
     print(f"Device:         {device}")
     print(f"Dtype:          {train_cfg.dtype}  (scaler={'ON' if train_cfg.use_scaler else 'OFF'})")
     print(f"Batch virtuale: {train_cfg.batch_size} x {train_cfg.grad_accum} = {train_cfg.effective_batch_size}")
