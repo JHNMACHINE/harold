@@ -172,32 +172,60 @@ def estimate_loss(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_checkpoint(
-    path:         str,
-    model:        Harold,
-    optimizer:    torch.optim.Optimizer,
-    scaler:       torch.GradScaler,
-    iter_num:     int,
-    val_loss:     float,
-    model_cfg:    ModelConfig,
-    train_cfg:    TrainConfig,
-    train_losses: deque,
-    val_losses:   list,
-    push_hf:      bool = False,
+    path:          str,
+    model:         Harold,
+    optimizer:     torch.optim.Optimizer,
+    scaler:        torch.GradScaler,
+    iter_num:      int,
+    val_loss:      float,
+    model_cfg:     ModelConfig,
+    train_cfg:     TrainConfig,
+    train_losses:  deque,
+    val_losses:    list,
+    push_hf:       bool = False,
+    hf_repo_id:    str  = "JHN-MACHINE/harold-v0.4",
+    full:          bool = True,   # True = salva optimizer+scaler (best/final)
+                                  # False = solo modello (periodici) → ~3GB invece di 8GB
 ) -> None:
-    torch.save({
-        "iter_num":        iter_num,
-        "model_state":     model.state_dict(),
-        "optimizer_state": optimizer.state_dict(),
-        "scaler_state":    scaler.state_dict(),
-        "val_loss":        val_loss,
-        "model_cfg":       model_cfg,
-        "train_cfg":       train_cfg,
-        "train_losses":    list(train_losses),
-        "val_losses":      val_losses,
-    }, path)
+    ckpt = {
+        "iter_num":     iter_num,
+        "model_state":  model.state_dict(),
+        "val_loss":     val_loss,
+        "model_cfg":    model_cfg,
+        "train_cfg":    train_cfg,
+        "train_losses": list(train_losses),
+        "val_losses":   val_losses,
+    }
+    if full:
+        # Best e final: salva optimizer e scaler per riprendere esattamente
+        ckpt["optimizer_state"] = optimizer.state_dict()
+        ckpt["scaler_state"]    = scaler.state_dict()
+    torch.save(ckpt, path)
 
+    # Push su HuggingFace solo se richiesto (best e final)
     if push_hf:
-        push_to_huggingface(path)
+        import threading
+        def _push():
+            try:
+                from huggingface_hub import HfApi
+                hf_token = os.environ.get("HF_TOKEN")
+                if not hf_token:
+                    print("\u26a0 HF_TOKEN non trovato \u2014 skip push HuggingFace.")
+                    return
+                api = HfApi()
+                api.create_repo(repo_id=hf_repo_id, repo_type="model", exist_ok=True, token=hf_token)
+                api.upload_file(
+                    path_or_fileobj=path,
+                    path_in_repo="harold-v0.4-700M.pt",
+                    repo_id=hf_repo_id,
+                    repo_type="model",
+                    token=hf_token,
+                )
+                print(f"  \u2713 HuggingFace \u2192 {hf_repo_id}/{os.path.basename(path)}")
+            except Exception as e:
+                print(f"  \u26a0 Errore push HuggingFace: {e}")
+        # Push in background per non bloccare il training
+        threading.Thread(target=_push, daemon=True).start()
 
 
 def load_checkpoint(
@@ -210,8 +238,14 @@ def load_checkpoint(
     print(f"Carico checkpoint: {path}")
     state = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(state["model_state"])
-    optimizer.load_state_dict(state["optimizer_state"])
-    scaler.load_state_dict(state["scaler_state"])
+    # optimizer/scaler presenti solo nei checkpoint full (best/final)
+    if "optimizer_state" in state:
+        optimizer.load_state_dict(state["optimizer_state"])
+        print("  optimizer state caricato")
+    else:
+        print("  optimizer state assente (checkpoint periodico) — riparte da zero")
+    if "scaler_state" in state:
+        scaler.load_state_dict(state["scaler_state"])
     iter_num     = state.get("iter_num", 0) + 1
     best_val     = state.get("val_loss", float("inf"))
     train_losses = state.get("train_losses", [])
@@ -368,7 +402,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     train_iter = iter(train_loader)
     accum_loss = 0.0
 
-    pbar = tqdm(range(initial_iter, train_cfg.max_iters + 1), desc="Harold v0.4")
+    pbar = tqdm(range(initial_iter, train_cfg.max_iters), desc="Harold v0.4")
 
     for iter_num in pbar:
         lr = get_lr(iter_num, train_cfg)
@@ -453,7 +487,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
                     train_losses, val_losses,
                     push_hf=True,
                 )
-                print(f"Best val loss: {val_loss:.4f} → {best_path}")
+                print(f"  ★ Best val loss: {val_loss:.4f} → {best_path}")
                 train_cfg.write_latest(iter_num, best_path)
                 logger.log({
                     "type":     "best_checkpoint",
@@ -470,6 +504,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
                 p, model, optimizer, scaler, # type: ignore
                 iter_num, best_val_loss, model_cfg, train_cfg,
                 train_losses, val_losses,
+                full=False,   # periodico: solo modello, ~3GB invece di 8GB
             )
             train_cfg.write_latest(iter_num, p)
             print(f"  Checkpoint periodico → {p}")
@@ -535,7 +570,7 @@ def push_to_huggingface(
         if os.path.isfile(path):
             print(f"Uploading {path}...")
             api.upload_file(
-                path_or_fileobj=final_path,
+                path_or_fileobj=path,
                 path_in_repo="harold-v0.4-700M.pt",
                 repo_id=repo_id,
                 repo_type="model",
@@ -554,7 +589,3 @@ if __name__ == "__main__":
     train_cfg = get_train_config()
     results   = run_training(model_cfg, train_cfg)
     print(f"Best val loss: {results['best_val_loss']:.4f}")
-
-    # ── Push automatico su HuggingFace ────────────────────────────────────────
-    final_path = results["checkpoint_path"]
-    push_to_huggingface(final_path)
