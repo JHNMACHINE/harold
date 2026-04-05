@@ -9,49 +9,48 @@ from typing import Optional
 
 @dataclass
 class ModelConfig:
-    # ── Vocabolario ───────────────────────────────────────────────────────
-    vocab_size:     int   = 50257
-    mask_token_id:  int   = 50256
+    # Vocabolario
+    vocab_size:     int   = 32000
+    mask_token_id:  int   = 0
 
-    # ── Architettura — 733M ───────────────────────────────────────────────
-    d_model:    int = 1024
-    n_layers:   int = 32
-    n_heads:    int = 16
-    n_kv_heads: int = 4
-    d_ff:       int = 2816
+    # Architettura — 1B
+    d_model:    int = 1280
+    n_layers:   int = 36
+    n_heads:    int = 20
+    n_kv_heads: int = 5
+    d_ff:       int = 3584
 
-    # ── MoE ───────────────────────────────────────────────────────────────
+    # MoE
     moe_n_routed_experts:    int = 4
     moe_top_k:               int = 2
     ds_moe_n_shared_experts: int = 2
 
-    # ── MLA ───────────────────────────────────────────────────────────────
-    mla_latent_dim: int = 128
+    # MLA
+    mla_latent_dim: int = 160
 
-    # ── DSA ───────────────────────────────────────────────────────────────
+    # DSA
     dsa_window_size:  int = 256
     dsa_global_every: int = 64
 
-    # ── Sequenza ──────────────────────────────────────────────────────────
+    # Sequenza
     max_seq_len: int = 1024
     block_size:  int = 1024
 
-    # ── Diffusion VP-SDE ──────────────────────────────────────────────────
-    diffusion_beta_min: float = 0.1
-    diffusion_beta_max: float = 20.0
+    # Flow Matching
+    flow_sigma_min: float = 1e-4   # rumore minimo alla fine della traiettoria
 
-    # ── Training ──────────────────────────────────────────────────────────
+    # Training
     dropout: float = 0.0
 
-    # ── RoPE ──────────────────────────────────────────────────────────────
+    # RoPE
     rope_theta:                float = 500000.0
     rope_original_max_seq_len: int   = 1024
     rope_scale_factor:         float = 1.0
 
-    # ── Flash Attention 2 ─────────────────────────────────────────────────
+    # Flash Attention 2
     use_flash_attention: bool = True
 
-    # ── Gradient checkpointing ────────────────────────────────────────────
+    # Gradient checkpointing
     gradient_checkpointing: bool = False
 
 
@@ -63,29 +62,29 @@ def get_model_config() -> ModelConfig:
 class TrainConfig:
     batch_size:    int   = 8
     grad_accum:    int   = 16
-    max_iters:     int   = 20000
+    max_iters:     int   = 100000
     lr:            float = 1e-4
     seq_len:       int   = 1024
-    warmup_iters:  int   = 1000
+    warmup_iters:  int   = 2000
     min_lr:        float = 1e-5
     eval_interval: int   = 500
     eval_iters:    int   = 20
     max_grad_norm: float = 1.0
-    
-    self_cond_prob: float = 0.5
-    ce_loss_weight: float = 0.1
-    tokenizer_model:    str   = "gpt2"
+
+    self_cond_prob:     float = 0.5
+    ce_loss_weight:     float = 0.1
+    tokenizer_model:    str   = "meta-llama/Llama-3.2-1B"
     stream_buffer_size: int   = 1000
     val_every:          int   = 200
 
-    checkpoint_dir:    str = "checkpoints_v4"
-    checkpoint_prefix: str = "harold_v04"
+    checkpoint_dir:    str = "checkpoints_v5"
+    checkpoint_prefix: str = "harold_v05"
     preload:           str = "latest"
     save_every:        int = 2000
 
     # torch.compile
     use_compile:  bool = True
-    compile_mode: str  = "max-autotune"  #  "max-autotune" OR "reduce-overhead"
+    compile_mode: str  = "max-autotune"
 
     # Storico loss
     loss_history_size: int = 100_000
@@ -151,8 +150,10 @@ class TrainConfig:
 def get_train_config() -> TrainConfig:
     return TrainConfig()
 
+
 def get_weights_file_path(config: TrainConfig, iter_num: int) -> str:
     return config.ckpt_path(iter_num)
+
 
 def get_latest_weights_file_path(config: TrainConfig) -> str | None:
     result = config.read_latest()
@@ -161,7 +162,7 @@ def get_latest_weights_file_path(config: TrainConfig) -> str | None:
 
 @dataclass
 class SFTConfig:
-    pretrain_ckpt: str = "checkpoints_v4/harold_v04_final.pt"
+    pretrain_ckpt: str = "checkpoints_v5/harold_v05_final.pt"
     batch_size:    int   = 8
     grad_accum:    int   = 16
     max_iters:     int   = 10000
@@ -171,19 +172,19 @@ class SFTConfig:
     max_grad_norm: float = 1.0
     eval_interval: int   = 500
     eval_iters:    int   = 20
-    max_ctx_len:   int = 128
-    max_resp_len:  int = 128
-    max_ctx_turns: int = 3
+    max_ctx_len:   int   = 128
+    max_resp_len:  int   = 128
+    max_ctx_turns: int   = 3
     p_uncond:      float = 0.1
     cfg_scale:     float = 3.0
     ce_loss_weight:  float = 0.1
     self_cond_prob:  float = 0.5
-    tokenizer_model: str   = "gpt2"
+    tokenizer_model: str   = "meta-llama/Llama-3.2-1B"
     val_every:       int   = 200
     stage2_max_iters: int   = 5000
     stage2_lr:        float = 1e-5
-    checkpoint_dir:    str = "checkpoints_sft_v4"
-    checkpoint_prefix: str = "harold_v04_sft"
+    checkpoint_dir:    str = "checkpoints_sft_v5"
+    checkpoint_prefix: str = "harold_v05_sft"
     save_every:        int = 1000
     preload:           str = "latest"
     device: str = field(init=False)
@@ -229,7 +230,7 @@ class SFTConfig:
 
     def read_latest(self) -> Optional[tuple]:
         p = Path(self.latest_json_path())
-        if not p.exists():\
+        if not p.exists():
             return None
         with open(p) as f:
             d = json.load(f)

@@ -52,7 +52,6 @@ from logger import AsyncLogger
 
 @runtime_checkable
 class TrainableModel(Protocol):
-    """Protocollo per modelli compatibili con DiffusionTrainer."""
     def compute_loss(
         self,
         x0:             torch.Tensor,
@@ -69,6 +68,7 @@ class TrainableModel(Protocol):
     def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
 
 MAX_SKIP_RATIO = 10
+
 
 def _setup_ddp() -> Tuple[int, int, int]:
     dist.init_process_group(backend="nccl")
@@ -204,7 +204,7 @@ def save_checkpoint(
     train_losses: deque,
     val_losses:   list,
     push_hf:      bool = False,
-    hf_repo_id:   str  = "JHN-MACHINE/harold-v0.4",
+    hf_repo_id:   str  = "JHN-MACHINE/harold-v0.5",
     full:         bool = True,
 ) -> None:
     ckpt = {
@@ -236,7 +236,7 @@ def save_checkpoint(
                 api.create_repo(repo_id=hf_repo_id, repo_type="model", exist_ok=True, token=hf_token)
                 api.upload_file(
                     path_or_fileobj=path,
-                    path_in_repo="harold-v0.4-700M.pt",
+                    path_in_repo="harold-v0.5-1B.pt",
                     repo_id=hf_repo_id, repo_type="model", token=hf_token,
                 )
                 print(f"HuggingFace → {hf_repo_id}/harold-v0.4-700M.pt")
@@ -323,13 +323,12 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     main = _is_main(rank)
 
     if main:
-        print("Harold v0.4 — VP-SDE Continuous Diffusion")
+        print("Harold v0.5 — Flow Matching")
         print(f"Modalità:       {'DDP (' + str(world_size) + ' GPU)' if use_ddp else 'Single-GPU'}")
         print(f"Device:         {device}")
         print(f"Dtype:          {train_cfg.dtype}  (scaler={'ON' if train_cfg.use_scaler else 'OFF'})")
         eff = train_cfg.batch_size * train_cfg.grad_accum * world_size
         print(f"Batch effettivo:{eff}  ({train_cfg.batch_size} x {train_cfg.grad_accum} x {world_size} GPU)")
-        print(f"Beta:           [{model_cfg.diffusion_beta_min}, {model_cfg.diffusion_beta_max}]")
 
     if device.startswith("cuda"):
         torch.backends.cudnn.benchmark = True
@@ -366,7 +365,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
     if main:
         n_params = sum(p.numel() for p in model.parameters()) / 1e6
-        print(f"Harold v0.4 — {n_params:.1f}M parametri totali")
+        print(f"Harold v0.5 — {n_params:.1f}M parametri totali")
 
     active_model: Union[Harold, DDP] = (
         DDP(model, device_ids=[local_rank], output_device=local_rank)
@@ -432,7 +431,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
     pbar = tqdm(
         range(initial_iter, train_cfg.max_iters),
-        desc="Harold v0.4" + (" DDP" if use_ddp else ""),
+        desc="Harold v0.5" + (" DDP" if use_ddp else ""),
         disable=not main,
     )
 

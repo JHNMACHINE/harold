@@ -1,37 +1,32 @@
 """
-Harold v0.4 — model.py  (ottimizzato)
-======================================
-Ottimizzazioni rispetto alla versione originale:
+Harold v0.5 — model.py
+========================
+Principali cambiamenti rispetto a v0.4:
 
-  [OPT-M1] DeepSeekMoELayer: routing completamente vettorializzato con
-           scatter/index_add — eliminato il loop Python O(n_experts).
-           Da n_experts kernel launches a 3 operazioni fuse.
-           Impatto: ~30-50% speedup sul forward MoE, specialmente con
-           n_routed_experts > 4.
+  [v0.5-M1] VPSDESchedule → FlowMatchingSchedule
+             Traiettoria lineare: x_t = (1-t)*x0 + t*noise
+             Target: v = noise - x0  (velocità costante lungo la traiettoria)
+             Nessuna schedule beta, nessun alpha/sigma.
 
-  [OPT-M2] BlockCausalAttention: sparse mask cache spostata su device
-           corrente (era sempre ricalcolata su CPU poi trasferita).
-           Eliminato il `.to(device)` implicito al forward.
+  [v0.5-M2] compute_loss: Min-SNR weighting rimosso
+             Il target è uniforme su tutti i timestep — non serve pesare.
+             Loss = MSE(vel_pred, v_target) + ce_weight * CE
 
-  [OPT-M3] Harold.forward: gradient checkpointing nativo per layer
-           (attivabile con config.gradient_checkpointing=True).
-           Riduce memoria attivazioni da O(L) a O(sqrt(L)).
-           Necessario per batch_size > 4 con 733M param su A100 80GB.
+  [v0.5-M3] eps_pred → vel_pred
+             Il modello predice la velocità del flusso, non il rumore.
+             Stessa architettura, diverso significato dell'output.
 
-  [OPT-M4] compute_loss: aggiunto fast path "total_per_sample" nel
-           loss_dict per abilitare la vettorializzazione dell'eval
-           multi-t in train.py (OPT #4 fast path).
+  [v0.5-M4] Scaling a 1B parametri
+             d_model=1280, n_layers=36, n_heads=20, d_ff=3584
 
-  [OPT-M5] RotaryEmbedding: cos/sin cache precalcolata in bfloat16
-           quando supportato — evita cast al forward.
-
-  [OPT-M6] AdaLN: chunk → unbind più veloce (evita una copy).
-
-  [OPT-M7] MoE shared experts: invece di somma iterativa con loop,
-           usa stack + mean in un'unica operazione.
-
-  [OPT-M8] VPSDESchedule.add_noise: eps allocato con torch.empty +
-           normal_() in-place invece di torch.randn_like (minor alloc).
+Ottimizzazioni mantenute da v0.4:
+  [OPT-M1] MoE routing vettorializzato
+  [OPT-M2] Sparse mask cache on-device
+  [OPT-M3] Gradient checkpointing
+  [OPT-M5] RoPE cache in bfloat16
+  [OPT-M6] AdaLN con unbind
+  [OPT-M7] Shared experts stack+mean
+  [OPT-M8] add_noise con empty+normal_
 """
 
 import math
@@ -39,13 +34,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Callable, cast
 from config import ModelConfig
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Expert e SharedExpert
-# ─────────────────────────────────────────────────────────────────────────────
 
 class Expert(nn.Module):
     def __init__(self, n_embd: int, hidden_dim: int, dropout: float = 0.0):
@@ -73,10 +64,6 @@ class SharedExpert(nn.Module):
         return self.w2(self.dropout(F.silu(self.w1(x)) * self.w3(x)))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# [OPT-M1] DeepSeekMoELayer — routing vettorializzato
-# ─────────────────────────────────────────────────────────────────────────────
-
 class DeepSeekMoELayer(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -102,11 +89,6 @@ class DeepSeekMoELayer(nn.Module):
         self.register_buffer("router_bias", torch.zeros(self.n_routed_experts))
         self.router_indices: Optional[torch.Tensor] = None
 
-        # [OPT-M1] Pre-stack pesi routed experts per batch matmul
-        # Nota: aggiornato in _rebuild_expert_cache() se i pesi cambiano
-        self._expert_w1_cache: Optional[torch.Tensor] = None   # (E, hidden, d)
-        self._expert_w2_cache: Optional[torch.Tensor] = None   # (E, d, hidden)
-
     def _affinity(self, x_flat: torch.Tensor, t_emb_flat: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(self.router(torch.cat([x_flat, t_emb_flat], dim=-1)).float())
 
@@ -115,49 +97,33 @@ class DeepSeekMoELayer(nn.Module):
 
     def _get_expert_outputs_vectorized(
         self,
-        x_flat:      torch.Tensor,   # (N, d)
-        topk_indices: torch.Tensor,  # (N, k)  — può contenere -1 per slot invalidi
-        gates:        torch.Tensor,  # (N, k)
+        x_flat:       torch.Tensor,
+        topk_indices: torch.Tensor,
+        gates:        torch.Tensor,
     ) -> torch.Tensor:
-        """
-        [OPT-M1] Routing vettorializzato — nessun loop Python su n_experts.
-
-        Strategia:
-          1. Flatten (N*k,) degli indici expert validi
-          2. Un forward pass per ogni expert solo sui token assegnati
-             usando advanced indexing (batch gathering)
-          3. Scatter-add del risultato pesato in output
-
-        Questa implementazione è compatibile con torch.compile e
-        non richiede padding o masked tensors.
-        """
         N, k = topk_indices.shape
         d    = x_flat.shape[-1]
-
         output = torch.zeros(N, d, dtype=x_flat.dtype, device=x_flat.device)
 
-        # Flatten token→expert assignments
-        flat_indices = topk_indices.view(-1)    # (N*k,)
-        flat_gates   = gates.view(-1)            # (N*k,)
-        token_ids    = torch.arange(N, device=x_flat.device).unsqueeze(1).expand(N, k).reshape(-1)  # (N*k,)
+        flat_indices = topk_indices.view(-1)
+        flat_gates   = gates.view(-1)
+        token_ids    = torch.arange(N, device=x_flat.device).unsqueeze(1).expand(N, k).reshape(-1)
 
-        valid_mask   = flat_indices >= 0
+        valid_mask = flat_indices >= 0
         if not valid_mask.any():
             return output
 
-        flat_indices_v = flat_indices[valid_mask]   # (V,)
-        flat_gates_v   = flat_gates[valid_mask]     # (V,)
-        token_ids_v    = token_ids[valid_mask]      # (V,)
-        x_selected     = x_flat[token_ids_v]        # (V, d)
+        flat_indices_v = flat_indices[valid_mask]
+        flat_gates_v   = flat_gates[valid_mask]
+        token_ids_v    = token_ids[valid_mask]
+        x_selected     = x_flat[token_ids_v]
 
-        # [OPT-M1] Group by expert con argsort — un forward per expert
-        sort_idx    = flat_indices_v.argsort(stable=True)
-        sorted_exp  = flat_indices_v[sort_idx]
-        sorted_tok  = token_ids_v[sort_idx]
-        sorted_x    = x_selected[sort_idx]
-        sorted_g    = flat_gates_v[sort_idx]
+        sort_idx   = flat_indices_v.argsort(stable=True)
+        sorted_exp = flat_indices_v[sort_idx]
+        sorted_tok = token_ids_v[sort_idx]
+        sorted_x   = x_selected[sort_idx]
+        sorted_g   = flat_gates_v[sort_idx]
 
-        # Trova i boundaries per ogni expert
         boundaries = torch.cat([
             torch.tensor([-1], device=x_flat.device),
             (sorted_exp[1:] != sorted_exp[:-1]).nonzero(as_tuple=False).view(-1),
@@ -165,13 +131,13 @@ class DeepSeekMoELayer(nn.Module):
         ])
 
         for b in range(len(boundaries) - 1):
-            start    = (boundaries[b] + 1).item()
-            end      = (boundaries[b + 1] + 1).item()
-            exp_id   = sorted_exp[start].item() # type: ignore
-            chunk_x  = sorted_x[start:end]                          # (Ci, d)
-            chunk_g  = sorted_g[start:end].unsqueeze(1).to(x_flat.dtype)  # (Ci, 1)
-            chunk_t  = sorted_tok[start:end]                         # (Ci,)
-            exp_out  = self.routed_experts[exp_id](chunk_x)          # type: ignore # (Ci, d)
+            start   = int((boundaries[b] + 1).item())
+            end     = int((boundaries[b + 1] + 1).item())
+            exp_id  = int(sorted_exp[start].item())
+            chunk_x = sorted_x[start:end]
+            chunk_g = sorted_g[start:end].unsqueeze(1).to(x_flat.dtype)
+            chunk_t = sorted_tok[start:end]
+            exp_out = self.routed_experts[exp_id](chunk_x)
             output.index_add_(0, chunk_t, (exp_out * chunk_g).to(output.dtype))
 
         return output
@@ -186,7 +152,6 @@ class DeepSeekMoELayer(nn.Module):
         x_flat     = x.view(-1, C)
         t_emb_flat = t_emb.unsqueeze(1).expand(B, T, C).reshape(-1, C)
 
-        # [OPT-M7] Shared experts: stack + mean invece di loop + sum/div
         if len(self.shared_experts) == 1:
             shared_out = self.shared_experts[0](x_flat)
         else:
@@ -194,7 +159,7 @@ class DeepSeekMoELayer(nn.Module):
                 [e(x_flat) for e in self.shared_experts], dim=0
             ).mean(dim=0)
 
-        s         = self._affinity(x_flat, t_emb_flat)
+        s          = self._affinity(x_flat, t_emb_flat)
         sel_scores = s + self.router_bias
 
         if self.training or t_normalized is None:
@@ -222,9 +187,7 @@ class DeepSeekMoELayer(nn.Module):
             torch.full_like(s_sel, 1.0 / self.top_k),
         ).to(x.dtype)
 
-        # [OPT-M1] Forward vettorializzato — no loop Python su experts
         routed_out = self._get_expert_outputs_vectorized(x_flat, topk_indices, gates)
-
         return ((shared_out + routed_out) / (len(self.shared_experts) + self.top_k)).view(B, T, C)
 
     @torch.no_grad()
@@ -239,15 +202,7 @@ class DeepSeekMoELayer(nn.Module):
         self.router_indices = None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# RoPE con YaRN scaling
-# ─────────────────────────────────────────────────────────────────────────────
-
 class RotaryEmbedding(nn.Module):
-    """
-    Rotary Position Embedding con YaRN scaling.
-    [OPT-M5] Cache precalcolata in bfloat16 quando disponibile.
-    """
     def __init__(
         self,
         head_dim:             int,
@@ -276,9 +231,11 @@ class RotaryEmbedding(nn.Module):
         else:
             mscale = 1.0
 
+        self.mscale: torch.Tensor
+        self.cos_cached: torch.Tensor
+        self.sin_cached: torch.Tensor
         self.register_buffer("mscale", torch.tensor(mscale, dtype=torch.float32))
         emb = torch.outer(torch.arange(max_seq_len, dtype=torch.float32), freqs)
-        # [OPT-M5] Salva in bfloat16 se disponibile — evita cast al forward
         cache_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
         self.register_buffer("cos_cached",
             torch.cat([torch.cos(emb), torch.cos(emb)], dim=-1).to(cache_dtype))
@@ -293,17 +250,12 @@ class RotaryEmbedding(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, offset: int = 0):
         T      = q.shape[2]
         mscale = self.mscale.to(q.dtype)
-        # [OPT-M5] Nessun .to() se già nel dtype corretto
-        cos    = self.cos_cached[offset:offset + T].to(q.dtype).unsqueeze(0).unsqueeze(0)  # type: ignore
-        sin    = self.sin_cached[offset:offset + T].to(q.dtype).unsqueeze(0).unsqueeze(0)  # type: ignore
-        q_rot  = (q * cos + self._rotate_half(q) * sin) * mscale  # type: ignore
-        k_rot  = (k * cos + self._rotate_half(k) * sin) * mscale  # type: ignore
+        cos    = self.cos_cached[offset:offset + T].to(q.dtype).unsqueeze(0).unsqueeze(0)
+        sin    = self.sin_cached[offset:offset + T].to(q.dtype).unsqueeze(0).unsqueeze(0)
+        q_rot  = (q * cos + self._rotate_half(q) * sin) * mscale
+        k_rot  = (k * cos + self._rotate_half(k) * sin) * mscale
         return q_rot, k_rot
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# BlockCausalAttention — MLA + DSA + Flash Attention 2
-# ─────────────────────────────────────────────────────────────────────────────
 
 class BlockCausalAttention(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -311,13 +263,13 @@ class BlockCausalAttention(nn.Module):
         assert config.d_model % config.n_heads == 0
         assert config.n_heads % config.n_kv_heads == 0
 
-        self.n_heads     = config.n_heads
-        self.n_kv_heads  = config.n_kv_heads
-        self.n_kv_groups = config.n_heads // config.n_kv_heads
-        self.head_dim    = config.d_model // config.n_heads
-        self.block_size  = config.block_size
-        self.dropout     = config.dropout
-        self.window_size = config.dsa_window_size
+        self.n_heads      = config.n_heads
+        self.n_kv_heads   = config.n_kv_heads
+        self.n_kv_groups  = config.n_heads // config.n_kv_heads
+        self.head_dim     = config.d_model // config.n_heads
+        self.block_size   = config.block_size
+        self.dropout      = config.dropout
+        self.window_size  = config.dsa_window_size
         self.global_every = config.dsa_global_every
 
         self.latent_dim = config.mla_latent_dim
@@ -335,10 +287,10 @@ class BlockCausalAttention(nn.Module):
             scale_factor         = config.rope_scale_factor,
         )
         self.resid_drop = nn.Dropout(config.dropout)
-        # [OPT-M2] Cache per device — chiave include device string
         self._sparse_mask_cache: Dict[Tuple[int, str], torch.Tensor] = {}
 
         self._use_flash = False
+        self._flash_attn_func: Optional[Callable] = None
         if config.use_flash_attention:
             try:
                 from flash_attn import flash_attn_func  # type: ignore
@@ -348,7 +300,6 @@ class BlockCausalAttention(nn.Module):
                 pass
 
     def _build_sparse_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        # [OPT-M2] Chiave include device — mask creata direttamente sul device
         key = (seq_len, str(device))
         if key in self._sparse_mask_cache:
             return self._sparse_mask_cache[key]
@@ -390,6 +341,7 @@ class BlockCausalAttention(nn.Module):
         if self._use_flash and past_kv is None:
             k_exp = k.repeat_interleave(self.n_kv_groups, dim=1)
             v_exp = v.repeat_interleave(self.n_kv_groups, dim=1)
+            assert self._flash_attn_func is not None
             y = self._flash_attn_func(
                 q.transpose(1, 2),
                 k_exp.transpose(1, 2),
@@ -401,7 +353,6 @@ class BlockCausalAttention(nn.Module):
         else:
             k_exp     = k.repeat_interleave(self.n_kv_groups, dim=1)
             v_exp     = v.repeat_interleave(self.n_kv_groups, dim=1)
-            # [OPT-M2] mask già sul device corretto — nessun trasferimento
             mask      = self._build_sparse_mask(full_len, x.device)
             if T < full_len:
                 mask  = mask[-T:, :]
@@ -419,10 +370,6 @@ class BlockCausalAttention(nn.Module):
         return out, (c_kv_full if use_cache else None)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AdaLN
-# ─────────────────────────────────────────────────────────────────────────────
-
 class AdaLN(nn.Module):
     def __init__(self, d_model: int):
         super().__init__()
@@ -432,14 +379,9 @@ class AdaLN(nn.Module):
         nn.init.zeros_(self.proj.bias)
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
-        # [OPT-M6] unbind evita la copy implicita di chunk
-        scale, shift = self.proj(t_emb).unbind(dim=-1) if False else self.proj(t_emb).chunk(2, dim=-1)
+        scale, shift = self.proj(t_emb).chunk(2, dim=-1)
         return self.norm(x) * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Block
-# ─────────────────────────────────────────────────────────────────────────────
 
 class Block(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -468,42 +410,72 @@ class Block(nn.Module):
         return x + moe_out, present_kv
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# VP-SDE Schedule
-# ─────────────────────────────────────────────────────────────────────────────
+# [v0.5-M1] FlowMatchingSchedule — sostituisce VPSDESchedule
+class FlowMatchingSchedule(nn.Module):
+    """
+    Conditional Flow Matching con traiettoria lineare (Lipman et al. 2022).
 
-class VPSDESchedule(nn.Module):
-    def __init__(self, beta_min: float = 0.1, beta_max: float = 20.0):
+    Forward process:
+        x_t = (1 - t) * x0 + t * noise,  t in [0, 1]
+
+    A t=0: x_t = x0  (dato pulito)
+    A t=1: x_t = noise  (rumore puro)
+
+    Il modello predice la velocità del flusso:
+        v = noise - x0  (costante lungo la traiettoria)
+
+    Questo è equivalente a predire la direzione da x0 verso noise,
+    che è indipendente da t — target molto più stabile di epsilon-prediction.
+
+    sigma_min: piccola quantità di rumore residuo a t=0 per stabilità numerica.
+    """
+
+    def __init__(self, sigma_min: float = 1e-4):
         super().__init__()
-        self.beta_min = beta_min
-        self.beta_max = beta_max
+        self.sigma_min = sigma_min
 
-    def get_beta(self, t: torch.Tensor) -> torch.Tensor:
-        return self.beta_min + t * (self.beta_max - self.beta_min)
+    def interpolate(
+        self,
+        x0:    torch.Tensor,
+        noise: torch.Tensor,
+        t:     torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Interpola linearmente tra x0 e noise al timestep t.
+        x_t = (1 - t_eff) * x0 + t_eff * noise
+        dove t_eff = (1 - sigma_min) * t + sigma_min
+        per garantire un minimo di rumore anche a t=0.
+        """
+        t_eff = (1.0 - self.sigma_min) * t + self.sigma_min
+        t_eff = t_eff.view(-1, 1, 1)
+        return (1.0 - t_eff) * x0 + t_eff * noise
 
-    def get_alpha_sigma(self, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        beta_int = self.beta_min * t + 0.5 * (self.beta_max - self.beta_min) * t ** 2
-        alpha_sq = torch.exp(-beta_int)
-        alpha    = torch.sqrt(alpha_sq.clamp(min=0.0))
-        sigma    = torch.sqrt((1.0 - alpha_sq).clamp(min=1e-8))
-        return alpha, sigma
+    def target_velocity(
+        self,
+        x0:    torch.Tensor,
+        noise: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Velocità target del flusso: v = noise - x0.
+        Costante lungo la traiettoria — indipendente da t.
+        """
+        return noise - x0
 
-    def add_noise(self, x0: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        alpha, sigma = self.get_alpha_sigma(t)
-        # [OPT-M8] empty + normal_ evita un'allocazione rispetto a randn_like
-        eps  = torch.empty_like(x0).normal_()
-        x_t  = alpha.view(-1, 1, 1) * x0 + sigma.view(-1, 1, 1) * eps
-        return x_t, eps
+    def add_noise(
+        self,
+        x0: torch.Tensor,
+        t:  torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Aggiunge rumore secondo la traiettoria lineare.
+        Ritorna (x_t, noise) per compatibilità con il vecchio VPSDESchedule.
+        """
+        noise = torch.empty_like(x0).normal_()
+        x_t   = self.interpolate(x0, noise, t)
+        return x_t, noise
 
-    def get_snr(self, t: torch.Tensor) -> torch.Tensor:
-        alpha, sigma = self.get_alpha_sigma(t)
-        return (alpha / sigma.clamp(min=1e-8)) ** 2
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Harold v0.4 — VP-SDE Continuous Diffusion
-# ─────────────────────────────────────────────────────────────────────────────
-
+# [v0.5] Harold — Flow Matching 1B
 class Harold(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -530,30 +502,31 @@ class Harold(nn.Module):
 
         half  = config.d_model // 2
         freqs = torch.exp(-math.log(10000) * torch.arange(half, dtype=torch.float32) / half)
+        self.t_freqs: torch.Tensor
         self.register_buffer("t_freqs", freqs)
 
         self.blocks   = nn.ModuleList([Block(config) for _ in range(config.n_layers)])
         self.norm_out = nn.LayerNorm(config.d_model)
-        self.eps_pred = nn.Linear(config.d_model, config.d_model, bias=False)
+
+        # [v0.5-M3] vel_pred invece di eps_pred — predice velocità del flusso
+        self.vel_pred = nn.Linear(config.d_model, config.d_model, bias=False)
 
         self.ce_head        = nn.Linear(config.d_model, emb_vocab, bias=False)
         self.ce_head.weight = self.token_emb.weight
 
-        self.schedule = VPSDESchedule(
-            beta_min=config.diffusion_beta_min,
-            beta_max=config.diffusion_beta_max,
+        # [v0.5-M1] FlowMatchingSchedule invece di VPSDESchedule
+        self.schedule = FlowMatchingSchedule(
+            sigma_min=config.flow_sigma_min,
         )
 
-        # [OPT-M3] Gradient checkpointing — abilitato da config
         self.use_gradient_checkpointing = getattr(config, "gradient_checkpointing", False)
-
         self._init_weights()
 
     def _init_weights(self):
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 std = (0.02 / math.sqrt(2 * self.config.n_layers)
-                       if any(name.endswith(s) for s in ("o_proj", "w2", "v_up", "eps_pred"))
+                       if any(name.endswith(s) for s in ("o_proj", "w2", "v_up", "vel_pred"))
                        else 0.02)
                 nn.init.normal_(module.weight, std=std)
                 if module.bias is not None:
@@ -562,7 +535,7 @@ class Harold(nn.Module):
                 nn.init.normal_(module.weight, std=0.02)
 
     def get_timestep_embedding(self, t: torch.Tensor) -> torch.Tensor:
-        args = (t.float() * 1000.0)[:, None] * self.t_freqs[None]  # type: ignore
+        args = (t.float() * 1000.0)[:, None] * self.t_freqs[None]
         emb  = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if self.d_model % 2:
             emb = F.pad(emb, (0, 1))
@@ -578,10 +551,6 @@ class Harold(nn.Module):
         kv_offset:    int,
         t_normalized: Optional[float],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Wrapper per gradient_checkpoint — necessario perché checkpoint
-        non supporta keyword arguments direttamente.
-        """
         return block(x, t_emb, past_kv=past_kv, use_cache=use_cache,
                      kv_offset=kv_offset, t_normalized=t_normalized)
 
@@ -616,14 +585,15 @@ class Harold(nn.Module):
         for i, block in enumerate(self.blocks):
             past_kv = past_key_values[i] if past_key_values is not None else None
 
-            # [OPT-M3] Gradient checkpointing per layer
             if self.use_gradient_checkpointing and self.training and not use_cache:
-                # use_reentrant=False è più stabile con torch.compile
-                x, present_kv = gradient_checkpoint(
-                    self._block_forward,
-                    block, x, t_emb, past_kv, use_cache, kv_offset, t_normalized,
-                    use_reentrant=False,
-                ) # type: ignore
+                x, present_kv = cast(
+                    Tuple[torch.Tensor, Optional[torch.Tensor]],
+                    gradient_checkpoint(
+                        self._block_forward,
+                        block, x, t_emb, past_kv, use_cache, kv_offset, t_normalized,
+                        use_reentrant=False,
+                    )
+                )
             else:
                 x, present_kv = block(
                     x, t_emb,
@@ -635,10 +605,11 @@ class Harold(nn.Module):
                 present_kvs.append(present_kv)
 
         x_out     = self.norm_out(x)
-        eps_pred  = self.eps_pred(x_out)
+        # [v0.5-M3] predice velocità del flusso invece del rumore
+        vel_pred  = self.vel_pred(x_out)
         ce_logits = self.ce_head(x_out)
 
-        return eps_pred, ce_logits, present_kvs
+        return vel_pred, ce_logits, present_kvs
 
     def compute_loss(
         self,
@@ -650,6 +621,14 @@ class Harold(nn.Module):
         ctx_emb:        Optional[torch.Tensor] = None,
         p_uncond:       float = 0.0,
     ) -> Tuple[torch.Tensor, Dict]:
+        """
+        [v0.5-M2] Flow Matching loss — nessun Min-SNR weighting.
+
+        Target: v = noise - x0  (velocità costante lungo la traiettoria)
+        Loss:   MSE(vel_pred, v_target) + ce_weight * CE
+
+        Il target è uniforme su tutti i timestep — nessun peso necessario.
+        """
         device = x0.device
 
         if mask.sum() == 0:
@@ -661,13 +640,18 @@ class Harold(nn.Module):
 
         with torch.no_grad():
             x0_emb = self.token_emb(x0)
-        x_t, eps = self.schedule.add_noise(x0_emb, t)
+
+        # [v0.5-M1] Traiettoria lineare
+        x_t, noise = self.schedule.add_noise(x0_emb, t)
+
+        # [v0.5-M1] Target: velocità del flusso
+        v_target = self.schedule.target_velocity(x0_emb, noise)
 
         self_cond: Optional[torch.Tensor] = None
         if self_cond_prob > 0 and torch.rand(1).item() < self_cond_prob:
             with torch.no_grad():
-                eps_prev, _, _ = self.forward(x_t, t, self_cond=None, ctx_emb=None)
-            self_cond = eps_prev.mean(dim=1).detach()
+                vel_prev, _, _ = self.forward(x_t, t, self_cond=None, ctx_emb=None)
+            self_cond = vel_prev.mean(dim=1).detach()
 
         cfg_emb: Optional[torch.Tensor] = None
         if ctx_emb is not None:
@@ -676,15 +660,11 @@ class Harold(nn.Module):
             else:
                 cfg_emb = ctx_emb
 
-        eps_pred, ce_logits, _ = self.forward(x_t, t, self_cond=self_cond, ctx_emb=cfg_emb)
+        vel_pred, ce_logits, _ = self.forward(x_t, t, self_cond=self_cond, ctx_emb=cfg_emb)
 
-        snr_clip = 5.0
-        snr      = self.schedule.get_snr(t).clamp(max=snr_clip)
-        snr_w    = (snr / (snr + 1.0)).to(eps_pred.dtype)
-
-        per_token_mse = F.mse_loss(eps_pred, eps, reduction="none").mean(dim=-1)
-        weighted_mse  = per_token_mse * snr_w.unsqueeze(1)
-        loss_score    = weighted_mse[mask].mean()
+        # [v0.5-M2] Loss senza weighting — target uniforme su tutti i t
+        per_token_mse = F.mse_loss(vel_pred, v_target, reduction="none").mean(dim=-1)
+        loss_score    = per_token_mse[mask].mean()
 
         x0_for_ce = x0.masked_fill(~mask, -100)
         loss_ce   = F.cross_entropy(
@@ -695,17 +675,15 @@ class Harold(nn.Module):
         )
         total = loss_score + ce_weight * loss_ce
 
-        # [OPT-M4] loss_per_sample per fast path eval multi-t in train.py
-        # Calcolato solo se fixed_t è fornito (modalità eval) — zero overhead in training
         extra: Dict = {}
         if fixed_t is not None:
-            per_sample_score = weighted_mse.mean(dim=-1)   # (B,) — approssimazione per token
+            per_sample_score = per_token_mse.mean(dim=-1)
             per_sample_ce    = F.cross_entropy(
                 ce_logits.view(-1, ce_logits.size(-1)),
                 x0_for_ce.view(-1),
                 ignore_index=-100,
                 reduction="none",
-            ).view(B, -1).mean(dim=-1)                     # (B,)
+            ).view(B, -1).mean(dim=-1)
             per_sample_total = per_sample_score + ce_weight * per_sample_ce
             extra = {
                 "total_per_sample": per_sample_total.detach(),
