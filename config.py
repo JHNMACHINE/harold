@@ -73,7 +73,7 @@ class TrainConfig:
 
     self_cond_prob:     float = 0.5
     ce_loss_weight:     float = 0.1
-    tokenizer_model:    str   = "meta-llama/Llama-3.2-1B"
+    tokenizer_model: str = "NousResearch/Llama-2-7b-hf" # "meta-llama/Llama-3.2-1B"
     stream_buffer_size: int   = 1000
     val_every:          int   = 200
 
