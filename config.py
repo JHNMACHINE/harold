@@ -60,7 +60,7 @@ def get_model_config() -> ModelConfig:
 
 @dataclass
 class TrainConfig:
-    batch_size:    int   = 8
+    batch_size:    int   = 16
     grad_accum:    int   = 16
     max_iters:     int   = 100000
     lr:            float = 1e-4
