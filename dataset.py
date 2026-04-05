@@ -466,16 +466,12 @@ def build_loaders(
         train_ds,
         batch_size=train_cfg.batch_size,
         pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=True,
         worker_init_fn=worker_init_fn,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=train_cfg.batch_size,
         pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=True,
         worker_init_fn=worker_init_fn,
     )
     return train_loader, val_loader
@@ -565,13 +561,9 @@ def build_loaders_ddp(
     train_loader = DataLoader(
         train_ds, batch_size=train_cfg.batch_size,
         pin_memory=True, worker_init_fn=worker_init_fn,
-        prefetch_factor=True,
-        persistent_workers=True,
     )
     val_loader = DataLoader(
         val_ds, batch_size=train_cfg.batch_size,
         pin_memory=True, worker_init_fn=worker_init_fn,
-        prefetch_factor=True,
-        persistent_workers=True,
     )
     return train_loader, val_loader
