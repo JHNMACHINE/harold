@@ -239,7 +239,7 @@ def save_checkpoint(
                     path_in_repo="harold-v0.5-1B.pt",
                     repo_id=hf_repo_id, repo_type="model", token=hf_token,
                 )
-                print(f"HuggingFace → {hf_repo_id}/harold-v0.4-700M.pt")
+                print(f"HuggingFace -> {hf_repo_id}/harold-v0.5-1B.pt")
             except Exception as e:
                 print(f"Errore push HuggingFace: {e}")
         threading.Thread(target=_push, daemon=True).start()
@@ -323,7 +323,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     main = _is_main(rank)
 
     if main:
-        print("Harold v0.5 — Flow Matching")
+        print("Harold v0.5 - Flow Matching")
         print(f"Modalità:       {'DDP (' + str(world_size) + ' GPU)' if use_ddp else 'Single-GPU'}")
         print(f"Device:         {device}")
         print(f"Dtype:          {train_cfg.dtype}  (scaler={'ON' if train_cfg.use_scaler else 'OFF'})")
