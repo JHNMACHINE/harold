@@ -74,7 +74,7 @@ class TrainConfig:
     self_cond_prob:     float = 0.5
     ce_loss_weight:     float = 0.1
     tokenizer_model: str = "NousResearch/Llama-2-7b-hf" # "meta-llama/Llama-3.2-1B"
-    stream_buffer_size: int   = 1000
+    stream_buffer_size: int   = 5000
     val_every:          int   = 200
 
     checkpoint_dir:    str = "checkpoints_v5"
