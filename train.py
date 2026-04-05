@@ -67,8 +67,8 @@ class TrainableModel(Protocol):
     def parameters(self) -> Any: ...
     def update_router_biases(self) -> None: ...
     def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
-MAX_SKIP_RATIO = 10
 
+MAX_SKIP_RATIO = 10
 
 def _setup_ddp() -> Tuple[int, int, int]:
     dist.init_process_group(backend="nccl")
@@ -230,7 +230,7 @@ def save_checkpoint(
                 from huggingface_hub import HfApi
                 hf_token = os.environ.get("HF_TOKEN")
                 if not hf_token:
-                    print("⚠ HF_TOKEN non trovato — skip push HuggingFace.")
+                    print("HF_TOKEN non trovato — skip push HuggingFace.")
                     return
                 api = HfApi()
                 api.create_repo(repo_id=hf_repo_id, repo_type="model", exist_ok=True, token=hf_token)
@@ -239,9 +239,9 @@ def save_checkpoint(
                     path_in_repo="harold-v0.4-700M.pt",
                     repo_id=hf_repo_id, repo_type="model", token=hf_token,
                 )
-                print(f"  ✓ HuggingFace → {hf_repo_id}/harold-v0.4-700M.pt")
+                print(f"HuggingFace → {hf_repo_id}/harold-v0.4-700M.pt")
             except Exception as e:
-                print(f"  ⚠ Errore push HuggingFace: {e}")
+                print(f"Errore push HuggingFace: {e}")
         threading.Thread(target=_push, daemon=True).start()
 
 
@@ -328,7 +328,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         print(f"Device:         {device}")
         print(f"Dtype:          {train_cfg.dtype}  (scaler={'ON' if train_cfg.use_scaler else 'OFF'})")
         eff = train_cfg.batch_size * train_cfg.grad_accum * world_size
-        print(f"Batch effettivo:{eff}  ({train_cfg.batch_size} × {train_cfg.grad_accum} × {world_size} GPU)")
+        print(f"Batch effettivo:{eff}  ({train_cfg.batch_size} x {train_cfg.grad_accum} x {world_size} GPU)")
         print(f"Beta:           [{model_cfg.diffusion_beta_min}, {model_cfg.diffusion_beta_max}]")
 
     if device.startswith("cuda"):
