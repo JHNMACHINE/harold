@@ -25,6 +25,7 @@ from __future__ import annotations
 from collections import deque
 from pathlib import Path
 from typing import Iterator
+import os
 import yaml
 import torch
 from transformers import BatchEncoding, PreTrainedTokenizer
@@ -63,6 +64,26 @@ def _first_token_id(val) -> int | None:
     if isinstance(val, list):
         return int(val[0]) if val else None
     return int(val)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [OPT-D4] Numero worker ottimale
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _optimal_num_workers(max_workers: int = 4) -> int:
+    """
+    Calcola il numero ottimale di worker in base ai core disponibili.
+    Usa metà dei core fisici, fino a max_workers.
+    Su sistemi con pochi core (es. Colab), ritorna 0 per evitare overhead.
+    """
+    try:
+        n_cpu = os.cpu_count() or 1
+    except Exception:
+        n_cpu = 1
+    if n_cpu <= 2:
+        return 0   # single-process — meno overhead su macchine piccole
+    return min(max_workers, n_cpu // 2)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Caricamento configurazione YAML
@@ -510,4 +531,50 @@ def build_sft_loaders(
         batch_size=train_cfg.batch_size,
         pin_memory=True,
     )
+    return train_loader, val_loader
+
+
+def build_loaders_ddp(
+    train_cfg,
+    tokenizer:  "PreTrainedTokenizer",
+    rank:       int,
+    yaml_path:  str = "datasets_config.yaml",
+) -> "tuple[DataLoader, DataLoader]":
+    """
+    Costruisce i DataLoader partizionati per rank DDP.
+
+    Con IterableDataset in streaming non esiste DistributedSampler —
+    la partizionamento avviene tramite seed offset per rank, così ogni
+    GPU vede porzioni diverse dello stream senza duplicati:
+      rank 0: seed=42
+      rank 1: seed=1042
+      rank 2: seed=2042
+      ...
+    """
+    cfg         = load_dataset_config(yaml_path)
+    dataset_cfg = cfg["pretraining"]
+
+    rank_seed = 42 + rank * 1000
+
+    train_ds = MixedStreamingDataset(
+        tokenizer=tokenizer, seq_len=train_cfg.seq_len, dataset_cfg=dataset_cfg,
+        split="train", val_every=train_cfg.val_every,
+        seed=rank_seed, buffer_size=train_cfg.stream_buffer_size,
+    )
+    val_ds = MixedStreamingDataset(
+        tokenizer=tokenizer, seq_len=train_cfg.seq_len, dataset_cfg=dataset_cfg,
+        split="val", val_every=train_cfg.val_every,
+        seed=rank_seed, buffer_size=train_cfg.stream_buffer_size,
+    )
+
+    def worker_init_fn(_: int) -> None:
+        wi = torch.utils.data.get_worker_info()
+        if wi is not None:
+            ds = wi.dataset
+            setattr(ds, "seed", getattr(ds, "seed", rank_seed) + wi.id * 31)
+
+    train_loader = DataLoader(train_ds, batch_size=train_cfg.batch_size,
+                              pin_memory=True, worker_init_fn=worker_init_fn)
+    val_loader   = DataLoader(val_ds,   batch_size=train_cfg.batch_size,
+                              pin_memory=True, worker_init_fn=worker_init_fn)
     return train_loader, val_loader

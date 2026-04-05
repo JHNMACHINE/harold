@@ -1,14 +1,32 @@
 """
-Harold v0.4 — train.py  (ottimizzato, versione finale)
-========================================================
-Integra le ottimizzazioni cross-file: usa use_compile e loss_history_size
-da config.py, total_per_sample da model.compute_loss, prefetch dai DataLoader.
+Harold v0.4 — train.py  (unified single-GPU + DDP)
+====================================================
+Entry point unico per training single-GPU e multi-GPU DDP.
 
-Changelog rispetto alla prima versione ottimizzata:
-  - Rimosso _patch_loader_for_perf (ora gestito direttamente in dataset.py)
-  - use_compile letto da train_cfg invece di hardcoded
-  - estimate_loss: fast path attivo grazie a OPT-M4 in model.py
+Avvio single-GPU:
+    torchrun --nproc_per_node=1 train.py
+
+Avvio multi-GPU (es. 4 GPU):
+    torchrun --nproc_per_node=4 train.py
+
+Comportamento automatico:
+  - world_size=1  → single-GPU, torch.compile abilitato, nessun overhead DDP
+  - world_size>1  → DDP attivo, torch.compile disabilitato (instabile con DDP),
+                    dataset partizionato per rank tramite seed offset,
+                    checkpoint/logging/HF push solo su rank 0,
+                    val loss sincronizzata via all_reduce
+
+Compatibilità checkpoint:
+  - I checkpoint sono sempre salvati unwrapped (model.module se DDP)
+  - Intercambiabili tra run single-GPU e multi-GPU
+
+Changelog:
+  - Rimosso _patch_loader_for_perf (gestito in dataset.py)
+  - use_compile letto da train_cfg
+  - estimate_loss: loop per t_value (evita OOM su GPU < 80GB)
   - Deque con maxlen da train_cfg.loss_history_size
+  - save_checkpoint: full=True (best/final) vs full=False (periodici)
+  - DDP: partizionamento dataset per seed, all_reduce val loss
 """
 
 import math
@@ -16,27 +34,52 @@ import os
 import time
 import warnings
 from collections import deque
-from typing import Dict, Tuple, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from config import ModelConfig, TrainConfig, get_model_config, get_train_config
 from model import Harold, build_model
-from dataset import build_loaders
+from dataset import build_loaders, MixedStreamingDataset, load_dataset_config
 from logger import AsyncLogger
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Costanti
-# ─────────────────────────────────────────────────────────────────────────────
+MAX_SKIP_RATIO = 10
 
-MAX_SKIP_RATIO = 10   # max micro-batch invalidi prima di abbandonare lo step
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Trainer
-# ─────────────────────────────────────────────────────────────────────────────
+def _setup_ddp() -> Tuple[int, int, int]:
+    dist.init_process_group(backend="nccl")
+    rank       = dist.get_rank()
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    world_size = dist.get_world_size()
+    torch.cuda.set_device(local_rank)
+    return rank, local_rank, world_size
+
+
+def _cleanup_ddp() -> None:
+    dist.destroy_process_group()
+
+
+def _is_main(rank: int) -> bool:
+    return rank == 0
+
+
+def _all_reduce_mean(tensor: torch.Tensor, world_size: int) -> torch.Tensor:
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return tensor / world_size
+
+
+def _is_ddp_available() -> bool:
+    return (
+        "RANK" in os.environ
+        and "WORLD_SIZE" in os.environ
+        and int(os.environ.get("WORLD_SIZE", 1)) > 1
+    )
+
 
 class DiffusionTrainer:
     def __init__(self, model: Harold, config: ModelConfig, train_cfg: TrainConfig,
@@ -46,25 +89,17 @@ class DiffusionTrainer:
         self.train_cfg    = train_cfg
         self.pad_token_id = pad_token_id
 
-    def train_step(
-        self,
-        batch: torch.Tensor,
-    ) -> Optional[Tuple[torch.Tensor, Dict[str, float]]]:
+    def train_step(self, batch: torch.Tensor) -> Optional[Tuple[torch.Tensor, Dict[str, float]]]:
         mask = (batch != self.pad_token_id)
         if mask.sum() == 0:
             return None
         loss, loss_dict = self.model.compute_loss(
-            x0=batch,
-            mask=mask,
+            x0=batch, mask=mask,
             ce_weight=self.train_cfg.ce_loss_weight,
             self_cond_prob=self.train_cfg.self_cond_prob,
         )
         return loss, loss_dict
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LR schedule — cosine decay con warmup
-# ─────────────────────────────────────────────────────────────────────────────
 
 def get_lr(it: int, cfg: TrainConfig) -> float:
     if it < cfg.warmup_iters:
@@ -75,10 +110,6 @@ def get_lr(it: int, cfg: TrainConfig) -> float:
     return cfg.min_lr + 0.5 * (1.0 + math.cos(math.pi * ratio)) * (cfg.lr - cfg.min_lr)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Valutazione multi-t vettorializzata
-# ─────────────────────────────────────────────────────────────────────────────
-
 @torch.no_grad()
 def estimate_loss(
     model:        Harold,
@@ -88,48 +119,32 @@ def estimate_loss(
     iter_num:     int = 0,
     logger:       Optional["AsyncLogger"] = None,
 ) -> float:
-    """
-    Valuta su t_values fissi.
-
-    Fast path (OPT-M4): se compute_loss restituisce *_per_sample,
-    un unico forward pass su batch x n_t per tutti i t values.
-    Fallback automatico a loop classico per compatibilità.
-    """
     device   = next(model.parameters()).device
     model.eval()
 
     t_values = [0.1, 0.3, 0.5, 0.7, 0.9]
-
     all_total: Dict[float, list] = {t: [] for t in t_values}
     all_score: Dict[float, list] = {t: [] for t in t_values}
     all_ce:    Dict[float, list] = {t: [] for t in t_values}
 
     iterator = iter(val_loader)
-
     for _ in range(train_cfg.eval_iters):
         try:
             batch = next(iterator)
         except StopIteration:
             break
-
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         mask      = (input_ids != pad_token_id)
         if mask.sum() == 0:
             continue
-
         B = input_ids.shape[0]
-
-        # Loop per t_value — il fast path (batch B×n_t) causa OOM su GPU < 80GB
-        # perché ce_logits (B*n_t, L, vocab_size) alloca ~7GB in un colpo solo.
         for t_val in t_values:
             fixed_t = torch.full((B,), t_val, dtype=torch.float32, device=device)
             with train_cfg.ctx:
                 _, loss_dict = model.compute_loss(
-                    x0=input_ids,
-                    mask=mask,
+                    x0=input_ids, mask=mask,
                     ce_weight=train_cfg.ce_loss_weight,
-                    fixed_t=fixed_t,
-                    self_cond_prob=0.0,
+                    fixed_t=fixed_t, self_cond_prob=0.0,
                 )
             all_total[t_val].append(loss_dict["total"])
             all_score[t_val].append(loss_dict["score"])
@@ -137,18 +152,9 @@ def estimate_loss(
 
     model.train()
 
-    per_t_total = {
-        t: float(torch.tensor(v).mean()) if v else float("inf")
-        for t, v in all_total.items()
-    }
-    per_t_score = {
-        t: float(torch.tensor(v).mean()) if v else float("inf")
-        for t, v in all_score.items()
-    }
-    per_t_ce = {
-        t: float(torch.tensor(v).mean()) if v else float("inf")
-        for t, v in all_ce.items()
-    }
+    per_t_total = {t: float(torch.tensor(v).mean()) if v else float("inf") for t, v in all_total.items()}
+    per_t_score = {t: float(torch.tensor(v).mean()) if v else float("inf") for t, v in all_score.items()}
+    per_t_ce    = {t: float(torch.tensor(v).mean()) if v else float("inf") for t, v in all_ce.items()}
 
     print("  val total: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_total.items()))
     print("  val score: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_score.items()))
@@ -167,25 +173,20 @@ def estimate_loss(
     return sum(valid) / len(valid) if valid else float("inf")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Checkpoint
-# ─────────────────────────────────────────────────────────────────────────────
-
 def save_checkpoint(
-    path:          str,
-    model:         Harold,
-    optimizer:     torch.optim.Optimizer,
-    scaler:        torch.GradScaler,
-    iter_num:      int,
-    val_loss:      float,
-    model_cfg:     ModelConfig,
-    train_cfg:     TrainConfig,
-    train_losses:  deque,
-    val_losses:    list,
-    push_hf:       bool = False,
-    hf_repo_id:    str  = "JHN-MACHINE/harold-v0.4",
-    full:          bool = True,   # True = salva optimizer+scaler (best/final)
-                                  # False = solo modello (periodici) → ~3GB invece di 8GB
+    path:         str,
+    model:        Harold,
+    optimizer:    torch.optim.Optimizer,
+    scaler:       torch.GradScaler,
+    iter_num:     int,
+    val_loss:     float,
+    model_cfg:    ModelConfig,
+    train_cfg:    TrainConfig,
+    train_losses: deque,
+    val_losses:   list,
+    push_hf:      bool = False,
+    hf_repo_id:   str  = "JHN-MACHINE/harold-v0.4",
+    full:         bool = True,
 ) -> None:
     ckpt = {
         "iter_num":     iter_num,
@@ -197,12 +198,10 @@ def save_checkpoint(
         "val_losses":   val_losses,
     }
     if full:
-        # Best e final: salva optimizer e scaler per riprendere esattamente
         ckpt["optimizer_state"] = optimizer.state_dict()
         ckpt["scaler_state"]    = scaler.state_dict()
     torch.save(ckpt, path)
 
-    # Push su HuggingFace solo se richiesto (best e final)
     if push_hf:
         import threading
         def _push():
@@ -210,21 +209,18 @@ def save_checkpoint(
                 from huggingface_hub import HfApi
                 hf_token = os.environ.get("HF_TOKEN")
                 if not hf_token:
-                    print("\u26a0 HF_TOKEN non trovato \u2014 skip push HuggingFace.")
+                    print("HF_TOKEN non trovato — skip push HuggingFace.")
                     return
                 api = HfApi()
                 api.create_repo(repo_id=hf_repo_id, repo_type="model", exist_ok=True, token=hf_token)
                 api.upload_file(
                     path_or_fileobj=path,
                     path_in_repo="harold-v0.4-700M.pt",
-                    repo_id=hf_repo_id,
-                    repo_type="model",
-                    token=hf_token,
+                    repo_id=hf_repo_id, repo_type="model", token=hf_token,
                 )
-                print(f"  \u2713 HuggingFace \u2192 {hf_repo_id}/{os.path.basename(path)}")
+                print(f"HuggingFace → {hf_repo_id}/harold-v0.4-700M.pt")
             except Exception as e:
-                print(f"  \u26a0 Errore push HuggingFace: {e}")
-        # Push in background per non bloccare il training
+                print(f"Errore push HuggingFace: {e}")
         threading.Thread(target=_push, daemon=True).start()
 
 
@@ -238,7 +234,6 @@ def load_checkpoint(
     print(f"Carico checkpoint: {path}")
     state = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(state["model_state"])
-    # optimizer/scaler presenti solo nei checkpoint full (best/final)
     if "optimizer_state" in state:
         optimizer.load_state_dict(state["optimizer_state"])
         print("  optimizer state caricato")
@@ -254,24 +249,43 @@ def load_checkpoint(
     return iter_num, best_val, train_losses, val_losses
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Gradient accumulation
-# ─────────────────────────────────────────────────────────────────────────────
+def _build_loaders_ddp(train_cfg, tokenizer, rank: int) -> Tuple[DataLoader, DataLoader]:
+    cfg         = load_dataset_config("datasets_config.yaml")
+    dataset_cfg = cfg["pretraining"]
+    if _is_main(rank):
+        print("Dataset mix pretraining: " +
+              ", ".join(f"{d['name']} {d['weight']:.0%}" for d in dataset_cfg))
+    rank_seed = 42 + rank * 1000
+
+    train_ds = MixedStreamingDataset(
+        tokenizer=tokenizer, seq_len=train_cfg.seq_len, dataset_cfg=dataset_cfg,
+        split="train", val_every=train_cfg.val_every,
+        seed=rank_seed, buffer_size=train_cfg.stream_buffer_size,
+    )
+    val_ds = MixedStreamingDataset(
+        tokenizer=tokenizer, seq_len=train_cfg.seq_len, dataset_cfg=dataset_cfg,
+        split="val", val_every=train_cfg.val_every,
+        seed=rank_seed, buffer_size=train_cfg.stream_buffer_size,
+    )
+
+    def worker_init_fn(_: int) -> None:
+        wi = torch.utils.data.get_worker_info()
+        if wi is not None:
+            ds = wi.dataset
+            setattr(ds, "seed", getattr(ds, "seed", rank_seed) + wi.id * 31)
+
+    train_loader = DataLoader(train_ds, batch_size=train_cfg.batch_size, pin_memory=True, worker_init_fn=worker_init_fn)
+    val_loader   = DataLoader(val_ds,   batch_size=train_cfg.batch_size, pin_memory=True, worker_init_fn=worker_init_fn)
+    return train_loader, val_loader
+
 
 def _run_grad_accum(
-    trainer:      DiffusionTrainer,
-    train_iter,
-    train_loader: DataLoader,
-    train_cfg:    TrainConfig,
-    scaler:       torch.GradScaler,
-    device:       str,
+    trainer: DiffusionTrainer, train_iter, train_loader: DataLoader,
+    train_cfg: TrainConfig, scaler: torch.GradScaler, device: str,
 ) -> Tuple[float, float, float, int, object]:
-    step_loss_sum  = 0.0
-    step_score_sum = 0.0
-    step_ce_sum    = 0.0
-    valid_count    = 0
-    mb_idx         = 0
-    max_skip       = train_cfg.grad_accum * MAX_SKIP_RATIO
+    step_loss_sum = step_score_sum = step_ce_sum = 0.0
+    valid_count = mb_idx = 0
+    max_skip = train_cfg.grad_accum * MAX_SKIP_RATIO
 
     while valid_count < train_cfg.grad_accum:
         if mb_idx > max_skip:
@@ -283,7 +297,6 @@ def _run_grad_accum(
             batch      = next(train_iter)
 
         input_ids = batch["input_ids"].to(device, non_blocking=True)
-
         with train_cfg.ctx:
             result = trainer.train_step(input_ids)
 
@@ -293,86 +306,104 @@ def _run_grad_accum(
 
         loss, loss_dict = result
         scaler.scale(loss / train_cfg.grad_accum).backward()
-
         step_loss_sum  += loss.item()
         step_score_sum += loss_dict.get("score", 0.0)
         step_ce_sum    += loss_dict.get("ce",    0.0)
-        valid_count    += 1
-        mb_idx         += 1
+        valid_count += 1
+        mb_idx      += 1
 
     return step_loss_sum, step_score_sum, step_ce_sum, valid_count, train_iter
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Run training
-# ─────────────────────────────────────────────────────────────────────────────
-
 def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
-    device = train_cfg.device
 
-    print("Harold v0.4 - VP-SDE Continuous Diffusion")
-    print(f"Device:         {device}")
-    print(f"Dtype:          {train_cfg.dtype}  (scaler={'ON' if train_cfg.use_scaler else 'OFF'})")
-    print(f"Batch virtuale: {train_cfg.batch_size} x {train_cfg.grad_accum} = {train_cfg.effective_batch_size}")
-    print(f"Self-cond prob: {train_cfg.self_cond_prob}")
-    print(f"Beta:           [{model_cfg.diffusion_beta_min}, {model_cfg.diffusion_beta_max}]")
+    # Setup
+    use_ddp    = _is_ddp_available()
+    rank       = 0
+    local_rank = 0
+    world_size = 1
+
+    if use_ddp:
+        rank, local_rank, world_size = _setup_ddp()
+        device = f"cuda:{local_rank}"
+    else:
+        device = train_cfg.device
+
+    main = _is_main(rank)
+
+    if main:
+        print("Harold v0.4 — VP-SDE Continuous Diffusion")
+        print(f"Modalità:       {'DDP (' + str(world_size) + ' GPU)' if use_ddp else 'Single-GPU'}")
+        print(f"Device:         {device}")
+        print(f"Dtype:          {train_cfg.dtype}  (scaler={'ON' if train_cfg.use_scaler else 'OFF'})")
+        eff = train_cfg.batch_size * train_cfg.grad_accum * world_size
+        print(f"Batch effettivo:{eff}  ({train_cfg.batch_size} x {train_cfg.grad_accum} x {world_size} GPU)")
+        print(f"Beta:           [{model_cfg.diffusion_beta_min}, {model_cfg.diffusion_beta_max}]")
 
     if device.startswith("cuda"):
         torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
 
-    # ── Tokenizer ─────────────────────────────────────────────────────────
+    # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(train_cfg.tokenizer_model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     pad_token_id = tokenizer.pad_token_id
-
     model_cfg.vocab_size    = tokenizer.vocab_size
     model_cfg.mask_token_id = int(getattr(tokenizer, "mask_token_id", None) or tokenizer.vocab_size)
 
-    # ── Modello ───────────────────────────────────────────────────────────
+    # Modello
     model = build_model(model_cfg).to(device)
 
-    # torch.compile — letto da train_cfg.use_compile
-    use_compile = (
-        getattr(train_cfg, "use_compile", True)
-        and hasattr(torch, "compile")
-        and device.startswith("cuda")
-        and torch.cuda.get_device_capability()[0] >= 7
-    )
-    if use_compile:
-        compile_mode = getattr(train_cfg, "compile_mode", "reduce-overhead")
-        print(f"torch.compile() abilitato (mode='{compile_mode}')")
-        model = torch.compile(model, mode=compile_mode)
-    else:
-        print("torch.compile() disabilitato")
+    if not use_ddp:
+        use_compile = (
+            getattr(train_cfg, "use_compile", True)
+            and hasattr(torch, "compile")
+            and device.startswith("cuda")
+            and torch.cuda.get_device_capability()[0] >= 7
+        )
+        if use_compile:
+            compile_mode = getattr(train_cfg, "compile_mode", "reduce-overhead")
+            if main:
+                print(f"torch.compile() abilitato (mode='{compile_mode}')")
+            model = torch.compile(model, mode=compile_mode)
+        elif main:
+            print("torch.compile() disabilitato")
+    elif main:
+        print("torch.compile() disabilitato (DDP)")
 
-    n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"Harold v0.4 — {n_params:.1f}M parametri totali")
-    if model_cfg.gradient_checkpointing:
-        print("Gradient checkpointing: ON")
+    if main:
+        n_params = sum(p.numel() for p in model.parameters()) / 1e6
+        print(f"Harold v0.4 — {n_params:.1f}M parametri totali")
 
-    # ── Optimizer ─────────────────────────────────────────────────────────
+    if use_ddp:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)  # type: ignore
+
+    raw_model: Harold = model.module if isinstance(model, DDP) else model  # type: ignore
+
+    # Optimizer
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=train_cfg.lr,
-        betas=(0.9, 0.95),
-        weight_decay=0.1,
-        fused=True,
+        model.parameters(), lr=train_cfg.lr,
+        betas=(0.9, 0.95), weight_decay=0.1, fused=True,
     )
     scaler = torch.GradScaler("cuda", enabled=train_cfg.use_scaler)
 
-    # ── Dataset ───────────────────────────────────────────────────────────
-    train_loader, val_loader = build_loaders(train_cfg, tokenizer)
+    # Dataset
+    if use_ddp:
+        train_loader, val_loader = _build_loaders_ddp(train_cfg, tokenizer, rank)
+    else:
+        train_loader, val_loader = build_loaders(train_cfg, tokenizer)
 
-    # ── Trainer ───────────────────────────────────────────────────────────
-    trainer = DiffusionTrainer(model, model_cfg, train_cfg, pad_token_id=pad_token_id) # type: ignore
+    # Trainer
+    trainer = DiffusionTrainer(model, model_cfg, train_cfg, pad_token_id=pad_token_id)  # type: ignore
 
-    # ── Checkpoint resume ─────────────────────────────────────────────────
-    os.makedirs(train_cfg.checkpoint_dir, exist_ok=True)
+    # Checkpoint resume
+    if main:
+        os.makedirs(train_cfg.checkpoint_dir, exist_ok=True)
+
     initial_iter  = 0
     best_val_loss = float("inf")
-    max_history   = getattr(train_cfg, "loss_history_size", 100_000)
-    train_losses: deque = deque(maxlen=max_history)
+    train_losses: deque = deque(maxlen=getattr(train_cfg, "loss_history_size", 100_000))
     val_losses:   list  = []
 
     if train_cfg.preload:
@@ -383,26 +414,34 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         )
         if ckpt_path and os.path.isfile(ckpt_path):
             initial_iter, best_val_loss, _tl, val_losses = load_checkpoint(
-                ckpt_path, model, optimizer, scaler, device # type: ignore
+                ckpt_path, raw_model, optimizer, scaler, device  # type: ignore
             )
             train_losses.extend(_tl)
-        else:
+        elif main:
             print("Nessun checkpoint trovato, parto da zero.")
 
-    # ── AsyncLogger ───────────────────────────────────────────────────────
-    log_path = os.path.join(train_cfg.checkpoint_dir, "training.log")
-    logger   = AsyncLogger(log_path, flush_every=10)
-    print(f"Log asincrono -> {log_path}")
+    if use_ddp:
+        for param in model.parameters():
+            dist.broadcast(param.data, src=0)
 
-    # ── Loop principale ────────────────────────────────────────────────────
-    print(f"\nAvvio training -> {train_cfg.max_iters} optimizer steps\n")
+    # Logger 
+    logger = None
+    if main:
+        log_path = os.path.join(train_cfg.checkpoint_dir, "training.log")
+        logger   = AsyncLogger(log_path, flush_every=10)
+        print(f"Log -> {log_path}\nAvvio training -> {train_cfg.max_iters} optimizer steps\n")
 
+    # Loop
     model.train()
     start_time = time.time()
     train_iter = iter(train_loader)
     accum_loss = 0.0
 
-    pbar = tqdm(range(initial_iter, train_cfg.max_iters), desc="Harold v0.4")
+    pbar = tqdm(
+        range(initial_iter, train_cfg.max_iters),
+        desc="Harold v0.4" + (" DDP" if use_ddp else ""),
+        disable=not main,
+    )
 
     for iter_num in pbar:
         lr = get_lr(iter_num, train_cfg)
@@ -414,7 +453,6 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         step_loss_sum, step_score_sum, step_ce_sum, valid_count, train_iter = (
             _run_grad_accum(trainer, train_iter, train_loader, train_cfg, scaler, device)
         )
-
         if valid_count == 0:
             continue
 
@@ -423,164 +461,101 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
         scaler.step(optimizer)
         scaler.update()
-        model.update_router_biases()
+        raw_model.update_router_biases()
 
         avg_loss  = step_loss_sum  / valid_count
         avg_score = step_score_sum / valid_count
         avg_ce    = step_ce_sum    / valid_count
-
         accum_loss += avg_loss
         train_losses.append(avg_loss)
 
-        pbar.set_postfix({
-            "loss":  f"{avg_loss:.4f}",
-            "score": f"{avg_score:.4f}",
-            "lr":    f"{lr:.2e}",
-            "grad":  f"{grad_norm:.2f}",
-        })
+        if main:
+            pbar.set_postfix({"loss": f"{avg_loss:.4f}", "score": f"{avg_score:.4f}",
+                              "lr": f"{lr:.2e}", "grad": f"{grad_norm:.2f}"})
+            if logger:
+                logger.log({"type": "train", "iter": iter_num,
+                            "loss": round(avg_loss, 6), "score": round(avg_score, 6),
+                            "ce": round(avg_ce, 6), "lr": lr,
+                            "grad_norm": round(float(grad_norm), 6),
+                            "elapsed_min": round((time.time() - start_time) / 60, 2)})
 
-        logger.log({
-            "type":        "train",
-            "iter":        iter_num,
-            "loss":        round(avg_loss,  6),
-            "score":       round(avg_score, 6),
-            "ce":          round(avg_ce,    6),
-            "lr":          lr,
-            "grad_norm":   round(float(grad_norm), 6),
-            "elapsed_min": round((time.time() - start_time) / 60, 2),
-        })
-
+        # Val
         if iter_num % train_cfg.eval_interval == 0 or iter_num == train_cfg.max_iters - 1:
             if iter_num == 0:
                 continue
 
-            val_loss   = estimate_loss(model, train_cfg, val_loader, pad_token_id, iter_num, logger) # type: ignore
+            local_val = estimate_loss(
+                raw_model, train_cfg, val_loader, pad_token_id,
+                iter_num=iter_num, logger=logger if main else None,
+            )
+
+            if use_ddp:
+                val_tensor = torch.tensor(local_val, device=device)
+                val_loss   = float(_all_reduce_mean(val_tensor, world_size).item())
+            else:
+                val_loss = local_val
+
             val_losses.append(val_loss)
             avg_train  = accum_loss / max(train_cfg.eval_interval, 1)
             accum_loss = 0.0
             elapsed    = (time.time() - start_time) / 60
 
-            print(
-                f"\n[iter {iter_num:7d}] "
-                f"train={avg_train:.4f}  val={val_loss:.4f}  "
-                f"lr={lr:.2e}  elapsed={elapsed:.1f}min"
-            )
+            if main:
+                print(f"\n[iter {iter_num:7d}] train={avg_train:.4f}  val={val_loss:.4f}  "
+                      f"lr={lr:.2e}  elapsed={elapsed:.1f}min")
+                if logger:
+                    logger.log({"type": "val", "iter": iter_num,
+                                "train_loss": round(avg_train, 6), "val_loss": round(val_loss, 6),
+                                "lr": lr, "elapsed_min": round(elapsed, 2)})
 
-            logger.log({
-                "type":        "val",
-                "iter":        iter_num,
-                "train_loss":  round(avg_train, 6),
-                "val_loss":    round(val_loss,  6),
-                "lr":          lr,
-                "elapsed_min": round(elapsed, 2),
-            })
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_path     = os.path.join(
-                    train_cfg.checkpoint_dir,
-                    f"{train_cfg.checkpoint_prefix}_best.pt",
-                )
-                save_checkpoint(
-                    best_path, model, optimizer, scaler, # type: ignore
-                    iter_num, val_loss, model_cfg, train_cfg,
-                    train_losses, val_losses,
-                    push_hf=True,
-                )
-                print(f"  ★ Best val loss: {val_loss:.4f} → {best_path}")
-                train_cfg.write_latest(iter_num, best_path)
-                logger.log({
-                    "type":     "best_checkpoint",
-                    "iter":     iter_num,
-                    "val_loss": round(val_loss, 6),
-                    "path":     best_path,
-                })
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_path = os.path.join(train_cfg.checkpoint_dir,
+                                             f"{train_cfg.checkpoint_prefix}_best.pt")
+                    save_checkpoint(best_path, raw_model, optimizer, scaler,  # type: ignore
+                                    iter_num, val_loss, model_cfg, train_cfg,
+                                    train_losses, val_losses, push_hf=True)
+                    print(f"  ★ Best val loss: {val_loss:.4f} → {best_path}")
+                    train_cfg.write_latest(iter_num, best_path)
+                    if logger:
+                        logger.log({"type": "best_checkpoint", "iter": iter_num,
+                                    "val_loss": round(val_loss, 6), "path": best_path})
 
             model.train()
 
-        if iter_num > 0 and iter_num % train_cfg.save_every == 0:
+        # Checkpoint periodico
+        if iter_num > 0 and iter_num % train_cfg.save_every == 0 and main:
             p = train_cfg.ckpt_path(iter_num)
-            save_checkpoint(
-                p, model, optimizer, scaler, # type: ignore
-                iter_num, best_val_loss, model_cfg, train_cfg,
-                train_losses, val_losses,
-                full=False,   # periodico: solo modello, ~3GB invece di 8GB
-            )
+            save_checkpoint(p, raw_model, optimizer, scaler,  # type: ignore
+                            iter_num, best_val_loss, model_cfg, train_cfg,
+                            train_losses, val_losses, full=False)
             train_cfg.write_latest(iter_num, p)
             print(f"  Checkpoint periodico → {p}")
-            logger.log({"type": "periodic_checkpoint", "iter": iter_num, "path": p})
+            if logger:
+                logger.log({"type": "periodic_checkpoint", "iter": iter_num, "path": p})
 
-    # ── Finale ────────────────────────────────────────────────────────────
     elapsed    = (time.time() - start_time) / 60
-    final_path = os.path.join(
-        train_cfg.checkpoint_dir,
-        f"{train_cfg.checkpoint_prefix}_final.pt",
-    )
-    save_checkpoint(
-        final_path, model, optimizer, scaler, # type: ignore
-        train_cfg.max_iters, best_val_loss, model_cfg, train_cfg,
-        train_losses, val_losses,
-        push_hf=True,
-    )
-    train_cfg.write_latest(train_cfg.max_iters, final_path)
-    logger.log({
-        "type":             "finished",
-        "total_iters":      train_cfg.max_iters,
-        "best_val_loss":    round(best_val_loss, 6),
-        "elapsed_min":      round(elapsed, 2),
-        "final_checkpoint": final_path,
-    })
-    logger.close()
-    print(f"\nTraining completato in {elapsed:.1f} min → {final_path}")
+    final_path = os.path.join(train_cfg.checkpoint_dir,
+                              f"{train_cfg.checkpoint_prefix}_final.pt")
 
-    return {
-        "train_losses":       list(train_losses),
-        "val_losses":         val_losses,
-        "best_val_loss":      best_val_loss,
-        "train_time_minutes": elapsed,
-        "checkpoint_path":    final_path,
-    }
+    if main:
+        save_checkpoint(final_path, raw_model, optimizer, scaler,  # type: ignore
+                        train_cfg.max_iters, best_val_loss, model_cfg, train_cfg,
+                        train_losses, val_losses, push_hf=True)
+        train_cfg.write_latest(train_cfg.max_iters, final_path)
+        if logger:
+            logger.log({"type": "finished", "total_iters": train_cfg.max_iters,
+                        "best_val_loss": round(best_val_loss, 6),
+                        "elapsed_min": round(elapsed, 2), "final_checkpoint": final_path})
+            logger.close()
+        print(f"\nTraining completato in {elapsed:.1f} min → {final_path}")
 
+    if use_ddp:
+        _cleanup_ddp()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────────────────────
-
-def push_to_huggingface(
-    path: str,
-    repo_id:    str = "JHN-MACHINE/harold-v0.4",
-) -> None:
-    """
-    Pusha i checkpoint finali su HuggingFace Hub.
-    Chiamato automaticamente alla fine del training.
-    Se token=None, usa la variabile d'ambiente HF_TOKEN.
-    """
-    import os
-    try:
-        from huggingface_hub import HfApi
-        hf_token = os.environ.get("HF_TOKEN")
-        if not hf_token:
-            print("HF_TOKEN non trovato — skip push HuggingFace.")
-            return
-        api = HfApi()
-        # Crea il repo se non esiste
-        api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, token=hf_token)
-        print(f"\nPush su HuggingFace → {repo_id}")
-        # Upload final checkpoint
-        if os.path.isfile(path):
-            print(f"Uploading {path}...")
-            api.upload_file(
-                path_or_fileobj=path,
-                path_in_repo="harold-v0.4-700M.pt",
-                repo_id=repo_id,
-                repo_type="model",
-                token=hf_token,
-            )
-            print(f"{os.path.basename(path)} pushato")
-        print(f"Push completato → https://huggingface.co/{repo_id}")
-    except Exception as e:
-        print(f"Errore push HuggingFace: {e}")
-        print("Checkpoint salvato localmente — fai il push manualmente.")
+    return {"train_losses": list(train_losses), "val_losses": val_losses,
+            "best_val_loss": best_val_loss, "train_time_minutes": elapsed,
+            "checkpoint_path": final_path}
 
 
 if __name__ == "__main__":
@@ -588,4 +563,5 @@ if __name__ == "__main__":
     model_cfg = get_model_config()
     train_cfg = get_train_config()
     results   = run_training(model_cfg, train_cfg)
-    print(f"Best val loss: {results['best_val_loss']:.4f}")
+    if _is_main(int(os.environ.get("RANK", 0))):
+        print(f"Best val loss: {results['best_val_loss']:.4f}")
