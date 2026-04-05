@@ -45,7 +45,7 @@ from transformers import AutoTokenizer
 
 from config import ModelConfig, TrainConfig, get_model_config, get_train_config
 from model import Harold, build_model
-from dataset import build_loaders, MixedStreamingDataset, load_dataset_config
+from dataset import build_loaders, build_loaders_ddp
 from logger import AsyncLogger
 
 MAX_SKIP_RATIO = 10
@@ -248,37 +248,6 @@ def load_checkpoint(
     del state
     return iter_num, best_val, train_losses, val_losses
 
-
-def _build_loaders_ddp(train_cfg, tokenizer, rank: int) -> Tuple[DataLoader, DataLoader]:
-    cfg         = load_dataset_config("datasets_config.yaml")
-    dataset_cfg = cfg["pretraining"]
-    if _is_main(rank):
-        print("Dataset mix pretraining: " +
-              ", ".join(f"{d['name']} {d['weight']:.0%}" for d in dataset_cfg))
-    rank_seed = 42 + rank * 1000
-
-    train_ds = MixedStreamingDataset(
-        tokenizer=tokenizer, seq_len=train_cfg.seq_len, dataset_cfg=dataset_cfg,
-        split="train", val_every=train_cfg.val_every,
-        seed=rank_seed, buffer_size=train_cfg.stream_buffer_size,
-    )
-    val_ds = MixedStreamingDataset(
-        tokenizer=tokenizer, seq_len=train_cfg.seq_len, dataset_cfg=dataset_cfg,
-        split="val", val_every=train_cfg.val_every,
-        seed=rank_seed, buffer_size=train_cfg.stream_buffer_size,
-    )
-
-    def worker_init_fn(_: int) -> None:
-        wi = torch.utils.data.get_worker_info()
-        if wi is not None:
-            ds = wi.dataset
-            setattr(ds, "seed", getattr(ds, "seed", rank_seed) + wi.id * 31)
-
-    train_loader = DataLoader(train_ds, batch_size=train_cfg.batch_size, pin_memory=True, worker_init_fn=worker_init_fn)
-    val_loader   = DataLoader(val_ds,   batch_size=train_cfg.batch_size, pin_memory=True, worker_init_fn=worker_init_fn)
-    return train_loader, val_loader
-
-
 def _run_grad_accum(
     trainer: DiffusionTrainer, train_iter, train_loader: DataLoader,
     train_cfg: TrainConfig, scaler: torch.GradScaler, device: str,
@@ -337,12 +306,13 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         print(f"Device:         {device}")
         print(f"Dtype:          {train_cfg.dtype}  (scaler={'ON' if train_cfg.use_scaler else 'OFF'})")
         eff = train_cfg.batch_size * train_cfg.grad_accum * world_size
-        print(f"Batch effettivo:{eff}  ({train_cfg.batch_size} x {train_cfg.grad_accum} x {world_size} GPU)")
+        print(f"Batch effettivo:{eff}  ({train_cfg.batch_size} × {train_cfg.grad_accum} × {world_size} GPU)")
         print(f"Beta:           [{model_cfg.diffusion_beta_min}, {model_cfg.diffusion_beta_max}]")
 
     if device.startswith("cuda"):
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
 
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(train_cfg.tokenizer_model)
@@ -381,20 +351,20 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
     raw_model: Harold = model.module if isinstance(model, DDP) else model  # type: ignore
 
-    # Optimizer
+    # Optimizer 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=train_cfg.lr,
         betas=(0.9, 0.95), weight_decay=0.1, fused=True,
     )
     scaler = torch.GradScaler("cuda", enabled=train_cfg.use_scaler)
 
-    # Dataset
+    # Dataset 
     if use_ddp:
-        train_loader, val_loader = _build_loaders_ddp(train_cfg, tokenizer, rank)
+        train_loader, val_loader = build_loaders_ddp(train_cfg, tokenizer, rank)
     else:
         train_loader, val_loader = build_loaders(train_cfg, tokenizer)
 
-    # Trainer
+    # Trainer 
     trainer = DiffusionTrainer(model, model_cfg, train_cfg, pad_token_id=pad_token_id)  # type: ignore
 
     # Checkpoint resume
@@ -438,7 +408,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     accum_loss = 0.0
 
     pbar = tqdm(
-        range(initial_iter, train_cfg.max_iters),
+        range(initial_iter, train_cfg.max_iters + 1),
         desc="Harold v0.4" + (" DDP" if use_ddp else ""),
         disable=not main,
     )
@@ -479,7 +449,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
                             "grad_norm": round(float(grad_norm), 6),
                             "elapsed_min": round((time.time() - start_time) / 60, 2)})
 
-        # Val
+        # Val 
         if iter_num % train_cfg.eval_interval == 0 or iter_num == train_cfg.max_iters - 1:
             if iter_num == 0:
                 continue
