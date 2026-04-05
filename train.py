@@ -333,7 +333,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         print(f"Device:         {device}")
         print(f"Dtype:          {train_cfg.dtype}  (scaler={'ON' if train_cfg.use_scaler else 'OFF'})")
         eff = train_cfg.batch_size * train_cfg.grad_accum * world_size
-        print(f"Batch effettivo:{eff}  ({train_cfg.batch_size} x {train_cfg.grad_accum} x {world_size} GPU)")
+        print(f"Batch effettivo: {eff}  ({train_cfg.batch_size} x {train_cfg.grad_accum} x {world_size} GPU)")
 
     if device.startswith("cuda"):
         torch.backends.cudnn.benchmark = True
@@ -370,7 +370,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
     if main:
         n_params = sum(p.numel() for p in model.parameters()) / 1e6
-        print(f"Harold v0.5 — {n_params:.1f}M parametri totali")
+        print(f"Harold v0.5 — {n_params/1000:.2f}B parametri totali")
 
     active_model: Union[Harold, DDP] = (
         DDP(model, device_ids=[local_rank], output_device=local_rank)
