@@ -1,30 +1,23 @@
 """
-Harold v0.4 — train_sft.py
+Harold v0.5 — train_sft.py
 ===========================
 Supervised Fine-Tuning con Classifier-Free Guidance (CFG).
 
 Pipeline:
-  1. Carica checkpoint del pretraining (harold_v04_final.pt)
+  1. Carica checkpoint del pretraining (harold_v05_final.pt)
   2. Strato 1: oasst2 60% + OpenOrca 40% (mix YAML)
   3. Strato 2: OpenOrca 100% (Q&A chain-of-thought)
 
-CFG:
+CFG (Flow Matching):
   - ctx_emb = mean pooling degli embedding del prompt (context)
   - Con p_uncond=0.1: ctx_emb viene azzerato → training unconditional
-  - In inferenza: ε_guided = ε_uncond + cfg_scale*(ε_cond - ε_uncond)
+  - In inferenza: vel_guided = vel_uncond + cfg_scale*(vel_cond - vel_uncond)
 
-Differenze rispetto al pretraining:
-  - lr molto più basso (2e-5 invece di 1e-4) — adattamento, non riscrittura
-  - Loss solo sulla risposta (mask = response_mask, non padding mask)
-  - ctx_emb passato a compute_loss per il conditioning
-  - cfg_proj trainabile con lr 10× rispetto al resto (nuovo layer, parte da zero)
-
-Differenze rispetto a v3:
-  - GPT-2 tokenizer — pad_token_id = eos_token_id (50256), non 0
-  - encode_context usa pad_token_id del tokenizer invece di padding_idx=0
-  - Dataset da YAML (datasets_config.yaml): oasst2 + OpenOrca invece di UltraChat
-  - Strato 2: filtra dataset_cfg per nome invece di ricostruire SFTDataset a mano
-  - yaml_path passato a build_sft_loaders per coerenza con train.py
+Differenze rispetto a v0.4:
+  - Flow Matching invece di VP-SDE — target è velocità, non rumore
+  - LLaMA tokenizer (NousResearch/Llama-2-7b-hf, 32k vocab)
+  - pad_token_id dal tokenizer invece di hardcoded 50256
+  - save_sft_checkpoint: full=True (best) vs full=False (periodici)
 """
 
 import math
@@ -45,39 +38,23 @@ from model import Harold, build_model
 from dataset import SFTDataset, build_sft_loaders, load_dataset_config
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Context encoder — mean pooling degli embedding del prompt
-# ─────────────────────────────────────────────────────────────────────────────
-
 def encode_context(
     model:        Harold,
-    prompt_ids:   torch.Tensor,  # (B, L_ctx)
-    pad_token_id: int = 50256,   # GPT-2 eos usato come pad
+    prompt_ids:   torch.Tensor,
+    pad_token_id: int,
 ) -> torch.Tensor:
     """
-    Encoda il contesto (prompt) come mean pooling degli embedding.
-
-    Usiamo direttamente token_emb — non un encoder separato.
-    Coerente con lo spazio embedding in cui opera già il modello,
-    e con _encode_context() in sampler.py.
-
-    GPT-2 non ha padding_idx=0 fisso — usiamo pad_token_id del tokenizer
-    (eos_token_id=50256 configurato in __main__ come pad).
-
-    Returns:
-        ctx_emb: (B, D) — context embedding, media sui token non-padding
+    Encoda il contesto come mean pooling degli embedding.
+    Coerente con _encode_context() in sampler.py.
+    Returns: ctx_emb (B, D)
     """
     with torch.no_grad():
-        pad_mask = (prompt_ids != pad_token_id).float()          # (B, L_ctx)
-        emb      = model.token_emb(prompt_ids)                    # (B, L_ctx, D)
+        pad_mask = (prompt_ids != pad_token_id).float()
+        emb      = model.token_emb(prompt_ids)
         n_tokens = pad_mask.sum(dim=1, keepdim=True).clamp(min=1)
-        ctx_emb  = (emb * pad_mask.unsqueeze(-1)).sum(dim=1) / n_tokens  # (B, D)
+        ctx_emb  = (emb * pad_mask.unsqueeze(-1)).sum(dim=1) / n_tokens
     return ctx_emb
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LR schedule
-# ─────────────────────────────────────────────────────────────────────────────
 
 def get_lr(it: int, cfg: SFTConfig, max_iters: int, base_lr: float, min_lr: float) -> float:
     if it < cfg.warmup_iters:
@@ -88,10 +65,6 @@ def get_lr(it: int, cfg: SFTConfig, max_iters: int, base_lr: float, min_lr: floa
     return min_lr + 0.5 * (1.0 + math.cos(math.pi * ratio)) * (base_lr - min_lr)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Valutazione
-# ─────────────────────────────────────────────────────────────────────────────
-
 @torch.no_grad()
 def estimate_sft_loss(
     model:        Harold,
@@ -101,7 +74,7 @@ def estimate_sft_loss(
     iter_num:     int = 0,
     logger:       Optional[AsyncLogger] = None,
 ) -> float:
-    device = next(model.parameters()).device
+    device    = next(model.parameters()).device
     model.eval()
 
     t_values  = [0.1, 0.3, 0.5, 0.7, 0.9]
@@ -124,11 +97,10 @@ def estimate_sft_loss(
             continue
 
         ctx_emb = encode_context(model, prompt_ids, pad_token_id)
-
         B = response_ids.shape[0]
+
         for t_val in t_values:
             fixed_t = torch.full((B,), t_val, dtype=torch.float32, device=device)
-
             with sft_cfg.ctx:
                 _, loss_dict = model.compute_loss(
                     x0=response_ids,
@@ -137,9 +109,8 @@ def estimate_sft_loss(
                     fixed_t=fixed_t,
                     self_cond_prob=0.0,
                     ctx_emb=ctx_emb,
-                    p_uncond=0.0,   # no dropout in val
+                    p_uncond=0.0,
                 )
-
             all_total[t_val].append(loss_dict["total"])
             all_score[t_val].append(loss_dict["score"])
             all_ce[t_val].append(loss_dict["ce"])
@@ -167,10 +138,6 @@ def estimate_sft_loss(
     return sum(valid) / len(valid) if valid else float("inf")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Checkpoint
-# ─────────────────────────────────────────────────────────────────────────────
-
 def save_sft_checkpoint(
     path:         str,
     model:        Harold,
@@ -183,19 +150,22 @@ def save_sft_checkpoint(
     sft_cfg:      SFTConfig,
     train_losses: list,
     val_losses:   list,
+    full:         bool = True,
 ) -> None:
-    torch.save({
-        "stage":           stage,
-        "iter_num":        iter_num,
-        "model_state":     model.state_dict(),
-        "optimizer_state": optimizer.state_dict(),
-        "scaler_state":    scaler.state_dict(),
-        "val_loss":        val_loss,
-        "model_cfg":       model_cfg,
-        "sft_cfg":         sft_cfg,
-        "train_losses":    train_losses,
-        "val_losses":      val_losses,
-    }, path)
+    ckpt = {
+        "stage":        stage,
+        "iter_num":     iter_num,
+        "model_state":  model.state_dict(),
+        "val_loss":     val_loss,
+        "model_cfg":    model_cfg,
+        "sft_cfg":      sft_cfg,
+        "train_losses": train_losses,
+        "val_losses":   val_losses,
+    }
+    if full:
+        ckpt["optimizer_state"] = optimizer.state_dict()
+        ckpt["scaler_state"]    = scaler.state_dict()
+    torch.save(ckpt, path)
 
 
 def load_sft_checkpoint(
@@ -208,7 +178,8 @@ def load_sft_checkpoint(
     print(f"Carico SFT checkpoint: {path}")
     state = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(state["model_state"])
-    optimizer.load_state_dict(state["optimizer_state"])
+    if "optimizer_state" in state:
+        optimizer.load_state_dict(state["optimizer_state"])
     if "scaler_state" in state:
         scaler.load_state_dict(state["scaler_state"])
     stage        = state.get("stage", 1)
@@ -219,10 +190,6 @@ def load_sft_checkpoint(
     del state
     return stage, iter_num, best_val, train_losses, val_losses
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Training stage — loop generico usato per strato 1 e 2
-# ─────────────────────────────────────────────────────────────────────────────
 
 def run_stage(
     stage:        int,
@@ -242,16 +209,12 @@ def run_stage(
     val_losses:   list,
     logger:       AsyncLogger,
 ) -> Tuple[float, list, list]:
-    """
-    Loop di training generico per un singolo strato SFT.
-    Ritorna (best_val_loss, train_losses, val_losses).
-    """
     device     = sft_cfg.device
     start_time = time.time()
     train_iter = iter(train_loader)
     accum_loss = 0.0
 
-    pbar = tqdm(range(initial_iter, max_iters), desc=f"Harold SFT s{stage}")
+    pbar = tqdm(range(initial_iter, max_iters), desc=f"Harold v0.5 SFT s{stage}")
 
     for iter_num in pbar:
         lr = get_lr(iter_num, sft_cfg, max_iters, base_lr, sft_cfg.min_lr)
@@ -337,7 +300,6 @@ def run_stage(
             "elapsed_min": round((time.time() - start_time) / 60, 2),
         })
 
-        # Valutazione
         if iter_num % sft_cfg.eval_interval == 0 or iter_num == max_iters - 1:
             if iter_num == 0:
                 continue
@@ -372,61 +334,51 @@ def run_stage(
                 save_sft_checkpoint(
                     best_path, model, optimizer, scaler,
                     stage, iter_num, val_loss, model_cfg, sft_cfg,
-                    train_losses, val_losses,
+                    train_losses, val_losses, full=True,
                 )
                 print(f"  ★ Best val loss s{stage}: {val_loss:.4f} → {best_path}")
                 sft_cfg.write_latest(stage, iter_num, best_path)
-                logger.log({"type": "best_checkpoint", "stage": stage, "iter": iter_num,
-                            "val_loss": round(val_loss, 6), "path": best_path})
+                logger.log({"type": "best_checkpoint", "stage": stage,
+                            "iter": iter_num, "val_loss": round(val_loss, 6),
+                            "path": best_path})
 
             model.train()
 
-        # Checkpoint periodico
         if iter_num > 0 and iter_num % sft_cfg.save_every == 0:
             p = sft_cfg.ckpt_path(stage, iter_num)
             save_sft_checkpoint(
                 p, model, optimizer, scaler,
                 stage, iter_num, best_val, model_cfg, sft_cfg,
-                train_losses, val_losses,
+                train_losses, val_losses, full=False,
             )
             sft_cfg.write_latest(stage, iter_num, p)
             print(f"  Checkpoint periodico → {p}")
-            logger.log({"type": "periodic_checkpoint", "stage": stage, "iter": iter_num, "path": p})
+            logger.log({"type": "periodic_checkpoint", "stage": stage,
+                        "iter": iter_num, "path": p})
 
     return best_val, train_losses, val_losses
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────────────────────
-
 def run_sft(sft_cfg: SFTConfig) -> dict:
     device = sft_cfg.device
 
-    print("Harold v0.4 — SFT con CFG")
+    print("Harold v0.5 — SFT con CFG (Flow Matching)")
     print(f"Device:         {device}")
     print(f"Dtype:          {sft_cfg.dtype}")
-    print(f"Batch virtuale: {sft_cfg.batch_size} × {sft_cfg.grad_accum} = {sft_cfg.effective_batch_size}")
+    print(f"Batch virtuale: {sft_cfg.batch_size} x {sft_cfg.grad_accum} = {sft_cfg.effective_batch_size}")
     print(f"p_uncond:       {sft_cfg.p_uncond}  (CFG dropout)")
     print(f"ctx_len:        {sft_cfg.max_ctx_len}  resp_len: {sft_cfg.max_resp_len}")
 
-    # ── Tokenizer ─────────────────────────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(sft_cfg.tokenizer_model)
-    # GPT-2 non ha pad token di default — usa eos come pad (coerente con train.py)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    pad_token_id: int = int(tokenizer.pad_token_id)  # 50256
+    pad_token_id: int = int(tokenizer.pad_token_id)
 
-    # ── Modello: carica dal checkpoint di pretraining ─────────────────────
     print(f"\nCarico pretraining checkpoint: {sft_cfg.pretrain_ckpt}")
     state     = torch.load(sft_cfg.pretrain_ckpt, map_location="cpu", weights_only=False)
     model_cfg = state["model_cfg"]
+    model     = build_model(model_cfg).to(device)
 
-    # cfg_proj non è nel checkpoint del pretraining — viene inizializzato
-    # a zero da build_model (come definito in Harold.__init__)
-    model = build_model(model_cfg).to(device)
-
-    # strict=False: cfg_proj inizializzato a zero anche se assente nel checkpoint
     missing, unexpected = model.load_state_dict(state["model_state"], strict=False)
     if missing:
         print(f"Pesi mancanti (nuovi layer): {missing}")
@@ -435,10 +387,9 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
     del state
 
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"Harold v0.4 SFT — {n_params:.1f}M parametri")
+    print(f"Harold v0.5 SFT — {n_params/1000:.2f}B parametri")
 
-    # ── Optimizer ─────────────────────────────────────────────────────────
-    # cfg_proj ha lr 10× — parte da zero, deve imparare velocemente
+    # cfg_proj ha lr 10x — parte da zero, deve imparare velocemente
     cfg_params   = list(model.cfg_proj.parameters())
     other_params = [p for n, p in model.named_parameters()
                     if "cfg_proj" not in n and p.requires_grad]
@@ -454,13 +405,11 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
     )
     scaler = torch.GradScaler("cuda", enabled=sft_cfg.use_scaler)
 
-    # ── AsyncLogger ────────────────────────────────────────────────────────
     os.makedirs(sft_cfg.checkpoint_dir, exist_ok=True)
     log_path = os.path.join(sft_cfg.checkpoint_dir, "training_sft.log")
     logger   = AsyncLogger(log_path)
     print(f"Log SFT → {log_path}")
 
-    # ── Resume dal checkpoint SFT se esiste ───────────────────────────────
     initial_stage = 1
     initial_iter  = 0
     best_val      = float("inf")
@@ -483,11 +432,9 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
         else:
             print("Nessun SFT checkpoint trovato, parto dal pretraining.")
 
-    # ── Strato 1: oasst2 60% + OpenOrca 40% ──────────────────────────────
+    # Strato 1
     if initial_stage <= 1:
-        print(f"\n{'='*60}")
-        print(f"Strato 1: oasst2 + OpenOrca — {sft_cfg.max_iters} step")
-        print(f"{'='*60}\n")
+        print(f"\nStrato 1  — {sft_cfg.max_iters} step\n")
 
         train_loader, val_loader = build_sft_loaders(
             sft_cfg, tokenizer,
@@ -512,24 +459,22 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
             logger=logger,
         )
 
-        s1_final = os.path.join(sft_cfg.checkpoint_dir, f"{sft_cfg.checkpoint_prefix}_s1_final.pt")
+        s1_final = os.path.join(sft_cfg.checkpoint_dir,
+                                f"{sft_cfg.checkpoint_prefix}_s1_final.pt")
         save_sft_checkpoint(
             s1_final, model, optimizer, scaler,
             1, sft_cfg.max_iters, best_val, model_cfg, sft_cfg,
-            train_losses, val_losses,
+            train_losses, val_losses, full=True,
         )
         print(f"\nStrato 1 completato → {s1_final}")
 
-    # ── Strato 2: OpenOrca 100% ────────────────────────────────────────────
-    print(f"\n{'='*60}")
-    print(f"Strato 2: OpenOrca — {sft_cfg.stage2_max_iters} step")
-    print(f"{'='*60}\n")
+    # Strato 2: OpenOrca 100%
+    print(f"\nStrato 2 — {sft_cfg.stage2_max_iters} step\n")
 
-    # Carica dataset_cfg dal YAML e filtra solo openorca per strato 2
     full_cfg  = load_dataset_config("datasets_config.yaml")
     s2_ds_cfg = [d for d in full_cfg["sft"] if d["name"] == "openorca"]
     for d in s2_ds_cfg:
-        d["weight"] = 1.0   # unico dataset, peso normalizzato
+        d["weight"] = 1.0
 
     train_ds2 = SFTDataset(
         tokenizer=tokenizer, dataset_cfg=s2_ds_cfg, split="train",
@@ -543,10 +488,11 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
         max_ctx_turns=sft_cfg.max_ctx_turns,
         val_every=sft_cfg.val_every, seed=43,
     )
-    train_loader2 = DataLoader(train_ds2, batch_size=sft_cfg.batch_size, num_workers=0, pin_memory=True)
-    val_loader2   = DataLoader(val_ds2,   batch_size=sft_cfg.batch_size, num_workers=0, pin_memory=True)
+    train_loader2 = DataLoader(train_ds2, batch_size=sft_cfg.batch_size,
+                               num_workers=0, pin_memory=False)
+    val_loader2   = DataLoader(val_ds2,   batch_size=sft_cfg.batch_size,
+                               num_workers=0, pin_memory=False)
 
-    # LR ridotto per strato 2
     for pg in optimizer.param_groups:
         pg["lr"] = sft_cfg.stage2_lr
 
@@ -565,11 +511,12 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
         logger=logger,
     )
 
-    final_path = os.path.join(sft_cfg.checkpoint_dir, f"{sft_cfg.checkpoint_prefix}_final.pt")
+    final_path = os.path.join(sft_cfg.checkpoint_dir,
+                              f"{sft_cfg.checkpoint_prefix}_final.pt")
     save_sft_checkpoint(
         final_path, model, optimizer, scaler,
         2, sft_cfg.stage2_max_iters, best_val2, model_cfg, sft_cfg,
-        train_losses, val_losses,
+        train_losses, val_losses, full=True,
     )
     sft_cfg.write_latest(2, sft_cfg.stage2_max_iters, final_path)
     logger.log({"type": "finished", "best_val_s1": round(best_val, 6),
