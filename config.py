@@ -62,7 +62,7 @@ def get_model_config() -> ModelConfig:
 class TrainConfig:
     batch_size:    int   = 8
     grad_accum:    int   = 16
-    max_iters:     int   = 50000
+    max_iters:     int   = 20000
     lr:            float = 1e-4
     seq_len:       int   = 1024
     warmup_iters:  int   = 2000
