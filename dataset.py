@@ -65,6 +65,20 @@ def _first_token_id(val) -> int | None:
         return int(val[0]) if val else None
     return int(val)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [OPT-D4] Numero worker ottimale
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _optimal_num_workers(max_workers: int = 4) -> int:
+    """
+    HuggingFace streaming datasets non sono compatibili con multiprocessing
+    workers — causano SIGABRT da signal handler nei subprocess.
+    Fisso a 0 come soluzione definitiva.
+    """
+    return 0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Caricamento configurazione YAML
 # ─────────────────────────────────────────────────────────────────────────────
@@ -453,7 +467,7 @@ def build_loaders(
         seed=42, buffer_size=train_cfg.stream_buffer_size,
     )
 
-    def worker_init_fn(_: int) -> None:
+    def worker_init_fn(worker_id: int) -> None:
         """Partiziona lo stream tra i worker per evitare duplicati."""
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is not None:
@@ -461,17 +475,24 @@ def build_loaders(
             current_seed = getattr(ds, "seed", 42)
             setattr(ds, "seed", current_seed + worker_info.id * 31)
 
-
+    num_workers = _optimal_num_workers(max_workers=4)
+    prefetch    = 2 if num_workers > 0 else None
     train_loader = DataLoader(
         train_ds,
         batch_size=train_cfg.batch_size,
         pin_memory=True,
+        num_workers=num_workers,
+        prefetch_factor=prefetch,
+        persistent_workers=num_workers > 0,
         worker_init_fn=worker_init_fn,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=train_cfg.batch_size,
         pin_memory=True,
+        num_workers=num_workers,
+        prefetch_factor=prefetch,
+        persistent_workers=num_workers > 0,
         worker_init_fn=worker_init_fn,
     )
     return train_loader, val_loader
@@ -501,20 +522,24 @@ def build_sft_loaders(
         max_ctx_turns=max_ctx_turns, val_every=train_cfg.val_every, seed=42,
     )
 
+    num_workers = _optimal_num_workers(max_workers=2)
+    prefetch    = 2 if num_workers > 0 else None
 
     train_loader = DataLoader(
         train_ds,
         batch_size=train_cfg.batch_size,
+        num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=True,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=prefetch,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=train_cfg.batch_size,
+        num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=True,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=prefetch,
     )
     return train_loader, val_loader
 
@@ -558,12 +583,20 @@ def build_loaders_ddp(
             ds = wi.dataset
             setattr(ds, "seed", getattr(ds, "seed", rank_seed) + wi.id * 31)
 
+    num_workers = _optimal_num_workers(max_workers=4)
+    prefetch    = 2 if num_workers > 0 else None
     train_loader = DataLoader(
         train_ds, batch_size=train_cfg.batch_size,
         pin_memory=True, worker_init_fn=worker_init_fn,
+        num_workers=num_workers,
+        prefetch_factor=prefetch,
+        persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
         val_ds, batch_size=train_cfg.batch_size,
         pin_memory=True, worker_init_fn=worker_init_fn,
+        num_workers=num_workers,
+        prefetch_factor=prefetch,
+        persistent_workers=num_workers > 0,
     )
     return train_loader, val_loader
