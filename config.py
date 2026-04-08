@@ -6,6 +6,8 @@ import json
 import torch
 from typing import Optional
 
+HF_FILENAME:  str  = "harold-v0.5-1B.pt"
+HF_REPO_ID: str  = "JHN-MACHINE/harold-v0.5"
 
 @dataclass
 class ModelConfig:

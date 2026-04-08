@@ -53,8 +53,6 @@ def cleanup_old_checkpoints(
 def _push_to_hf(
     path:       str,
     model:      nn.Module,
-    hf_repo_id: str,
-    filename:   str,
     wait:       bool,
 ) -> None:
     """
@@ -65,33 +63,34 @@ def _push_to_hf(
         try:
             from huggingface_hub import HfApi
             from safetensors.torch import save_file
+            from config import HF_REPO_ID, HF_FILENAME
             hf_token = os.environ.get("HF_TOKEN")
             if not hf_token:
                 print("  WARNING HF_TOKEN non trovato -- skip push HuggingFace.")
                 return
             api = HfApi()
-            api.create_repo(repo_id=hf_repo_id, repo_type="model",
+            api.create_repo(repo_id=HF_REPO_ID, repo_type="model",
                             exist_ok=True, token=hf_token)
 
             # Upload checkpoint .pt completo (con optimizer, config, losses)
             api.upload_file(
                 path_or_fileobj=path,
-                path_in_repo=filename,
-                repo_id=hf_repo_id, repo_type="model", token=hf_token,
+                path_in_repo=HF_FILENAME,
+                repo_id=HF_REPO_ID, repo_type="model", token=hf_token,
             )
-            print(f"  OK HuggingFace -> {hf_repo_id}/{filename}")
+            print(f"  OK HuggingFace -> {HF_REPO_ID}/{HF_FILENAME}")
 
             # Upload pesi in .safetensors (solo model state, memory-mappable)
-            sf_filename = filename.replace(".pt", ".safetensors")
+            sf_filename = HF_FILENAME.replace(".pt", ".safetensors")
             sf_path     = path.replace(".pt", ".safetensors")
             save_file(model.state_dict(), sf_path)
             api.upload_file(
                 path_or_fileobj=sf_path,
                 path_in_repo=sf_filename,
-                repo_id=hf_repo_id, repo_type="model", token=hf_token,
+                repo_id=HF_REPO_ID, repo_type="model", token=hf_token,
             )
             os.remove(sf_path)
-            print(f"  OK HuggingFace -> {hf_repo_id}/{sf_filename}")
+            print(f"  OK HuggingFace -> {HF_REPO_ID}/{sf_filename}")
         except BaseException as e:
             print(f"  WARNING Errore push HuggingFace: {e}")
 
@@ -116,8 +115,6 @@ def save_checkpoint(
     full:         bool = True,
     stage:        "int | None" = None,
     push_hf:      bool = False,
-    hf_repo_id:   str  = "JHN-MACHINE/harold-v0.5",
-    hf_filename:  str  = "harold-v0.5-1B.pt",
     wait_hf:      bool = False,
 ) -> None:
     """
@@ -162,7 +159,7 @@ def save_checkpoint(
         )
 
     if push_hf:
-        _push_to_hf(path, model, hf_repo_id, hf_filename, wait=wait_hf)
+        _push_to_hf(path, model, wait=wait_hf)
 
 
 def load_checkpoint(
