@@ -8,6 +8,7 @@ from typing import Optional
 
 HF_FILENAME:  str  = "harold-v0.5-1B.pt"
 HF_REPO_ID: str  = "JHN-MACHINE/harold-v0.5"
+MAX_SKIP_RATIO = 10
 
 @dataclass
 class ModelConfig:
@@ -181,7 +182,7 @@ class SFTConfig:
     cfg_scale:     float = 3.0
     ce_loss_weight:  float = 0.1
     self_cond_prob:  float = 0.5
-    tokenizer_model: str   = "meta-llama/Llama-3.2-1B"
+    tokenizer_model: str   = "NousResearch/Llama-2-7b-hf"
     val_every:       int   = 200
     stage2_max_iters: int   = 5000
     stage2_lr:        float = 1e-5
@@ -189,6 +190,7 @@ class SFTConfig:
     checkpoint_prefix: str = "harold_v05_sft"
     save_every:        int = 1000
     preload:           str = "latest"
+    world_size: int = 0
     device: str = field(init=False)
     dtype:  str = field(init=False)
 

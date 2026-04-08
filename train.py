@@ -44,11 +44,12 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
-from config import ModelConfig, TrainConfig, get_model_config, get_train_config
+from config import MAX_SKIP_RATIO, ModelConfig, TrainConfig, get_model_config, get_train_config
 from model import Harold, build_model
 from dataset import build_loaders, build_loaders_ddp
 from logger import AsyncLogger
-from checkpoint import load_checkpoint, save_checkpoint
+from checkpoint import save_checkpoint, load_checkpoint
+from ddp import DDPContext, is_ddp, is_main, all_reduce_mean, broadcast_model
 
 
 @runtime_checkable
@@ -68,37 +69,6 @@ class TrainableModel(Protocol):
     def update_router_biases(self) -> None: ...
     def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
 
-MAX_SKIP_RATIO = 10
-
-
-def _setup_ddp() -> Tuple[int, int, int]:
-    dist.init_process_group(backend="nccl")
-    rank       = dist.get_rank()
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    world_size = dist.get_world_size()
-    torch.cuda.set_device(local_rank)
-    return rank, local_rank, world_size
-
-
-def _cleanup_ddp() -> None:
-    dist.destroy_process_group()
-
-
-def _is_main(rank: int) -> bool:
-    return rank == 0
-
-
-def _all_reduce_mean(tensor: torch.Tensor, world_size: int) -> torch.Tensor:
-    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    return tensor / world_size
-
-
-def _is_ddp_available() -> bool:
-    return (
-        "RANK" in os.environ
-        and "WORLD_SIZE" in os.environ
-        and int(os.environ.get("WORLD_SIZE", 1)) > 1
-    )
 
 
 class DiffusionTrainer:
@@ -231,42 +201,46 @@ def _run_grad_accum(
 
 def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
-    # Setup
-    use_ddp    = _is_ddp_available()
+    # ── Setup ─────────────────────────────────────────────────────────────
+    use_ddp    = is_ddp()
     rank       = 0
     local_rank = 0
     world_size = 1
 
     if use_ddp:
-        rank, local_rank, world_size = _setup_ddp()
+        ctx = DDPContext().setup()
+        rank, local_rank, world_size = ctx.rank, ctx.local_rank, ctx.world_size
         device = f"cuda:{local_rank}"
     else:
         device = train_cfg.device
 
-    main = _is_main(rank)
+    main = is_main()
 
     if main:
-        print("Harold v0.5 - Flow Matching")
+        print("Harold v0.5 — Flow Matching")
         print(f"Modalità:       {'DDP (' + str(world_size) + ' GPU)' if use_ddp else 'Single-GPU'}")
         print(f"Device:         {device}")
         print(f"Dtype:          {train_cfg.dtype}  (scaler={'ON' if train_cfg.use_scaler else 'OFF'})")
         eff = train_cfg.batch_size * train_cfg.grad_accum * world_size
-        print(f"Batch effettivo: {eff}  ({train_cfg.batch_size} x {train_cfg.grad_accum} x {world_size} GPU)")
+        print(f"Batch effettivo:{eff}  ({train_cfg.batch_size} × {train_cfg.grad_accum} × {world_size} GPU)")
 
     if device.startswith("cuda"):
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
 
-    # Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(train_cfg.tokenizer_model)
+    # ── Tokenizer ─────────────────────────────────────────────────────────
+    tokenizer = AutoTokenizer.from_pretrained(
+        train_cfg.tokenizer_model,
+        token=os.environ.get("HF_TOKEN"),
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     pad_token_id = tokenizer.pad_token_id
     model_cfg.vocab_size    = tokenizer.vocab_size
     model_cfg.mask_token_id = int(getattr(tokenizer, "mask_token_id", None) or tokenizer.vocab_size)
 
-    # Modello
+    # ── Modello ───────────────────────────────────────────────────────────
     model = build_model(model_cfg).to(device)
 
     if not use_ddp:
@@ -288,7 +262,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
     if main:
         n_params = sum(p.numel() for p in model.parameters()) / 1e6
-        print(f"Harold v0.5 — {n_params/1000:.2f}B parametri totali")
+        print(f"Harold v0.5 — {n_params:.1f}M parametri totali")
 
     active_model: Union[Harold, DDP] = (
         DDP(model, device_ids=[local_rank], output_device=local_rank)
@@ -296,14 +270,14 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     )
     raw_model: Harold = cast(Harold, active_model.module if isinstance(active_model, DDP) else active_model)
 
-    # Optimizer
+    # ── Optimizer ─────────────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
         active_model.parameters(), lr=train_cfg.lr,
         betas=(0.9, 0.95), weight_decay=0.1, fused=True,
     )
     scaler = torch.GradScaler("cuda", enabled=train_cfg.use_scaler)
 
-    # Dataset
+    # ── Dataset ───────────────────────────────────────────────────────────
     if use_ddp:
         train_loader, val_loader = build_loaders_ddp(train_cfg, tokenizer, rank)
     else:
@@ -312,7 +286,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     # Trainer 
     trainer = DiffusionTrainer(raw_model, model_cfg, train_cfg, pad_token_id=pad_token_id)
 
-    # Checkpoint resume
+    # ── Checkpoint resume ─────────────────────────────────────────────────
     if main:
         os.makedirs(train_cfg.checkpoint_dir, exist_ok=True)
 
@@ -336,17 +310,16 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
             print("Nessun checkpoint trovato, parto da zero.")
 
     if use_ddp:
-        for param in active_model.parameters():
-            dist.broadcast(param.data, src=0)
+        broadcast_model(raw_model)
 
-    # Logger
+    # ── Logger ────────────────────────────────────────────────────────────
     logger = None
     if main:
         log_path = os.path.join(train_cfg.checkpoint_dir, "training.log")
         logger   = AsyncLogger(log_path, flush_every=10)
         print(f"Log -> {log_path}\nAvvio training -> {train_cfg.max_iters} optimizer steps\n")
 
-    # Loop
+    # ── Loop ──────────────────────────────────────────────────────────────
     active_model.train()
     start_time = time.time()
     train_iter = iter(train_loader)
@@ -394,7 +367,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
                             "grad_norm": round(float(grad_norm), 6),
                             "elapsed_min": round((time.time() - start_time) / 60, 2)})
 
-        # Val
+        # ── Val ───────────────────────────────────────────────────────────
         if iter_num % train_cfg.eval_interval == 0 or iter_num == train_cfg.max_iters - 1:
             if iter_num == 0:
                 continue
@@ -406,7 +379,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
             if use_ddp:
                 val_tensor = torch.tensor(local_val, device=device)
-                val_loss   = float(_all_reduce_mean(val_tensor, world_size).item())
+                val_loss   = float(all_reduce_mean(val_tensor, world_size).item())
             else:
                 val_loss = local_val
 
@@ -438,7 +411,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
             model.train()
 
-        # Checkpoint periodico
+        # ── Checkpoint periodico ──────────────────────────────────────────
         if iter_num > 0 and iter_num % train_cfg.save_every == 0 and main:
             p = train_cfg.ckpt_path(iter_num)
             save_checkpoint(p, raw_model, optimizer, scaler,
@@ -449,6 +422,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
             if logger:
                 logger.log({"type": "periodic_checkpoint", "iter": iter_num, "path": p})
 
+    # ── Finale ────────────────────────────────────────────────────────────
     elapsed    = (time.time() - start_time) / 60
     final_path = os.path.join(train_cfg.checkpoint_dir,
                               f"{train_cfg.checkpoint_prefix}_final.pt")
@@ -466,7 +440,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         print(f"\nTraining completato in {elapsed:.1f} min → {final_path}")
 
     if use_ddp:
-        _cleanup_ddp()
+        ctx.teardown() if use_ddp else None
 
     return {"train_losses": list(train_losses), "val_losses": val_losses,
             "best_val_loss": best_val_loss, "train_time_minutes": elapsed,
@@ -478,5 +452,5 @@ if __name__ == "__main__":
     model_cfg = get_model_config()
     train_cfg = get_train_config()
     results   = run_training(model_cfg, train_cfg)
-    if _is_main(int(os.environ.get("RANK", 0))):
+    if is_main():
         print(f"Best val loss: {results['best_val_loss']:.4f}")
