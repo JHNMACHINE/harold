@@ -48,6 +48,7 @@ from config import ModelConfig, TrainConfig, get_model_config, get_train_config
 from model import Harold, build_model
 from dataset import build_loaders, build_loaders_ddp
 from logger import AsyncLogger
+from checkpoint import load_checkpoint, save_checkpoint
 
 
 @runtime_checkable
@@ -190,108 +191,6 @@ def estimate_loss(
 
     valid = [v for v in per_t_total.values() if v != float("inf")]
     return sum(valid) / len(valid) if valid else float("inf")
-
-
-def _cleanup_old_checkpoints(
-    checkpoint_dir:    str,
-    checkpoint_prefix: str,
-    keep_last:         int = 2,
-) -> None:
-    """Mantiene solo gli ultimi `keep_last` checkpoint periodici."""
-    import glob
-    pattern = os.path.join(checkpoint_dir, f"{checkpoint_prefix}_[0-9]*.pt")
-    checkpoints = sorted(glob.glob(pattern))
-    for old in checkpoints[:-keep_last]:
-        os.remove(old)
-        print(f"  Rimosso checkpoint vecchio: {os.path.basename(old)}")
-
-def save_checkpoint(
-    path:         str,
-    model:        nn.Module,
-    optimizer:    torch.optim.Optimizer,
-    scaler:       torch.GradScaler,
-    iter_num:     int,
-    val_loss:     float,
-    model_cfg:    ModelConfig,
-    train_cfg:    TrainConfig,
-    train_losses: deque,
-    val_losses:   list,
-    push_hf:      bool = False,
-    hf_repo_id:   str  = "JHN-MACHINE/harold-v0.5",
-    full:         bool = True,
-    wait_hf:      bool = False,   # True per final checkpoint — aspetta upload prima di uscire
-) -> None:
-    ckpt = {
-        "iter_num":     iter_num,
-        "model_state":  model.state_dict(),
-        "val_loss":     val_loss,
-        "model_cfg":    model_cfg,
-        "train_cfg":    train_cfg,
-        "train_losses": list(train_losses),
-        "val_losses":   val_losses,
-    }
-    if full:
-        ckpt["optimizer_state"] = optimizer.state_dict()
-        ckpt["scaler_state"]    = scaler.state_dict()
-    tmp_path = path + ".tmp"
-    torch.save(ckpt, tmp_path)
-    os.replace(tmp_path, path)
-    if not full:
-        _cleanup_old_checkpoints(
-            os.path.dirname(path),
-            os.path.basename(path).rsplit("_", 1)[0],
-            keep_last=2,
-        )
- 
-    if push_hf:
-        import threading
-        def _push():
-            try:
-                from huggingface_hub import HfApi
-                hf_token = os.environ.get("HF_TOKEN")
-                if not hf_token:
-                    print("⚠ HF_TOKEN non trovato — skip push HuggingFace.")
-                    return
-                api = HfApi()
-                api.create_repo(repo_id=hf_repo_id, repo_type="model", exist_ok=True, token=hf_token)
-                api.upload_file(
-                    path_or_fileobj=path,
-                    path_in_repo="harold-v0.5-1B.pt",
-                    repo_id=hf_repo_id, repo_type="model", token=hf_token,
-                )
-                print(f"  ✓ HuggingFace → {hf_repo_id}/harold-v0.5-1B.pt")
-            except BaseException as e:
-                print(f"  ⚠ Errore push HuggingFace: {e}")
-        t = threading.Thread(target=_push, daemon=True)
-        t.start()
-        if wait_hf:
-            print("  Attendo upload HuggingFace...")
-            t.join()
-
-
-def load_checkpoint(
-    path:      str,
-    model:     nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scaler:    torch.GradScaler,
-    device:    str,
-) -> Tuple[int, float, list, list]:
-    print(f"Carico checkpoint: {path}")
-    state = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(state["model_state"])
-    if "optimizer_state" in state:
-        optimizer.load_state_dict(state["optimizer_state"])
-        print("  optimizer state caricato")
-    else:
-        print("  optimizer state assente (checkpoint periodico) — riparte da zero")
-    if "scaler_state" in state:
-        scaler.load_state_dict(state["scaler_state"])
-    iter_num     = state.get("iter_num", 0) + 1
-    best_val     = state.get("val_loss", float("inf"))
-    train_losses = state.get("train_losses", [])
-    val_losses   = state.get("val_losses", [])
-    del state
-    return iter_num, best_val, train_losses, val_losses
 
 
 def _run_grad_accum(

@@ -17,7 +17,7 @@ Differenze rispetto a v0.4:
   - Flow Matching invece di VP-SDE — target è velocità, non rumore
   - LLaMA tokenizer (NousResearch/Llama-2-7b-hf, 32k vocab)
   - pad_token_id dal tokenizer invece di hardcoded 50256
-  - save_sft_checkpoint: full=True (best) vs full=False (periodici)
+  - save_checkpoint: full=True (best) vs full=False (periodici)
 """
 
 import math
@@ -36,6 +36,7 @@ from config import ModelConfig, SFTConfig
 from logger import AsyncLogger
 from model import Harold, build_model
 from dataset import SFTDataset, build_sft_loaders, load_dataset_config
+from checkpoint import save_checkpoint, load_checkpoint
 
 
 def encode_context(
@@ -136,59 +137,6 @@ def estimate_sft_loss(
 
     valid = [v for v in per_t_total.values() if v != float("inf")]
     return sum(valid) / len(valid) if valid else float("inf")
-
-
-def save_sft_checkpoint(
-    path:         str,
-    model:        Harold,
-    optimizer:    torch.optim.Optimizer,
-    scaler:       torch.GradScaler,
-    stage:        int,
-    iter_num:     int,
-    val_loss:     float,
-    model_cfg:    ModelConfig,
-    sft_cfg:      SFTConfig,
-    train_losses: list,
-    val_losses:   list,
-    full:         bool = True,
-) -> None:
-    ckpt = {
-        "stage":        stage,
-        "iter_num":     iter_num,
-        "model_state":  model.state_dict(),
-        "val_loss":     val_loss,
-        "model_cfg":    model_cfg,
-        "sft_cfg":      sft_cfg,
-        "train_losses": train_losses,
-        "val_losses":   val_losses,
-    }
-    if full:
-        ckpt["optimizer_state"] = optimizer.state_dict()
-        ckpt["scaler_state"]    = scaler.state_dict()
-    torch.save(ckpt, path)
-
-
-def load_sft_checkpoint(
-    path:      str,
-    model:     Harold,
-    optimizer: torch.optim.Optimizer,
-    scaler:    torch.GradScaler,
-    device:    str,
-) -> Tuple[int, int, float, list, list]:
-    print(f"Carico SFT checkpoint: {path}")
-    state = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(state["model_state"])
-    if "optimizer_state" in state:
-        optimizer.load_state_dict(state["optimizer_state"])
-    if "scaler_state" in state:
-        scaler.load_state_dict(state["scaler_state"])
-    stage        = state.get("stage", 1)
-    iter_num     = state.get("iter_num", 0) + 1
-    best_val     = state.get("val_loss", float("inf"))
-    train_losses = state.get("train_losses", [])
-    val_losses   = state.get("val_losses", [])
-    del state
-    return stage, iter_num, best_val, train_losses, val_losses
 
 
 def run_stage(
@@ -331,10 +279,10 @@ def run_stage(
                     sft_cfg.checkpoint_dir,
                     f"{sft_cfg.checkpoint_prefix}_s{stage}_best.pt",
                 )
-                save_sft_checkpoint(
+                save_checkpoint(
                     best_path, model, optimizer, scaler,
-                    stage, iter_num, val_loss, model_cfg, sft_cfg,
-                    train_losses, val_losses, full=True,
+                    iter_num, val_loss, model_cfg, sft_cfg,
+                    train_losses, val_losses, full=True, stage=stage,
                 )
                 print(f"  ★ Best val loss s{stage}: {val_loss:.4f} → {best_path}")
                 sft_cfg.write_latest(stage, iter_num, best_path)
@@ -346,10 +294,10 @@ def run_stage(
 
         if iter_num > 0 and iter_num % sft_cfg.save_every == 0:
             p = sft_cfg.ckpt_path(stage, iter_num)
-            save_sft_checkpoint(
+            save_checkpoint(
                 p, model, optimizer, scaler,
-                stage, iter_num, best_val, model_cfg, sft_cfg,
-                train_losses, val_losses, full=False,
+                iter_num, best_val, model_cfg, sft_cfg,
+                train_losses, val_losses, full=False, stage=stage,
             )
             sft_cfg.write_latest(stage, iter_num, p)
             print(f"  Checkpoint periodico → {p}")
@@ -365,7 +313,7 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
     print("Harold v0.5 — SFT con CFG (Flow Matching)")
     print(f"Device:         {device}")
     print(f"Dtype:          {sft_cfg.dtype}")
-    print(f"Batch virtuale: {sft_cfg.batch_size} x {sft_cfg.grad_accum} = {sft_cfg.effective_batch_size}")
+    print(f"Batch virtuale: {sft_cfg.batch_size} × {sft_cfg.grad_accum} = {sft_cfg.effective_batch_size}")
     print(f"p_uncond:       {sft_cfg.p_uncond}  (CFG dropout)")
     print(f"ctx_len:        {sft_cfg.max_ctx_len}  resp_len: {sft_cfg.max_resp_len}")
 
@@ -387,9 +335,12 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
     del state
 
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"Harold v0.5 SFT — {n_params/1000:.2f}B parametri")
+    if n_params >= 1000:
+        print(f"Harold v0.5 SFT — {n_params/1000:.2f}B parametri")
+    else:
+        print(f"Harold v0.5 SFT — {n_params:.1f}M parametri")
 
-    # cfg_proj ha lr 10x — parte da zero, deve imparare velocemente
+    # cfg_proj ha lr 10× — parte da zero, deve imparare velocemente
     cfg_params   = list(model.cfg_proj.parameters())
     other_params = [p for n, p in model.named_parameters()
                     if "cfg_proj" not in n and p.requires_grad]
@@ -426,15 +377,15 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
             ckpt_path = sft_cfg.preload
 
         if ckpt_path and os.path.isfile(ckpt_path):
-            initial_stage, initial_iter, best_val, train_losses, val_losses = load_sft_checkpoint(
-                ckpt_path, model, optimizer, scaler, device
+            initial_stage, initial_iter, best_val, train_losses, val_losses = load_checkpoint(
+                ckpt_path, model, optimizer, scaler, device, load_stage=True
             )
         else:
             print("Nessun SFT checkpoint trovato, parto dal pretraining.")
 
     # Strato 1
     if initial_stage <= 1:
-        print(f"\nStrato 1  — {sft_cfg.max_iters} step\n")
+        print(f"\nStrato 1: oasst2 + OpenOrca — {sft_cfg.max_iters} step\n")
 
         train_loader, val_loader = build_sft_loaders(
             sft_cfg, tokenizer,
@@ -461,15 +412,15 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
 
         s1_final = os.path.join(sft_cfg.checkpoint_dir,
                                 f"{sft_cfg.checkpoint_prefix}_s1_final.pt")
-        save_sft_checkpoint(
+        save_checkpoint(
             s1_final, model, optimizer, scaler,
-            1, sft_cfg.max_iters, best_val, model_cfg, sft_cfg,
-            train_losses, val_losses, full=True,
+            sft_cfg.max_iters, best_val, model_cfg, sft_cfg,
+            train_losses, val_losses, full=True, stage=1,
         )
         print(f"\nStrato 1 completato → {s1_final}")
 
     # Strato 2: OpenOrca 100%
-    print(f"\nStrato 2 — {sft_cfg.stage2_max_iters} step\n")
+    print(f"\nStrato 2: OpenOrca — {sft_cfg.stage2_max_iters} step\n")
 
     full_cfg  = load_dataset_config("datasets_config.yaml")
     s2_ds_cfg = [d for d in full_cfg["sft"] if d["name"] == "openorca"]
@@ -513,10 +464,10 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
 
     final_path = os.path.join(sft_cfg.checkpoint_dir,
                               f"{sft_cfg.checkpoint_prefix}_final.pt")
-    save_sft_checkpoint(
+    save_checkpoint(
         final_path, model, optimizer, scaler,
-        2, sft_cfg.stage2_max_iters, best_val2, model_cfg, sft_cfg,
-        train_losses, val_losses, full=True,
+        sft_cfg.stage2_max_iters, best_val2, model_cfg, sft_cfg,
+        train_losses, val_losses, stage=2,
     )
     sft_cfg.write_latest(2, sft_cfg.stage2_max_iters, final_path)
     logger.log({"type": "finished", "best_val_s1": round(best_val, 6),
