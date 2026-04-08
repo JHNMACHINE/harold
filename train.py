@@ -192,6 +192,19 @@ def estimate_loss(
     return sum(valid) / len(valid) if valid else float("inf")
 
 
+def _cleanup_old_checkpoints(
+    checkpoint_dir:    str,
+    checkpoint_prefix: str,
+    keep_last:         int = 2,
+) -> None:
+    """Mantiene solo gli ultimi `keep_last` checkpoint periodici."""
+    import glob
+    pattern = os.path.join(checkpoint_dir, f"{checkpoint_prefix}_[0-9]*.pt")
+    checkpoints = sorted(glob.glob(pattern))
+    for old in checkpoints[:-keep_last]:
+        os.remove(old)
+        print(f"  Rimosso checkpoint vecchio: {os.path.basename(old)}")
+
 def save_checkpoint(
     path:         str,
     model:        nn.Module,
@@ -223,6 +236,12 @@ def save_checkpoint(
     tmp_path = path + ".tmp"
     torch.save(ckpt, tmp_path)
     os.replace(tmp_path, path)
+    if not full:
+        _cleanup_old_checkpoints(
+            os.path.dirname(path),
+            os.path.basename(path).rsplit("_", 1)[0],
+            keep_last=2,
+        )
  
     if push_hf:
         import threading
