@@ -69,10 +69,11 @@ pretraining:
     text_field: text
     weight: 0.12
 
-  - name: github_code
-    path: codeparrot/github-code
+  - name: starcoderdata
+    path: bigcode/starcoderdata
+    config: python
     split: train
-    text_field: code
+    text_field: content
     weight: 0.03
 
   - name: openmath
