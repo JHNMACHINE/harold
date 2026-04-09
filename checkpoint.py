@@ -26,6 +26,8 @@ from typing import Union
 import torch
 import torch.nn as nn
 
+from config import HF_FILENAME, HF_REPO_ID
+
 
 def cleanup_old_checkpoints(
     checkpoint_dir:    str,
@@ -161,41 +163,88 @@ def save_checkpoint(
     if push_hf:
         _push_to_hf(path, model, wait=wait_hf)
 
+def _default_result(load_stage: bool) -> tuple:
+    """Risultato di default per training da zero."""
+    if load_stage:
+        return 1, 0, float("inf"), [], []
+    return 0, float("inf"), [], []
+
+def _load_from_hf(
+    path:       str,
+) -> bool:
+    """
+    Scarica il checkpoint da HuggingFace e lo salva in path.
+    Ritorna True se il download è riuscito.
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+        hf_repo_id, hf_filename = HF_REPO_ID, HF_FILENAME
+        hf_token = os.environ.get("HF_TOKEN")
+        print(f"  Checkpoint locale non trovato — scarico da {hf_repo_id}/{hf_filename}...")
+        downloaded = hf_hub_download(
+            repo_id=hf_repo_id,
+            filename=hf_filename,
+            token=hf_token,
+            local_dir=os.path.dirname(path) or ".",
+        )
+        # Rinomina nel path atteso se necessario
+        if downloaded != path:
+            import shutil
+            shutil.move(downloaded, path)
+        print(f"  Scaricato -> {path}")
+        return True
+    except Exception as e:
+        print(f"  Download HuggingFace fallito: {e}")
+        return False
+
 
 def load_checkpoint(
-    path:       str,
-    model:      nn.Module,
-    optimizer:  torch.optim.Optimizer,
-    scaler:     torch.GradScaler,
-    device:     str,
-    load_stage: bool = False,
+    path:         str,
+    model:        nn.Module,
+    optimizer:    torch.optim.Optimizer,
+    scaler:       torch.GradScaler,
+    device:       str,
+    load_stage:   bool = False,
 ) -> tuple:
     """
     Carica un checkpoint (pretraining o SFT).
-
+ 
+    Ordine di ricerca:
+      1. File locale in path
+      2. Download da HuggingFace (hf_repo_id/hf_filename)
+      3. Riparte da zero
+ 
     load_stage=False -> (iter_num, best_val, train_losses, val_losses)
     load_stage=True  -> (stage, iter_num, best_val, train_losses, val_losses)
     """
+    # 1. Cerca il file locale
+    if not os.path.isfile(path):
+        # 2. Prova a scaricarlo da HuggingFace
+        if not _load_from_hf(path):
+            # 3. Riparte da zero
+            print("  Nessun checkpoint trovato — parto da zero.")
+            return _default_result(load_stage)
+ 
     print(f"Carico checkpoint: {path}")
     state = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(state["model_state"])
-
+ 
     if "optimizer_state" in state:
         optimizer.load_state_dict(state["optimizer_state"])
         print("  optimizer state caricato")
     else:
         print("  optimizer state assente (checkpoint periodico) -- riparte da zero")
-
+ 
     if "scaler_state" in state:
         scaler.load_state_dict(state["scaler_state"])
-
+ 
     iter_num     = state.get("iter_num", 0) + 1
     best_val     = state.get("val_loss", float("inf"))
     train_losses = state.get("train_losses", [])
     val_losses   = state.get("val_losses", [])
     stage        = state.get("stage", 1)
     del state
-
+ 
     if load_stage:
         return stage, iter_num, best_val, train_losses, val_losses
     return iter_num, best_val, train_losses, val_losses
