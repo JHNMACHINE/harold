@@ -29,7 +29,7 @@ from typing import Union
 import torch
 import torch.nn as nn
 from safetensors.torch import save_model
-
+from huggingface_hub import HfApi
 from config import HF_FILENAME, HF_REPO_ID
 
 
@@ -56,10 +56,10 @@ def cleanup_old_checkpoints(
         print(f"  Rimosso checkpoint vecchio: {os.path.basename(old)}")
 
 
-def _upload_pt(path: str, api: object, hf_repo_id: str, hf_token: str) -> None:
+def _upload_pt(path: str, api: HfApi, hf_repo_id: str, hf_token: str) -> None:
     """Upload del checkpoint .pt completo su HuggingFace."""
     try:
-        api.upload_file(                                     # type: ignore[attr-defined]
+        api.upload_file(                                     
             path_or_fileobj=path,
             path_in_repo=HF_FILENAME,
             repo_id=hf_repo_id, repo_type="model", token=hf_token,
@@ -70,14 +70,14 @@ def _upload_pt(path: str, api: object, hf_repo_id: str, hf_token: str) -> None:
 
 
 def _upload_safetensors(
-    path: str, model: nn.Module, api: object, hf_repo_id: str, hf_token: str,
+    path: str, model: nn.Module, api: HfApi, hf_repo_id: str, hf_token: str,
 ) -> None:
     """Salva e carica i pesi in .safetensors su HuggingFace, poi rimuove il file locale."""
     try:
         sf_filename = HF_FILENAME.replace(".pt", ".safetensors")
         sf_path     = path.replace(".pt", ".safetensors")
         save_model(model, sf_path)
-        api.upload_file(                                     # type: ignore[attr-defined]
+        api.upload_file(                                     
             path_or_fileobj=sf_path,
             path_in_repo=sf_filename,
             repo_id=hf_repo_id, repo_type="model", token=hf_token,
@@ -95,7 +95,6 @@ def _push_to_hf(path: str, model: nn.Module, wait: bool) -> None:
     """
     def _push() -> None:
         try:
-            from huggingface_hub import HfApi
             hf_token = os.environ.get("HF_TOKEN")
             if not hf_token:
                 print("  WARNING HF_TOKEN non trovato -- skip push HuggingFace.")
