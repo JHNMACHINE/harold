@@ -50,13 +50,13 @@ class ValidationScheduler:
         self.stability_threshold = stability_threshold
         self.patience            = patience
 
-        self._train_losses:  deque = deque(maxlen=100)
-        self._val_losses:    deque = deque(maxlen=20)
-        self._stable_count   = 0
-        self._unstable_count = 0
-        self._last_val_iter  = 0
-        self._skip_count     = 0
-        self._total_val      = 0
+        self._train_losses:   deque = deque(maxlen=100)
+        self._val_losses:     deque = deque(maxlen=20)
+        self._stable_count    = 0
+        self._unstable_count  = 0
+        self._last_val_iter   = 0
+        self._skip_count      = 0
+        self._total_val       = 0
 
     def should_validate(
         self,
@@ -280,15 +280,16 @@ class ValidationResult:
 
 
 def run_validation_step(
-    ctx:           "TrainingContext",
-    model_cfg:     ModelConfig,
-    train_cfg:     TrainConfig,
-    val_scheduler: "ValidationScheduler",
-    iter_num:      int,
-    accum_loss:    float,
-    start_time:    float,
-    lr:            float,
-    force_val:     bool,
+    ctx:             "TrainingContext",
+    model_cfg:       ModelConfig,
+    train_cfg:       TrainConfig,
+    val_scheduler:   "ValidationScheduler",
+    iter_num:        int,
+    accum_loss:      float,
+    steps_since_val: int,
+    start_time:      float,
+    lr:              float,
+    force_val:       bool,
 ) -> Optional[ValidationResult]:
     """
     Orchestrazione completa di un singolo step di validation.
@@ -302,7 +303,8 @@ def run_validation_step(
         train_cfg:    configurazione training
         val_scheduler: scheduler adattivo
         iter_num:     iterazione corrente
-        accum_loss:   loss accumulata dall'ultimo full val (per avg_train)
+        accum_loss:      loss accumulata dall'ultimo full val (per avg_train)
+        steps_since_val: numero di step validi dall'ultima val (denominatore avg_train)
         start_time:   timestamp avvio training (per elapsed)
         lr:           learning rate corrente (per logging)
         force_val:    forza validation indipendentemente dallo scheduler
@@ -347,7 +349,7 @@ def run_validation_step(
 
     if ctx.main:
         elapsed   = (time.time() - start_time) / 60
-        avg_train = accum_loss / max(iter_num - val_scheduler.last_val_iter, 1)
+        avg_train = accum_loss / max(steps_since_val, 1)
 
         if val_type == "full":
             ctx.val_losses.append(val_loss)

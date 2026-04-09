@@ -49,7 +49,8 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     ctx.active_model.train()
     start_time = time.time()
     train_iter = iter(ctx.train_loader)
-    accum_loss = 0.0
+    accum_loss      = 0.0
+    steps_since_val = 0
 
     pbar = tqdm(
         range(ctx.initial_iter, train_cfg.max_iters),
@@ -82,7 +83,8 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         avg_loss  = loss_sum  / valid_count
         avg_score = score_sum / valid_count
         avg_ce    = ce_sum    / valid_count
-        accum_loss += avg_loss
+        accum_loss      += avg_loss
+        steps_since_val += 1
         window_losses.append(avg_loss)
         ctx.train_losses.append(avg_loss)
 
@@ -98,18 +100,20 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
         # ── Validation ────────────────────────────────────────────────────
         val_result = run_validation_step(
-            ctx           = ctx,
-            model_cfg     = model_cfg,
-            train_cfg     = train_cfg,
-            val_scheduler = val_scheduler,
-            iter_num      = iter_num,
-            accum_loss    = accum_loss,
-            start_time    = start_time,
-            lr            = lr,
-            force_val     = (iter_num == train_cfg.max_iters - 1),
+            ctx             = ctx,
+            model_cfg       = model_cfg,
+            train_cfg       = train_cfg,
+            val_scheduler   = val_scheduler,
+            iter_num        = iter_num,
+            accum_loss      = accum_loss,
+            steps_since_val = steps_since_val,
+            start_time      = start_time,
+            lr              = lr,
+            force_val       = (iter_num == train_cfg.max_iters - 1),
         )
         if val_result is not None:
-            accum_loss = val_result.accum_loss
+            accum_loss      = val_result.accum_loss
+            steps_since_val = 0
             if val_result.is_best:
                 ctx.best_val_loss = val_result.val_loss
 
