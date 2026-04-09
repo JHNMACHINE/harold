@@ -34,7 +34,6 @@ from typing import Any, Dict, Optional, Tuple, Union, cast, Protocol, runtime_ch
 
 import torch
 import torch.distributed as dist
-import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -48,7 +47,6 @@ from logger import AsyncLogger
 from checkpoint import save_checkpoint, load_checkpoint
 from ddp import DDPContext, is_ddp, is_main, all_reduce_mean, broadcast_model
 from itertools import cycle
-import torch.distributed as dist
 
 @runtime_checkable
 class TrainableModel(Protocol):
@@ -86,6 +84,144 @@ class DiffusionTrainer:
             self_cond_prob=self.train_cfg.self_cond_prob,
         )
         return loss, loss_dict
+
+class ValidationScheduler:
+    """
+    Scheduler intelligente per validation:
+    - Riduce frequenza quando training è stabile
+    - Aumenta frequenza quando loss peggiora
+    - Skip adattivo basato su trend e varianza
+    """
+    
+    def __init__(
+        self,
+        base_interval: int = 500,
+        min_interval: int = 100,
+        max_interval: int = 2000,
+        stability_threshold: float = 0.05,  # 5% variazione
+        patience: int = 3,  # Epoche di stabilità prima di aumentare intervallo
+    ):
+        self.base_interval = base_interval
+        self.min_interval = min_interval
+        self.max_interval = max_interval
+        self.current_interval = base_interval
+        self.stability_threshold = stability_threshold
+        self.patience = patience
+        
+        # Tracking metriche
+        self.train_losses = deque(maxlen=100)
+        self.val_losses = deque(maxlen=20)
+        self.stable_counter = 0
+        self.unstable_counter = 0
+        self.last_val_iter = 0
+        self.skip_count = 0
+        self.total_val_calls = 0
+        
+    def should_validate(
+        self, 
+        iter_num: int, 
+        train_loss: float,
+        force: bool = False
+    ) -> Tuple[bool, str]:
+        """
+        Decide se eseguire validation.
+        
+        Returns:
+            (should_validate, reason)
+        """
+        if force:
+            return True, "forced"
+        
+        # Prima validation sempre dopo warmup
+        if self.total_val_calls == 0:
+            if iter_num >= self.base_interval:
+                return True, "first_validation"
+            return False, "waiting_warmup"
+        
+        # Aggiorna statistiche
+        self.train_losses.append(train_loss)
+        
+        # Calcola metriche di stabilità
+        if len(self.train_losses) >= 10:
+            recent_losses = list(self.train_losses)[-10:]
+            mean_loss = sum(recent_losses) / len(recent_losses)
+            std_loss = torch.tensor(recent_losses).std().item()
+            cv = std_loss / mean_loss if mean_loss > 0 else 0  # Coefficiente di variazione
+            
+            # Trend recente (pendenza)
+            if len(recent_losses) >= 5:
+                x = list(range(len(recent_losses)))
+                y = recent_losses
+                n = len(x)
+                slope = (n * sum(xi*yi for xi, yi in zip(x, y)) - sum(x) * sum(y)) / \
+                        (n * sum(xi*xi for xi in x) - sum(x)**2)
+            else:
+                slope = 0
+            
+            # Decisione adattiva
+            time_since_last = iter_num - self.last_val_iter
+            
+            # Caso 1: Loss molto stabile → aumenta intervallo
+            if cv < self.stability_threshold and abs(slope) < 0.001:
+                self.stable_counter += 1
+                self.unstable_counter = 0
+                
+                if self.stable_counter >= self.patience:
+                    self.current_interval = min(
+                        self.max_interval,
+                        int(self.current_interval * 1.5)
+                    )
+                    self.stable_counter = 0
+                    
+                if time_since_last < self.current_interval:
+                    self.skip_count += 1
+                    return False, f"stable_loss(cv={cv:.4f})"
+            
+            # Caso 2: Loss instabile o in aumento → riduci intervallo
+            elif cv > self.stability_threshold * 2 or slope > 0.01:
+                self.unstable_counter += 1
+                self.stable_counter = 0
+                
+                if self.unstable_counter >= 2:
+                    self.current_interval = max(
+                        self.min_interval,
+                        int(self.current_interval * 0.7)
+                    )
+                    self.unstable_counter = 0
+                    
+                # Forza validation se molto instabile
+                if cv > 0.2 and time_since_last > self.min_interval:
+                    return True, f"unstable_loss(cv={cv:.4f})"
+            
+            # Caso 3: Normale - segui intervallo corrente
+            else:
+                self.stable_counter = 0
+                self.unstable_counter = 0
+        
+        # Decisione finale basata su intervallo
+        if iter_num - self.last_val_iter >= self.current_interval:
+            return True, f"interval_reached({self.current_interval})"
+        
+        self.skip_count += 1
+        return False, f"skip({self.current_interval - (iter_num - self.last_val_iter)} left)"
+    
+    def record_validation(self, iter_num: int, val_loss: float):
+        """Registra validation eseguita."""
+        self.last_val_iter = iter_num
+        self.total_val_calls += 1
+        self.val_losses.append(val_loss)
+    
+    def get_stats(self) -> dict:
+        """Statistiche per logging."""
+        return {
+            "current_interval": self.current_interval,
+            "total_val_calls": self.total_val_calls,
+            "skip_count": self.skip_count,
+            "skip_rate": self.skip_count / max(1, self.total_val_calls + self.skip_count),
+            "stable_counter": self.stable_counter,
+            "recent_val_losses": list(self.val_losses)[-5:] if self.val_losses else [],
+        }
+
 
 
 def get_lr(it: int, cfg: TrainConfig) -> float:
@@ -172,13 +308,10 @@ def estimate_loss(
     
     valid_batches = 0
     skipped_batches = 0
-    iterator = iter(val_loader)
+    batch_iterator = cycle(val_loader)
     
     while valid_batches < train_cfg.eval_iters:
-        try:
-            batch = next(iterator)
-        except StopIteration:
-            batch = next(iterator)
+        batch = next(batch_iterator)
         
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         mask = (input_ids != pad_token_id)
@@ -252,9 +385,6 @@ def estimate_loss(
     valid = [v for v in per_t_total.values() if v != float("inf")]
     return sum(valid) / len(valid) if valid else float("inf")
 
-
-from itertools import cycle
-import torch.distributed as dist
 
 def _run_grad_accum(
     trainer: DiffusionTrainer, 
@@ -440,6 +570,16 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     # Trainer
     trainer = DiffusionTrainer(raw_model, model_cfg, train_cfg, pad_token_id=pad_token_id)
 
+    val_scheduler = ValidationScheduler(
+        base_interval=train_cfg.eval_interval,
+        min_interval=max(100, train_cfg.eval_interval // 5),
+        max_interval=train_cfg.eval_interval * 4,
+        stability_threshold=0.03,  # 3% variazione
+        patience=3
+    )
+
+    window_losses = deque(maxlen=train_cfg.eval_interval)
+
     # ── Checkpoint resume ─────────────────────────────────────────────────
     if main:
         os.makedirs(train_cfg.checkpoint_dir, exist_ok=True)
@@ -483,6 +623,13 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     )
 
     for iter_num in pbar:
+        # Memory monitoring (ogni 500 iter)
+        if main and iter_num % 500 == 0:
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1e9
+                reserved = torch.cuda.memory_reserved() / 1e9
+                print(f"GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+
         lr = get_lr(iter_num, train_cfg)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
@@ -500,14 +647,16 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         grad_norm = torch.nn.utils.clip_grad_norm_(active_model.parameters(), train_cfg.max_grad_norm)
         scaler.step(optimizer)
         scaler.update()
-        # Aggiorna meno frequentemente
-        if iter_num % 10 == 0:  # ogni N steps
+        
+        if iter_num % 10 == 0:
             raw_model.update_router_biases()
 
         avg_loss  = step_loss_sum  / valid_count
         avg_score = step_score_sum / valid_count
         avg_ce    = step_ce_sum    / valid_count
-        accum_loss += avg_loss
+        
+        # Aggiorna finestra per media mobile
+        window_losses.append(avg_loss)
         train_losses.append(avg_loss)
 
         if main:
@@ -520,82 +669,118 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
                             "grad_norm": round(float(grad_norm), 6),
                             "elapsed_min": round((time.time() - start_time) / 60, 2)})
 
-                # ── Val ───────────────────────────────────────────────────────────
-        do_full_val = (iter_num % train_cfg.eval_interval == 0 or iter_num == train_cfg.max_iters - 1)
-        do_quick_val = (iter_num % (max(100, train_cfg.eval_interval // 2)) == 0)  # Minimo 100 iterazioni
-        
-        if do_full_val or do_quick_val:
+        # Decisione validation
+        current_train_loss = sum(window_losses) / len(window_losses)
+        force_val = (iter_num == train_cfg.max_iters - 1)
+        should_val, reason = val_scheduler.should_validate(
+            iter_num, current_train_loss, force=force_val
+        )
+ 
+        # ── Val ───────────────────────────────────────────────────────────        
+        if should_val:
             if iter_num == 0:
                 continue
             
-            # Memory cleanup intelligente
-            if torch.cuda.is_available():
-                if iter_num % 500 == 0:
-                    torch.cuda.empty_cache()
-                # Monitora pressione memoria
-                reserved = torch.cuda.memory_reserved()
-                max_reserved = torch.cuda.max_memory_reserved()
-                if max_reserved > 0 and reserved / max_reserved > 0.9:
-                    torch.cuda.empty_cache()
-                    if main:
-                        print(f"  [GPU memory cleanup triggered: {reserved/1e9:.1f}GB / {max_reserved/1e9:.1f}GB]")
-
-            # Scegli il tipo di validation
-            if do_full_val:
-                # Validation completa
+            # Memory cleanup
+            if torch.cuda.is_available() and iter_num % 500 == 0:
+                torch.cuda.empty_cache()
+            
+            # Scegli tipo di validation
+            stats = val_scheduler.get_stats()
+            
+            # Alterna: 1 full validation ogni 3, altrimenti single_t
+            if stats["total_val_calls"] % 3 == 0 or force_val or "unstable" in reason:
+                # Validation completa con tutti i t_values
                 local_val = estimate_loss(
                     raw_model, train_cfg, val_loader, pad_token_id,
                     iter_num=iter_num, logger=logger if main else None,
                 )
+                val_type = "full"
+                
             else:
-                # Validation rapida (solo monitoring)
+                # Validation rapida con singolo t_value
                 local_val = estimate_loss_single_t(
                     raw_model, train_cfg, val_loader, pad_token_id, t=0.5
                 )
-                if main:
-                    print(f"  [quick val] t=0.5 loss: {local_val:.4f}")
-
-            # Sincronizza DDP se necessario
+                val_type = "quick"
+            
+            # Sincronizza DDP
             if use_ddp:
                 val_tensor = torch.tensor(local_val, device=device)
                 val_loss = float(all_reduce_mean(val_tensor, world_size).item())
             else:
                 val_loss = local_val
-
-            # Solo per validation completa salviamo metriche
-            if do_full_val:
-                val_losses.append(val_loss)
-                avg_train = accum_loss / max(train_cfg.eval_interval, 1)
-                accum_loss = 0.0
+            
+            # Registra validation
+            val_scheduler.record_validation(iter_num, val_loss)
+            
+            # Logging e checkpoint (solo main process)
+            if main:
                 elapsed = (time.time() - start_time) / 60
-
-                if main:
+                
+                if val_type == "full":
+                    # Usa media della finestra per training loss
+                    avg_train = sum(window_losses) / len(window_losses)
+                    window_losses.clear()
+                    
+                    val_losses.append(val_loss)
                     print(f"\n[iter {iter_num:7d}] train={avg_train:.4f}  val={val_loss:.4f}  "
-                          f"lr={lr:.2e}  elapsed={elapsed:.1f}min")
+                          f"lr={lr:.2e}  elapsed={elapsed:.1f}min  [{val_type}]")
+                    
                     if logger:
-                        logger.log({"type": "val", "iter": iter_num,
-                                    "train_loss": round(avg_train, 6), "val_loss": round(val_loss, 6),
-                                    "lr": lr, "elapsed_min": round(elapsed, 2)})
-
+                        logger.log({
+                            "type": "val",
+                            "iter": iter_num,
+                            "train_loss": round(avg_train, 6),
+                            "val_loss": round(val_loss, 6),
+                            "val_type": val_type,
+                            "reason": reason,
+                            "lr": lr,
+                            "elapsed_min": round(elapsed, 2)
+                        })
+                    
+                    # Checkpoint best model
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
-                        best_path = os.path.join(train_cfg.checkpoint_dir,
-                                                 f"{train_cfg.checkpoint_prefix}_best.pt")
+                        best_path = os.path.join(
+                            train_cfg.checkpoint_dir,
+                            f"{train_cfg.checkpoint_prefix}_best.pt"
+                        )
                         save_checkpoint(best_path, raw_model, optimizer, scaler,
                                         iter_num, val_loss, model_cfg, train_cfg,
                                         train_losses, val_losses, push_hf=True)
                         print(f"  ★ Best val loss: {val_loss:.4f} → {best_path}")
                         train_cfg.write_latest(iter_num, best_path)
+                        
                         if logger:
-                            logger.log({"type": "best_checkpoint", "iter": iter_num,
-                                        "val_loss": round(val_loss, 6), "path": best_path})
-            else:
-                # Per quick val, log minimale
-                if main and logger:
-                    logger.log({"type": "quick_val", "iter": iter_num,
-                                "val_loss": round(val_loss, 6), "lr": lr})
-
+                            logger.log({
+                                "type": "best_checkpoint",
+                                "iter": iter_num,
+                                "val_loss": round(val_loss, 6),
+                                "path": best_path
+                            })
+                else:
+                    # Quick val: logging minimale
+                    print(f"  [quick val] iter={iter_num} loss={val_loss:.4f} ({reason})")
+                    
+                    if logger:
+                        logger.log({
+                            "type": "quick_val",
+                            "iter": iter_num,
+                            "val_loss": round(val_loss, 6),
+                            "reason": reason,
+                            "lr": lr
+                        })
+            
             model.train()
+        else:
+            # Log skip occasionale
+            if main and iter_num % 200 == 0:
+                stats = val_scheduler.get_stats()
+                skip_rate = stats["skip_rate"]
+                if skip_rate > 0.3:
+                    print(f"  [val skip] iter={iter_num} reason={reason} "
+                          f"skip_rate={skip_rate:.1%} interval={stats['current_interval']}")
 
         # ── Checkpoint periodico ──────────────────────────────────────────
         if iter_num > 0 and iter_num % train_cfg.save_every == 0 and main:
