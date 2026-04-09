@@ -32,6 +32,11 @@ from safetensors.torch import save_model
 from huggingface_hub import HfApi
 from core.config import HF_FILENAME, HF_REPO_ID
 
+import sys
+from core import config as _core_config
+from core import model as _core_model
+sys.modules.setdefault("config", _core_config)
+sys.modules.setdefault("model", _core_model)
 
 def cleanup_old_checkpoints(
     checkpoint_dir:    str,
