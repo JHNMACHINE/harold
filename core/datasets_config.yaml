@@ -58,8 +58,7 @@ pretraining:
     weight: 0.13
 
   - name: arxiv
-    path: scientific_papers
-    config: arxiv
+    path: ccdv/arxiv-summarization
     split: train
     text_field: article
     weight: 0.09
