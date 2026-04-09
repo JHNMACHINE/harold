@@ -1,5 +1,5 @@
 """
-Harold v0.5 — checkpoint.py
+Harold v0.6 — checkpoint.py
 ============================
 Gestione centralizzata dei checkpoint per pretraining e SFT.
 
@@ -15,6 +15,9 @@ Pretraining:
 SFT:
   save_checkpoint(..., stage=1)
   stage, iter_num, best_val, train_losses, val_losses = load_checkpoint(..., load_stage=True)
+
+Upload HuggingFace:
+  .pt e .safetensors vengono caricati in parallelo su thread separati.
 """
 
 import glob
@@ -22,9 +25,10 @@ import os
 import threading
 from collections import deque
 from typing import Union
-from safetensors.torch import save_model
+
 import torch
 import torch.nn as nn
+from safetensors.torch import save_model
 
 from config import HF_FILENAME, HF_REPO_ID
 
@@ -52,47 +56,73 @@ def cleanup_old_checkpoints(
         print(f"  Rimosso checkpoint vecchio: {os.path.basename(old)}")
 
 
-def _push_to_hf(
-    path:       str,
-    model:      nn.Module,
-    wait:       bool,
+def _upload_pt(path: str, api: object, hf_repo_id: str, hf_token: str) -> None:
+    """Upload del checkpoint .pt completo su HuggingFace."""
+    try:
+        api.upload_file(                                     # type: ignore[attr-defined]
+            path_or_fileobj=path,
+            path_in_repo=HF_FILENAME,
+            repo_id=hf_repo_id, repo_type="model", token=hf_token,
+        )
+        print(f"  OK HuggingFace -> {hf_repo_id}/{HF_FILENAME}")
+    except BaseException as e:
+        print(f"  WARNING Errore upload .pt: {e}")
+
+
+def _upload_safetensors(
+    path: str, model: nn.Module, api: object, hf_repo_id: str, hf_token: str,
 ) -> None:
+    """Salva e carica i pesi in .safetensors su HuggingFace, poi rimuove il file locale."""
+    try:
+        sf_filename = HF_FILENAME.replace(".pt", ".safetensors")
+        sf_path     = path.replace(".pt", ".safetensors")
+        save_model(model, sf_path)
+        api.upload_file(                                     # type: ignore[attr-defined]
+            path_or_fileobj=sf_path,
+            path_in_repo=sf_filename,
+            repo_id=hf_repo_id, repo_type="model", token=hf_token,
+        )
+        os.remove(sf_path)
+        print(f"  OK HuggingFace -> {hf_repo_id}/{sf_filename}")
+    except BaseException as e:
+        print(f"  WARNING Errore upload .safetensors: {e}")
+
+
+def _push_to_hf(path: str, model: nn.Module, wait: bool) -> None:
     """
-    Upload su HuggingFace in thread separato.
-    Carica sia il checkpoint .pt completo che i pesi in .safetensors.
+    Upload su HuggingFace in thread separati (uno per .pt, uno per .safetensors).
+    I due upload avvengono in parallelo per sfruttare i core CPU disponibili.
     """
     def _push() -> None:
         try:
             from huggingface_hub import HfApi
-            from safetensors.torch import save_file
-            from config import HF_REPO_ID, HF_FILENAME
             hf_token = os.environ.get("HF_TOKEN")
             if not hf_token:
                 print("  WARNING HF_TOKEN non trovato -- skip push HuggingFace.")
                 return
+
             api = HfApi()
-            api.create_repo(repo_id=HF_REPO_ID, repo_type="model",
-                            exist_ok=True, token=hf_token)
-
-            # Upload checkpoint .pt completo (con optimizer, config, losses)
-            api.upload_file(
-                path_or_fileobj=path,
-                path_in_repo=HF_FILENAME,
-                repo_id=HF_REPO_ID, repo_type="model", token=hf_token,
+            api.create_repo(
+                repo_id=HF_REPO_ID, repo_type="model",
+                exist_ok=True, token=hf_token,
             )
-            print(f"  OK HuggingFace -> {HF_REPO_ID}/{HF_FILENAME}")
 
-            # Upload pesi in .safetensors (solo model state, memory-mappable)
-            sf_filename = HF_FILENAME.replace(".pt", ".safetensors")
-            sf_path     = path.replace(".pt", ".safetensors")
-            save_model(model, sf_path)
-            api.upload_file(
-                path_or_fileobj=sf_path,
-                path_in_repo=sf_filename,
-                repo_id=HF_REPO_ID, repo_type="model", token=hf_token,
+            # Lancia i due upload in parallelo
+            t_pt = threading.Thread(
+                target=_upload_pt,
+                args=(path, api, HF_REPO_ID, hf_token),
+                daemon=True,
             )
-            os.remove(sf_path)
-            print(f"  OK HuggingFace -> {HF_REPO_ID}/{sf_filename}")
+            t_sf = threading.Thread(
+                target=_upload_safetensors,
+                args=(path, model, api, HF_REPO_ID, hf_token),
+                daemon=True,
+            )
+            t_pt.start()
+            t_sf.start()
+            t_pt.join()
+            t_sf.join()
+
         except BaseException as e:
             print(f"  WARNING Errore push HuggingFace: {e}")
 
@@ -128,7 +158,7 @@ def save_checkpoint(
     stage=None -> pretraining (cfg = TrainConfig, chiave "train_cfg")
     stage=int  -> SFT (cfg = SFTConfig, chiave "sft_cfg", aggiunge "stage")
 
-    push_hf / wait_hf -> upload HuggingFace opzionale
+    push_hf / wait_hf -> upload HuggingFace opzionale (.pt e .safetensors in parallelo)
     """
     ckpt: dict = {
         "iter_num":     iter_num,
@@ -163,31 +193,29 @@ def save_checkpoint(
     if push_hf:
         _push_to_hf(path, model, wait=wait_hf)
 
+
 def _default_result(load_stage: bool) -> tuple:
     """Risultato di default per training da zero."""
     if load_stage:
         return 1, 0, float("inf"), [], []
     return 0, float("inf"), [], []
 
-def _load_from_hf(
-    path:       str,
-) -> bool:
+
+def _load_from_hf(path: str) -> bool:
     """
     Scarica il checkpoint da HuggingFace e lo salva in path.
     Ritorna True se il download è riuscito.
     """
     try:
         from huggingface_hub import hf_hub_download
-        hf_repo_id, hf_filename = HF_REPO_ID, HF_FILENAME
         hf_token = os.environ.get("HF_TOKEN")
-        print(f"  Checkpoint locale non trovato — scarico da {hf_repo_id}/{hf_filename}...")
+        print(f"  Checkpoint locale non trovato — scarico da {HF_REPO_ID}/{HF_FILENAME}...")
         downloaded = hf_hub_download(
-            repo_id=hf_repo_id,
-            filename=hf_filename,
+            repo_id=HF_REPO_ID,
+            filename=HF_FILENAME,
             token=hf_token,
             local_dir=os.path.dirname(path) or ".",
         )
-        # Rinomina nel path atteso se necessario
         if downloaded != path:
             import shutil
             shutil.move(downloaded, path)
@@ -199,52 +227,49 @@ def _load_from_hf(
 
 
 def load_checkpoint(
-    path:         str,
-    model:        nn.Module,
-    optimizer:    torch.optim.Optimizer,
-    scaler:       torch.GradScaler,
-    device:       str,
-    load_stage:   bool = False,
+    path:       str,
+    model:      nn.Module,
+    optimizer:  torch.optim.Optimizer,
+    scaler:     torch.GradScaler,
+    device:     str,
+    load_stage: bool = False,
 ) -> tuple:
     """
     Carica un checkpoint (pretraining o SFT).
- 
+
     Ordine di ricerca:
       1. File locale in path
-      2. Download da HuggingFace (hf_repo_id/hf_filename)
+      2. Download da HuggingFace (HF_REPO_ID/HF_FILENAME)
       3. Riparte da zero
- 
+
     load_stage=False -> (iter_num, best_val, train_losses, val_losses)
     load_stage=True  -> (stage, iter_num, best_val, train_losses, val_losses)
     """
-    # 1. Cerca il file locale
     if not os.path.isfile(path):
-        # 2. Prova a scaricarlo da HuggingFace
         if not _load_from_hf(path):
-            # 3. Riparte da zero
             print("  Nessun checkpoint trovato — parto da zero.")
             return _default_result(load_stage)
- 
+
     print(f"Carico checkpoint: {path}")
     state = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(state["model_state"])
- 
+
     if "optimizer_state" in state:
         optimizer.load_state_dict(state["optimizer_state"])
         print("  optimizer state caricato")
     else:
-        print("  optimizer state assente (checkpoint periodico) -- riparte da zero")
- 
+        print("  optimizer state assente (checkpoint periodico) — riparte da zero")
+
     if "scaler_state" in state:
         scaler.load_state_dict(state["scaler_state"])
- 
+
     iter_num     = state.get("iter_num", 0)
     best_val     = state.get("val_loss", float("inf"))
     train_losses = state.get("train_losses", [])
     val_losses   = state.get("val_losses", [])
     stage        = state.get("stage", 1)
     del state
- 
+
     if load_stage:
         return stage, iter_num, best_val, train_losses, val_losses
     return iter_num, best_val, train_losses, val_losses
