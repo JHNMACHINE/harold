@@ -90,7 +90,8 @@ class DiffusionTrainer:
 def get_lr(it: int, cfg: TrainConfig) -> float:
     # 1. Gestione limite finale
     if it >= cfg.max_iters:
-        return cfg.min_lr
+        progress = it / cfg.warmup_iters
+        return cfg.min_lr + progress * (cfg.lr - cfg.min_lr)
         
     # 2. Warmup lineare corretto (parte da 0 o da min_lr)
     if it < cfg.warmup_iters:
