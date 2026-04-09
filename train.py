@@ -88,12 +88,28 @@ class DiffusionTrainer:
 
 
 def get_lr(it: int, cfg: TrainConfig) -> float:
-    if it < cfg.warmup_iters:
-        return cfg.lr * max(it, 1) / cfg.warmup_iters
+    # 1. Gestione limite finale
     if it >= cfg.max_iters:
         return cfg.min_lr
-    ratio = (it - cfg.warmup_iters) / max(cfg.max_iters - cfg.warmup_iters, 1)
-    return cfg.min_lr + 0.5 * (1.0 + math.cos(math.pi * ratio)) * (cfg.lr - cfg.min_lr)
+        
+    # 2. Warmup lineare corretto (parte da 0 o da min_lr)
+    if it < cfg.warmup_iters:
+        # FIX: Se it=0, deve fare 0.0 (o min_lr/warmup_ratio)
+        # Usiamo (it + 1) per evitare LR=0 a step 0 se non voluto, 
+        # oppure semplicemente it / warmup_iters se accettiamo LR=0.
+        # Soluzione tipica: iniziare da cfg.min_lr
+        warmup_ratio = it / max(cfg.warmup_iters - 1, 1)
+        return cfg.min_lr + warmup_ratio * (cfg.lr - cfg.min_lr)
+        
+    # 3. Cosine Decay
+    # Assicuriamoci che il primo step di decay sia ESATTAMENTE cfg.lr
+    decay_iters = cfg.max_iters - cfg.warmup_iters
+    if decay_iters <= 0:
+        return cfg.min_lr
+        
+    ratio = (it - cfg.warmup_iters) / decay_iters
+    coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
+    return cfg.min_lr + coeff * (cfg.lr - cfg.min_lr)
 
 
 @torch.no_grad()
