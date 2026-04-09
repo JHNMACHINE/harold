@@ -118,16 +118,21 @@ def estimate_loss(
     iter_num:     int = 0,
     logger:       Optional["AsyncLogger"] = None,
 ) -> float:
-    device   = next(model.parameters()).device
+    device = next(model.parameters()).device
     model.eval()
 
     t_values = [0.1, 0.3, 0.5, 0.7, 0.9]
-    all_total: Dict[float, list] = {t: [] for t in t_values}
-    all_score: Dict[float, list] = {t: [] for t in t_values}
-    all_ce:    Dict[float, list] = {t: [] for t in t_values}
-
+    
+    # Somme e contatori invece di liste
+    sum_total = {t: 0.0 for t in t_values}
+    sum_score = {t: 0.0 for t in t_values}
+    sum_ce = {t: 0.0 for t in t_values}
+    count = {t: 0 for t in t_values}
+    
     iterator = iter(val_loader)
-    for _ in range(train_cfg.eval_iters):
+    valid_batches = 0
+    
+    while valid_batches < train_cfg.eval_iters:
         try:
             batch = next(iterator)
         except StopIteration:
@@ -135,10 +140,13 @@ def estimate_loss(
             batch = next(iterator)
             
         input_ids = batch["input_ids"].to(device, non_blocking=True)
-        mask      = (input_ids != pad_token_id)
+        mask = (input_ids != pad_token_id)
         if mask.sum() == 0:
             continue
+            
         B = input_ids.shape[0]
+        valid_batches += 1
+        
         for t_val in t_values:
             fixed_t = torch.full((B,), t_val, dtype=torch.float32, device=device)
             with train_cfg.ctx:
@@ -147,19 +155,23 @@ def estimate_loss(
                     ce_weight=train_cfg.ce_loss_weight,
                     fixed_t=fixed_t, self_cond_prob=0.0,
                 )
-            all_total[t_val].append(loss_dict["total"])
-            all_score[t_val].append(loss_dict["score"])
-            all_ce[t_val].append(loss_dict["ce"])
+            sum_total[t_val] += loss_dict["total"]
+            sum_score[t_val] += loss_dict["score"]
+            sum_ce[t_val] += loss_dict["ce"]
+            count[t_val] += 1
 
     model.train()
 
-    per_t_total = {t: float(torch.tensor(v).mean()) if v else float("inf") for t, v in all_total.items()}
-    per_t_score = {t: float(torch.tensor(v).mean()) if v else float("inf") for t, v in all_score.items()}
-    per_t_ce    = {t: float(torch.tensor(v).mean()) if v else float("inf") for t, v in all_ce.items()}
+    # Calcola medie
+    per_t_total = {t: sum_total[t] / count[t] if count[t] > 0 else float("inf") for t in t_values}
+    per_t_score = {t: sum_score[t] / count[t] if count[t] > 0 else float("inf") for t in t_values}
+    per_t_ce    = {t: sum_ce[t] / count[t] if count[t] > 0 else float("inf") for t in t_values}
 
-    print("  val total: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_total.items()))
-    print("  val score: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_score.items()))
-    print("  val CE:    " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_ce.items()))
+    # Logging
+    if not is_ddp() or dist.get_rank() == 0:
+        print("  val total: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_total.items()))
+        print("  val score: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_score.items()))
+        print("  val CE:    " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_ce.items()))
 
     if logger is not None:
         logger.log({
