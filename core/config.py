@@ -36,8 +36,8 @@ class ModelConfig:
     dsa_global_every: int = 64
 
     # Sequenza
-    max_seq_len:  int = 4096
-    block_size:   int = 4096
+    max_seq_len: int = 2048
+    block_size:  int = 2048
 
     # Flow Matching
     flow_sigma_min: float = 1e-4
@@ -48,7 +48,7 @@ class ModelConfig:
     # RoPE
     rope_theta:                float = 500000.0
     rope_original_max_seq_len: int   = 1024
-    rope_scale_factor:         float = 4.0
+    rope_scale_factor:         float = 2.0
 
     # Flash Attention 2
     use_flash_attention: bool = True
@@ -70,11 +70,11 @@ def get_model_config() -> ModelConfig:
 
 @dataclass
 class TrainConfig:
-    batch_size:    int   = 4
+    batch_size:    int   = 8
     grad_accum:    int   = 16
     max_iters:     int   = 20000
     lr:            float = 1e-4
-    seq_len:       int   = 4096
+    seq_len:       int   = 1024
     warmup_iters:  int   = 2000
     min_lr:        float = 1e-5
     eval_interval: int   = 500
