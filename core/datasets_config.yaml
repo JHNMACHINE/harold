@@ -1,4 +1,4 @@
-# Harold v0.4 — Dataset Configuration
+# Harold v0.6 — Dataset Configuration
 # =====================================
 # Modifica questo file per cambiare dataset senza toccare il codice Python.
 #
@@ -17,6 +17,16 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Pretraining
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# Mix progettato per Harold v0.6 (1.5B):
+#   - FineWeb-Edu + Wikipedia + C4: base general-purpose di alta qualità
+#   - SlimPajama: diversità tematica e stilistica
+#   - peS2o: paper scientifici open-access, migliora coerenza long-form
+#   - pg19: libri Project Gutenberg, coerenza su sequenze lunghe
+#   - github-code: codice variegato (meglio di CodeContests per 1.5B)
+#   - OpenMathInstruct: ridotto al 3% per evitare overspecialization
+#
+# Rimosso: CodeContests (troppo difficile per 1.5B, rumore > segnale)
 
 pretraining:
 
@@ -32,13 +42,13 @@ pretraining:
     config: 20231101.en
     split: train
     text_field: text
-    weight: 0.20
+    weight: 0.15
 
   - name: slimpajama
     path: DKYoon/SlimPajama-6B
     split: train
     text_field: text
-    weight: 0.25
+    weight: 0.20
 
   - name: c4
     path: allenai/c4
@@ -47,45 +57,77 @@ pretraining:
     text_field: text
     weight: 0.15
 
+  - name: pes2o
+    path: allenai/peS2o
+    split: train
+    text_field: text
+    weight: 0.10
+
+  - name: pg19
+    path: deepmind/pg19
+    split: train
+    text_field: text
+    weight: 0.12
+
+  - name: github_code
+    path: codeparrot/github-code
+    split: train
+    text_field: code
+    weight: 0.03
+
   - name: openmath
     path: nvidia/OpenMathInstruct-1
     split: train
     text_field: generated_solution
-    weight: 0.10
-
-  - name: codecontests
-    path: deepmind/code_contests
-    split: train
-    text_field: description
-    weight: 0.05
-    format: codecontests
+    weight: 0.03  # ridotto al 3% — evita overspecialization in pretraining
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SFT (Supervised Fine-Tuning)
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# Mix aggiornato per il 2026:
+#   - ultrafeedback: preferenze binarizzate di alta qualità (sostituisce oasst2)
+#   - tulu3: mix SFT curato da AllenAI, molto vario
+#   - magpie_ultra: conversazioni sintetiche di alta qualità
+#   - openorca: Q&A chain-of-thought, mantenuto
+#
+# Rimosso: oasst2 (dataset 2023, piccolo, qualità variabile)
 
 sft:
 
-  - name: oasst2
-    path: OpenAssistant/oasst2
-    split_map:
-      train: train
-      val: validation
-    weight: 0.60
-    structure: ranked_pairs
+  - name: ultrafeedback
+    path: HuggingFaceH4/ultrafeedback_binarized
+    split: train_sft
+    weight: 0.35
+    structure: pairs
     fields:
-      role: role
-      text: text
-      rank: rank
-      prompter_role: prompter
-      assistant_role: assistant
+      context: prompt
+      response: chosen
+
+  - name: tulu3
+    path: allenai/tulu-3-sft-mixture
+    split: train
+    weight: 0.30
+    structure: pairs
+    fields:
+      context: prompt
+      response: completion
+
+  - name: magpie_ultra
+    path: argilla/magpie-ultra-v0.1
+    split: train
+    weight: 0.15
+    structure: pairs
+    fields:
+      context: instruction
+      response: response
 
   - name: openorca
     path: Open-Orca/OpenOrca
     split: train
-    weight: 0.40
+    weight: 0.20
     structure: pairs
     fields:
-      context: [system_prompt, question]   
-      separator: " User: "                 
+      context: [system_prompt, question]
+      separator: " User: "
       response: response
