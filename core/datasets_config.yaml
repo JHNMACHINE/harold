@@ -57,11 +57,11 @@ pretraining:
     text_field: text
     weight: 0.13
 
-  - name: pes2o
-    path: allenai/peS2o
-    config: v2
+  - name: arxiv
+    path: scientific_papers
+    config: arxiv
     split: train
-    text_field: text
+    text_field: article
     weight: 0.09
 
   - name: pg19
