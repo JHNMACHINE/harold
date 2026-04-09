@@ -47,7 +47,8 @@ from dataset import build_loaders, build_loaders_ddp
 from logger import AsyncLogger
 from checkpoint import save_checkpoint, load_checkpoint
 from ddp import DDPContext, is_ddp, is_main, all_reduce_mean, broadcast_model
-
+from itertools import cycle
+import torch.distributed as dist
 
 @runtime_checkable
 class TrainableModel(Protocol):
@@ -252,52 +253,108 @@ def estimate_loss(
     return sum(valid) / len(valid) if valid else float("inf")
 
 
+from itertools import cycle
+import torch.distributed as dist
+
 def _run_grad_accum(
-    trainer: DiffusionTrainer, train_iter, train_loader: DataLoader,
-    train_cfg: TrainConfig, scaler: torch.GradScaler, device: str,
-) -> Tuple[float, float, float, int, object]:
-    step_loss_sum = step_score_sum = step_ce_sum = 0.0
+    trainer: DiffusionTrainer, 
+    train_loader: DataLoader,
+    train_cfg: TrainConfig, 
+    scaler: torch.GradScaler, 
+    device: str,
+) -> Tuple[float, float, float, int]:
+    """
+    Versione ottimizzata di gradient accumulation:
+    - Usa cycle iterator (no StopIteration overhead)
+    - Gestione intelligente batch vuoti
+    - Accumulo loss in fp32 per stabilità
+    - Skip rate tracking con soglia adattiva
+    """
+    step_loss_sum = 0.0
+    step_score_sum = 0.0
+    step_ce_sum = 0.0
     valid_count = 0
     skipped_count = 0
-    max_consecutive_skips = train_cfg.grad_accum * MAX_SKIP_RATIO
     consecutive_skips = 0
-
+    
+    # Soglia adattiva per skip consecutivi
+    max_consecutive_skips = max(10, train_cfg.grad_accum * MAX_SKIP_RATIO)
+    
+    # Usa cycle iterator per training (mai StopIteration)
+    # NOTA: train_iter dovrebbe essere creato una volta all'inizio del training
+    # e passato come ciclo infinito
+    if not hasattr(_run_grad_accum, "train_cycle"):
+        _run_grad_accum.train_cycle = cycle(train_loader)
+    
+    train_cycle = _run_grad_accum.train_cycle
+    
+    # Pre-alloca lista per loss scaling (evita divisioni ripetute)
+    grad_accum_inv = 1.0 / train_cfg.grad_accum
+    
     while valid_count < train_cfg.grad_accum:
-        try:
-            batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            batch = next(train_iter)
-
+        batch = next(train_cycle)
+        
+        # Verifica rapida se batch è valido (senza spostare su GPU)
+        if "input_ids" not in batch:
+            skipped_count += 1
+            continue
+            
         input_ids = batch["input_ids"].to(device, non_blocking=True)
+        
         with train_cfg.ctx:
             result = trainer.train_step(input_ids)
-
+        
         if result is None:
             skipped_count += 1
             consecutive_skips += 1
             
-            # Se troppi skip consecutivi, warning ma continua (non resettare)
-            if consecutive_skips > max_consecutive_skips:
-                print(f"WARNING: {consecutive_skips} batch vuoti consecutivi. Dataset pulito?")
-                consecutive_skips = 0  # Reset solo contatore warning
+            # Warning solo se troppi skip consecutivi (evita spam)
+            if consecutive_skips == max_consecutive_skips:
+                if dist.get_rank() == 0:
+                    print(f"WARNING: {consecutive_skips} batch vuoti consecutivi. "
+                          f"Verifica dataset o tokenizzazione.")
+            # Se troppi skip, fai una pausa per evitare loop infinito
+            elif consecutive_skips > max_consecutive_skips * 2:
+                if dist.get_rank() == 0:
+                    print(f"ERROR: Troppi batch vuoti ({consecutive_skips}). "
+                          f"Interruzione gradient accumulation.")
+                break
             continue
         
-        consecutive_skips = 0  # Reset contatore skip
+        # Reset skip counter su batch valido
+        consecutive_skips = 0
+        
         loss, loss_dict = result
-        scaler.scale(loss / train_cfg.grad_accum).backward()
+        
+        # Gradient accumulation con scaling
+        scaled_loss = loss * grad_accum_inv
+        scaler.scale(scaled_loss).backward()
+        
+        # Accumula in fp32 per precisione
         step_loss_sum += loss.item()
         step_score_sum += loss_dict.get("score", 0.0)
         step_ce_sum += loss_dict.get("ce", 0.0)
         valid_count += 1
-
-    # Logga statistiche sugli skip
+    
+    # Logging statistiche skip (solo main process)
     if skipped_count > 0 and dist.get_rank() == 0:
-        skip_rate = skipped_count / (valid_count + skipped_count)
-        if skip_rate > 0.1:  # Più del 10% di batch saltati
-            print(f"  WARNING: {skip_rate*100:.1f}% batch saltati ({skipped_count}/{valid_count+skipped_count})")
-
-    return step_loss_sum, step_score_sum, step_ce_sum, valid_count, train_iter
+        total_batches = valid_count + skipped_count
+        skip_rate = skipped_count / total_batches
+        
+        if skip_rate > 0.2:  # >20% batch saltati
+            print(f"  WARNING: {skip_rate*100:.1f}% batch saltati "
+                  f"({skipped_count}/{total_batches}) - Dataset potrebbe avere problemi")
+        elif skip_rate > 0.05:  # 5-20%
+            # Logga solo ogni tanto per non spamare
+            if valid_count % (train_cfg.grad_accum * 10) == 0:
+                print(f"  Info: {skip_rate*100:.1f}% batch con pochi token validi")
+    
+    # Se valid_count == 0, qualcosa è andato storto
+    if valid_count == 0:
+        raise RuntimeError(f"Gradient accumulation fallita: 0/{train_cfg.grad_accum} batch validi. "
+                          f"Verifica dataset e tokenizzazione.")
+    
+    return step_loss_sum, step_score_sum, step_ce_sum, valid_count
 
 def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
@@ -417,7 +474,6 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     # ── Loop ──────────────────────────────────────────────────────────────
     active_model.train()
     start_time = time.time()
-    train_iter = iter(train_loader)
     accum_loss = 0.0
 
     pbar = tqdm(
@@ -433,8 +489,8 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
         optimizer.zero_grad(set_to_none=True)
 
-        step_loss_sum, step_score_sum, step_ce_sum, valid_count, train_iter = (
-            _run_grad_accum(trainer, train_iter, train_loader, train_cfg, scaler, device)
+        step_loss_sum, step_score_sum, step_ce_sum, valid_count = (
+            _run_grad_accum(trainer, train_loader, train_cfg, scaler, device)
         )
         if valid_count == 0:
             continue
