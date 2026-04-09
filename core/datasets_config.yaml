@@ -69,11 +69,10 @@ pretraining:
     text_field: text
     weight: 0.12
 
-  - name: starcoderdata
-    path: bigcode/starcoderdata
-    config: python
+  - name: python_code
+    path: flytech/python-codes-25k
     split: train
-    text_field: content
+    text_field: output
     weight: 0.03
 
   - name: openmath

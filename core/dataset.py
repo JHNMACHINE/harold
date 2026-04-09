@@ -71,7 +71,18 @@ def _first_token_id(val) -> int | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _optimal_num_workers(max_workers: int = 4) -> int:
-    return 0  # temporaneo per debug
+    """
+    Calcola il numero ottimale di worker in base ai core disponibili.
+    Usa metà dei core fisici, fino a max_workers.
+    Su sistemi con pochi core (es. Colab), ritorna 0 per evitare overhead.
+    """
+    try:
+        n_cpu = os.cpu_count() or 1
+    except Exception:
+        n_cpu = 1
+    if n_cpu <= 2:
+        return 0   # single-process — meno overhead su macchine piccole
+    return min(max_workers, n_cpu // 2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
