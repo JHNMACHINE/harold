@@ -64,7 +64,7 @@ pretraining:
     weight: 0.09
 
   - name: pg19
-    path: deepmind/pg19
+    path: emozilla/pg19
     split: train
     text_field: text
     weight: 0.12
