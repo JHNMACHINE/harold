@@ -55,13 +55,13 @@ pretraining:
     config: en
     split: train
     text_field: text
-    weight: 0.15
+    weight: 0.13
 
   - name: pes2o
     path: allenai/peS2o
     split: train
     text_field: text
-    weight: 0.10
+    weight: 0.09
 
   - name: pg19
     path: deepmind/pg19
