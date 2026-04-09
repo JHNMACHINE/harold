@@ -92,12 +92,12 @@ def _optimal_num_workers(max_workers: int = 4) -> int:
 def load_dataset_config(yaml_path: str = "datasets_config.yaml") -> dict:
     path = Path(yaml_path)
     if not path.is_absolute() and not path.exists():
-        root = Path(__file__).parent.parent
-        path = root / yaml_path
+        # Cerca nella stessa directory di dataset.py (core/)
+        path = Path(__file__).parent / yaml_path
     if not path.exists():
         raise FileNotFoundError(
             f"Dataset config non trovato: {yaml_path}\n"
-            f"Assicurati che datasets_config.yaml sia nella stessa directory."
+            f"Cercato in: {path.resolve()}"
         )
     with open(path) as f:
         cfg = yaml.safe_load(f)
