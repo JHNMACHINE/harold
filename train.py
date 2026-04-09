@@ -90,16 +90,12 @@ class DiffusionTrainer:
 def get_lr(it: int, cfg: TrainConfig) -> float:
     # 1. Gestione limite finale
     if it >= cfg.max_iters:
-        progress = it / cfg.warmup_iters
-        return cfg.min_lr + progress * (cfg.lr - cfg.min_lr)
+        return cfg.min_lr
         
-    # 2. Warmup lineare corretto (parte da 0 o da min_lr)
     if it < cfg.warmup_iters:
-        # FIX: Se it=0, deve fare 0.0 (o min_lr/warmup_ratio)
-        # Usiamo (it + 1) per evitare LR=0 a step 0 se non voluto, 
-        # oppure semplicemente it / warmup_iters se accettiamo LR=0.
-        # Soluzione tipica: iniziare da cfg.min_lr
-        warmup_ratio = it / max(cfg.warmup_iters - 1, 1)
+        if cfg.warmup_iters <= 1:
+            return cfg.lr
+        warmup_ratio = it / (cfg.warmup_iters - 1)
         return cfg.min_lr + warmup_ratio * (cfg.lr - cfg.min_lr)
         
     # 3. Cosine Decay
@@ -135,7 +131,9 @@ def estimate_loss(
         try:
             batch = next(iterator)
         except StopIteration:
-            break
+            iterator = iter(val_loader)
+            batch = next(iterator)
+            
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         mask      = (input_ids != pad_token_id)
         if mask.sum() == 0:
@@ -181,36 +179,47 @@ def _run_grad_accum(
     train_cfg: TrainConfig, scaler: torch.GradScaler, device: str,
 ) -> Tuple[float, float, float, int, object]:
     step_loss_sum = step_score_sum = step_ce_sum = 0.0
-    valid_count = mb_idx = 0
-    max_skip = train_cfg.grad_accum * MAX_SKIP_RATIO
+    valid_count = 0
+    skipped_count = 0
+    max_consecutive_skips = train_cfg.grad_accum * MAX_SKIP_RATIO
+    consecutive_skips = 0
 
     while valid_count < train_cfg.grad_accum:
-        if mb_idx > max_skip:
-            break
         try:
             batch = next(train_iter)
         except StopIteration:
             train_iter = iter(train_loader)
-            batch      = next(train_iter)
+            batch = next(train_iter)
 
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         with train_cfg.ctx:
             result = trainer.train_step(input_ids)
 
         if result is None:
-            mb_idx += 1
+            skipped_count += 1
+            consecutive_skips += 1
+            
+            # Se troppi skip consecutivi, warning ma continua (non resettare)
+            if consecutive_skips > max_consecutive_skips:
+                print(f"WARNING: {consecutive_skips} batch vuoti consecutivi. Dataset pulito?")
+                consecutive_skips = 0  # Reset solo contatore warning
             continue
-
+        
+        consecutive_skips = 0  # Reset contatore skip
         loss, loss_dict = result
         scaler.scale(loss / train_cfg.grad_accum).backward()
-        step_loss_sum  += loss.item()
+        step_loss_sum += loss.item()
         step_score_sum += loss_dict.get("score", 0.0)
-        step_ce_sum    += loss_dict.get("ce",    0.0)
+        step_ce_sum += loss_dict.get("ce", 0.0)
         valid_count += 1
-        mb_idx      += 1
+
+    # Logga statistiche sugli skip
+    if skipped_count > 0 and dist.get_rank() == 0:
+        skip_rate = skipped_count / (valid_count + skipped_count)
+        if skip_rate > 0.1:  # Più del 10% di batch saltati
+            print(f"  WARNING: {skip_rate*100:.1f}% batch saltati ({skipped_count}/{valid_count+skipped_count})")
 
     return step_loss_sum, step_score_sum, step_ce_sum, valid_count, train_iter
-
 
 def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
@@ -379,6 +388,9 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         if iter_num % train_cfg.eval_interval == 0 or iter_num == train_cfg.max_iters - 1:
             if iter_num == 0:
                 continue
+            
+            if iter_num % 1000 == 0:
+                torch.cuda.empty_cache()
 
             local_val = estimate_loss(
                 raw_model, train_cfg, val_loader, pad_token_id,
