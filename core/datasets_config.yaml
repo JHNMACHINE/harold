@@ -100,19 +100,23 @@ sft:
     path: HuggingFaceH4/ultrafeedback_binarized
     split: train_sft
     weight: 0.35
-    structure: pairs
+    structure: multiturn
     fields:
-      context: prompt
-      response: chosen
+      messages: messages
+      role_field: role
+      content_field: content
+      assistant_role: assistant
 
   - name: tulu3
     path: allenai/tulu-3-sft-mixture
     split: train
     weight: 0.30
-    structure: pairs
+    structure: multiturn
     fields:
-      context: prompt
-      response: completion
+      messages: messages
+      role_field: role
+      content_field: content
+      assistant_role: assistant
 
   - name: magpie_ultra
     path: argilla/magpie-ultra-v0.1
