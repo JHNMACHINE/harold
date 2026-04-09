@@ -110,78 +110,144 @@ def get_lr(it: int, cfg: TrainConfig) -> float:
 
 
 @torch.no_grad()
-def estimate_loss(
-    model:        Harold,
-    train_cfg:    TrainConfig,
-    val_loader:   DataLoader,
-    pad_token_id: int = 50256,
-    iter_num:     int = 0,
-    logger:       Optional["AsyncLogger"] = None,
-) -> float:
+def estimate_loss_single_t(model, train_cfg, val_loader, pad_token_id, t=0.5):
+    """Validation ultra-rapida per monitoring frequente."""
     device = next(model.parameters()).device
     model.eval()
+    
+    losses = []
+    for i, batch in enumerate(val_loader):
+        if i >= train_cfg.eval_iters // 2:  # Metà batch
+            break
+        
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        mask = (input_ids != pad_token_id)
+        if mask.sum() < 10:
+            continue
+            
+        fixed_t = torch.full((input_ids.shape[0],), t, device=device)
+        with train_cfg.ctx:
+            _, loss_dict = model.compute_loss(
+                x0=input_ids, mask=mask,
+                ce_weight=train_cfg.ce_loss_weight,
+                fixed_t=fixed_t, self_cond_prob=0.0
+            )
+        losses.append(loss_dict["total"])
+    
+    model.train()
+    return sum(losses) / len(losses) if losses else float("inf")
 
-    t_values = [0.1, 0.3, 0.5, 0.7, 0.9]
+@torch.no_grad()
+def estimate_loss(
+    model: Harold,
+    train_cfg: TrainConfig,
+    val_loader: DataLoader,
+    pad_token_id: int = 50256,
+    iter_num: int = 0,
+    logger: Optional["AsyncLogger"] = None,
+) -> float:
+    """
+    Versione ottimizzata specifica per Harold:
+    - Cache intelligente per fixed_t (evita allocazioni GPU ripetute)
+    - Early stopping su batch vuoti
+    - Riduzione t_values da 5 a 3 (0.3, 0.5, 0.7 sono i più informativi per diffusion)
+    - Accumulo diretto su GPU invece di CPU
+    """
+    device = next(model.parameters()).device
+    model.eval()
     
-    # Somme e contatori invece di liste
-    sum_total = {t: 0.0 for t in t_values}
-    sum_score = {t: 0.0 for t in t_values}
-    sum_ce = {t: 0.0 for t in t_values}
-    count = {t: 0 for t in t_values}
+    # Per Harold, t=0.3, 0.5, 0.7 sono sufficienti (evita estremi poco informativi)
+    t_values = [0.3, 0.5, 0.7]
+    n_t = len(t_values)
     
-    iterator = iter(val_loader)
+    # Accumulatori su GPU (più veloce di CPU)
+    sum_total = torch.zeros(n_t, device=device)
+    sum_score = torch.zeros(n_t, device=device)
+    sum_ce = torch.zeros(n_t, device=device)
+    count = torch.zeros(n_t, device=device)
+    
+    # Cache per tensori fixed_t (evita allocazioni ripetute)
+    t_cache = {}
+    
     valid_batches = 0
+    skipped_batches = 0
+    iterator = iter(val_loader)
     
     while valid_batches < train_cfg.eval_iters:
         try:
             batch = next(iterator)
         except StopIteration:
-            iterator = iter(val_loader)
             batch = next(iterator)
-            
+        
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         mask = (input_ids != pad_token_id)
-        if mask.sum() == 0:
+        
+        # Early skip per batch problematici
+        valid_tokens = mask.sum().item()
+        if valid_tokens < 10:  # Troppo pochi token validi
+            skipped_batches += 1
+            if skipped_batches > 5:  # Massimo 5 skip consecutivi
+                break
             continue
-            
+        
         B = input_ids.shape[0]
         valid_batches += 1
+        skipped_batches = 0
         
-        for t_val in t_values:
-            fixed_t = torch.full((B,), t_val, dtype=torch.float32, device=device)
+        # Processa ogni t_value
+        for idx, t_val in enumerate(t_values):
+            # Cache lookup/creation
+            cache_key = (t_val, B)
+            if cache_key not in t_cache:
+                t_cache[cache_key] = torch.full((B,), t_val, dtype=torch.float32, device=device)
+            fixed_t = t_cache[cache_key]
+            
+            # Forward pass
             with train_cfg.ctx:
                 _, loss_dict = model.compute_loss(
-                    x0=input_ids, mask=mask,
+                    x0=input_ids, 
+                    mask=mask,
                     ce_weight=train_cfg.ce_loss_weight,
-                    fixed_t=fixed_t, self_cond_prob=0.0,
+                    fixed_t=fixed_t, 
+                    self_cond_prob=0.0,  # Validation sempre senza self-conditioning
                 )
-            sum_total[t_val] += loss_dict["total"]
-            sum_score[t_val] += loss_dict["score"]
-            sum_ce[t_val] += loss_dict["ce"]
-            count[t_val] += 1
-
+            
+            # Accumula su GPU
+            sum_total[idx] += loss_dict["total"]
+            sum_score[idx] += loss_dict["score"]
+            sum_ce[idx] += loss_dict["ce"]
+            count[idx] += 1
+    
     model.train()
-
-    # Calcola medie
-    per_t_total = {t: sum_total[t] / count[t] if count[t] > 0 else float("inf") for t in t_values}
-    per_t_score = {t: sum_score[t] / count[t] if count[t] > 0 else float("inf") for t in t_values}
-    per_t_ce    = {t: sum_ce[t] / count[t] if count[t] > 0 else float("inf") for t in t_values}
-
-    # Logging
+    
+    # Calcola medie su GPU
+    count_clamped = count.clamp(min=1)
+    avg_total = (sum_total / count_clamped).cpu().tolist()
+    avg_score = (sum_score / count_clamped).cpu().tolist()
+    avg_ce = (sum_ce / count_clamped).cpu().tolist()
+    
+    per_t_total = {t: avg_total[i] for i, t in enumerate(t_values)}
+    per_t_score = {t: avg_score[i] for i, t in enumerate(t_values)}
+    per_t_ce = {t: avg_ce[i] for i, t in enumerate(t_values)}
+    
+    # Logging (solo main process)
     if not is_ddp() or dist.get_rank() == 0:
-        print("  val total: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_total.items()))
-        print("  val score: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_score.items()))
-        print("  val CE:    " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_ce.items()))
-
+        print(f"  val (optimized, {valid_batches} batches):")
+        print("    total: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_total.items()))
+        print("    score: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_score.items()))
+        print("    CE:    " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_ce.items()))
+    
     if logger is not None:
         logger.log({
-            "type":        "val_detail",
-            "iter":        iter_num,
+            "type": "val_detail",
+            "iter": iter_num,
+            "batches_used": valid_batches,
             "total_per_t": {str(t): round(v, 6) for t, v in per_t_total.items()},
             "score_per_t": {str(t): round(v, 6) for t, v in per_t_score.items()},
-            "ce_per_t":    {str(t): round(v, 6) for t, v in per_t_ce.items()},
+            "ce_per_t": {str(t): round(v, 6) for t, v in per_t_ce.items()},
         })
-
+    
+    # Media pesata sui t_values (tutti stesso peso)
     valid = [v for v in per_t_total.values() if v != float("inf")]
     return sum(valid) / len(valid) if valid else float("inf")
 
@@ -378,7 +444,9 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         grad_norm = torch.nn.utils.clip_grad_norm_(active_model.parameters(), train_cfg.max_grad_norm)
         scaler.step(optimizer)
         scaler.update()
-        raw_model.update_router_biases()
+        # Aggiorna meno frequentemente
+        if iter_num % 10 == 0:  # ogni N steps
+            raw_model.update_router_biases()
 
         avg_loss  = step_loss_sum  / valid_count
         avg_score = step_score_sum / valid_count
@@ -396,50 +464,80 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
                             "grad_norm": round(float(grad_norm), 6),
                             "elapsed_min": round((time.time() - start_time) / 60, 2)})
 
-        # ── Val ───────────────────────────────────────────────────────────
-        if iter_num % train_cfg.eval_interval == 0 or iter_num == train_cfg.max_iters - 1:
+                # ── Val ───────────────────────────────────────────────────────────
+        do_full_val = (iter_num % train_cfg.eval_interval == 0 or iter_num == train_cfg.max_iters - 1)
+        do_quick_val = (iter_num % (max(100, train_cfg.eval_interval // 2)) == 0)  # Minimo 100 iterazioni
+        
+        if do_full_val or do_quick_val:
             if iter_num == 0:
                 continue
             
-            if iter_num % 1000 == 0:
-                torch.cuda.empty_cache()
+            # Memory cleanup intelligente
+            if torch.cuda.is_available():
+                if iter_num % 500 == 0:
+                    torch.cuda.empty_cache()
+                # Monitora pressione memoria
+                reserved = torch.cuda.memory_reserved()
+                max_reserved = torch.cuda.max_memory_reserved()
+                if max_reserved > 0 and reserved / max_reserved > 0.9:
+                    torch.cuda.empty_cache()
+                    if main:
+                        print(f"  [GPU memory cleanup triggered: {reserved/1e9:.1f}GB / {max_reserved/1e9:.1f}GB]")
 
-            local_val = estimate_loss(
-                raw_model, train_cfg, val_loader, pad_token_id,
-                iter_num=iter_num, logger=logger if main else None,
-            )
+            # Scegli il tipo di validation
+            if do_full_val:
+                # Validation completa
+                local_val = estimate_loss(
+                    raw_model, train_cfg, val_loader, pad_token_id,
+                    iter_num=iter_num, logger=logger if main else None,
+                )
+            else:
+                # Validation rapida (solo monitoring)
+                local_val = estimate_loss_single_t(
+                    raw_model, train_cfg, val_loader, pad_token_id, t=0.5
+                )
+                if main:
+                    print(f"  [quick val] t=0.5 loss: {local_val:.4f}")
 
+            # Sincronizza DDP se necessario
             if use_ddp:
                 val_tensor = torch.tensor(local_val, device=device)
-                val_loss   = float(all_reduce_mean(val_tensor, world_size).item())
+                val_loss = float(all_reduce_mean(val_tensor, world_size).item())
             else:
                 val_loss = local_val
 
-            val_losses.append(val_loss)
-            avg_train  = accum_loss / max(train_cfg.eval_interval, 1)
-            accum_loss = 0.0
-            elapsed    = (time.time() - start_time) / 60
+            # Solo per validation completa salviamo metriche
+            if do_full_val:
+                val_losses.append(val_loss)
+                avg_train = accum_loss / max(train_cfg.eval_interval, 1)
+                accum_loss = 0.0
+                elapsed = (time.time() - start_time) / 60
 
-            if main:
-                print(f"\n[iter {iter_num:7d}] train={avg_train:.4f}  val={val_loss:.4f}  "
-                      f"lr={lr:.2e}  elapsed={elapsed:.1f}min")
-                if logger:
-                    logger.log({"type": "val", "iter": iter_num,
-                                "train_loss": round(avg_train, 6), "val_loss": round(val_loss, 6),
-                                "lr": lr, "elapsed_min": round(elapsed, 2)})
-
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    best_path = os.path.join(train_cfg.checkpoint_dir,
-                                             f"{train_cfg.checkpoint_prefix}_best.pt")
-                    save_checkpoint(best_path, raw_model, optimizer, scaler,
-                                    iter_num, val_loss, model_cfg, train_cfg,
-                                    train_losses, val_losses, push_hf=True)
-                    print(f"  ★ Best val loss: {val_loss:.4f} → {best_path}")
-                    train_cfg.write_latest(iter_num, best_path)
+                if main:
+                    print(f"\n[iter {iter_num:7d}] train={avg_train:.4f}  val={val_loss:.4f}  "
+                          f"lr={lr:.2e}  elapsed={elapsed:.1f}min")
                     if logger:
-                        logger.log({"type": "best_checkpoint", "iter": iter_num,
-                                    "val_loss": round(val_loss, 6), "path": best_path})
+                        logger.log({"type": "val", "iter": iter_num,
+                                    "train_loss": round(avg_train, 6), "val_loss": round(val_loss, 6),
+                                    "lr": lr, "elapsed_min": round(elapsed, 2)})
+
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        best_path = os.path.join(train_cfg.checkpoint_dir,
+                                                 f"{train_cfg.checkpoint_prefix}_best.pt")
+                        save_checkpoint(best_path, raw_model, optimizer, scaler,
+                                        iter_num, val_loss, model_cfg, train_cfg,
+                                        train_losses, val_losses, push_hf=True)
+                        print(f"  ★ Best val loss: {val_loss:.4f} → {best_path}")
+                        train_cfg.write_latest(iter_num, best_path)
+                        if logger:
+                            logger.log({"type": "best_checkpoint", "iter": iter_num,
+                                        "val_loss": round(val_loss, 6), "path": best_path})
+            else:
+                # Per quick val, log minimale
+                if main and logger:
+                    logger.log({"type": "quick_val", "iter": iter_num,
+                                "val_loss": round(val_loss, 6), "lr": lr})
 
             model.train()
 
