@@ -6,8 +6,8 @@ import json
 import torch
 from typing import Optional
 
-HF_FILENAME:  str  = "harold-v0.5-1B.pt"
-HF_REPO_ID: str  = "JHN-MACHINE/harold-v0.5"
+HF_FILENAME:  str = "harold-v0.6-1B.pt"
+HF_REPO_ID:   str = "JHN-MACHINE/harold-v0.6"
 MAX_SKIP_RATIO = 10
 
 @dataclass
@@ -24,9 +24,9 @@ class ModelConfig:
     d_ff:       int = 3584
 
     # MoE
-    moe_n_routed_experts:    int = 4
+    moe_n_routed_experts:    int = 8
     moe_top_k:               int = 2
-    ds_moe_n_shared_experts: int = 2
+    ds_moe_n_shared_experts: int = 1
 
     # MLA
     mla_latent_dim: int = 160
@@ -40,7 +40,7 @@ class ModelConfig:
     block_size:  int = 1024
 
     # Flow Matching
-    flow_sigma_min: float = 1e-4   # rumore minimo alla fine della traiettoria
+    flow_sigma_min: float = 1e-4
 
     # Training
     dropout: float = 0.0
@@ -53,8 +53,15 @@ class ModelConfig:
     # Flash Attention 2
     use_flash_attention: bool = True
 
-    # Gradient checkpointing
-    gradient_checkpointing: bool = False
+    # [v0.6-J1] Jamba: pattern ibrido Mamba2 + Attention
+    # Un layer attention ogni `jamba_attn_every` layer.
+    # Con n_layers=36 e jamba_attn_every=4: layer 3,7,11,...,35 → 9 attention, 27 mamba.
+    jamba_attn_every: int = 4
+
+    # [v0.6-J2] Mamba2 iperparametri
+    mamba_d_state:  int = 128   # dimensione dello stato SSM (Mamba2 default: 128)
+    mamba_d_conv:   int = 4     # kernel size della conv1d causale
+    mamba_expand:   int = 2     # expand factor: d_inner = expand * d_model
 
 
 def get_model_config() -> ModelConfig:
@@ -80,8 +87,8 @@ class TrainConfig:
     stream_buffer_size: int   = 1000
     val_every:          int   = 200
 
-    checkpoint_dir:    str = "checkpoints_v5"
-    checkpoint_prefix: str = "harold_v05"
+    checkpoint_dir:    str = "checkpoints_v6"
+    checkpoint_prefix: str = "harold_v06"
     preload:           str = "latest"
     save_every:        int = 5000
 
@@ -165,7 +172,7 @@ def get_latest_weights_file_path(config: TrainConfig) -> str | None:
 
 @dataclass
 class SFTConfig:
-    pretrain_ckpt: str = "checkpoints_v5/harold_v05_final.pt"
+    pretrain_ckpt: str = "checkpoints_v6/harold_v06_final.pt"
     batch_size:    int   = 8
     grad_accum:    int   = 16
     max_iters:     int   = 10000
@@ -186,8 +193,8 @@ class SFTConfig:
     val_every:       int   = 200
     stage2_max_iters: int   = 5000
     stage2_lr:        float = 1e-5
-    checkpoint_dir:    str = "checkpoints_sft_v5"
-    checkpoint_prefix: str = "harold_v05_sft"
+    checkpoint_dir:    str = "checkpoints_sft_v6"
+    checkpoint_prefix: str = "harold_v06_sft"
     save_every:        int = 1000
     preload:           str = "latest"
     world_size: int = 0

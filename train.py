@@ -217,7 +217,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     main = is_main()
 
     if main:
-        print("Harold v0.5 — Flow Matching")
+        print("Harold")
         print(f"Modalità:       {'DDP (' + str(world_size) + ' GPU)' if use_ddp else 'Single-GPU'}")
         print(f"Device:         {device}")
         print(f"Dtype:          {train_cfg.dtype}  (scaler={'ON' if train_cfg.use_scaler else 'OFF'})")
@@ -262,7 +262,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
     if main:
         n_params = sum(p.numel() for p in model.parameters()) / 1e6
-        print(f"Harold v0.5 — {n_params:.1f}M parametri totali")
+        print(f"Harold — {n_params/1000:.2f}B parametri")
 
     active_model: Union[Harold, DDP] = (
         DDP(model, device_ids=[local_rank], output_device=local_rank)
@@ -325,7 +325,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
     pbar = tqdm(
         range(initial_iter, train_cfg.max_iters),
-        desc="Harold v0.5" + (" DDP" if use_ddp else ""),
+        desc="Harold" + (" DDP" if use_ddp else ""),
         disable=not main,
     )
 

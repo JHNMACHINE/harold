@@ -1,42 +1,50 @@
 """
-Harold v0.5 — model.py
+Harold v0.6 — model.py
 ========================
-Principali cambiamenti rispetto a v0.4:
+Principali cambiamenti rispetto a v0.5:
 
-  [v0.5-M1] VPSDESchedule → FlowMatchingSchedule
-             Traiettoria lineare: x_t = (1-t)*x0 + t*noise
-             Target: v = noise - x0  (velocità costante lungo la traiettoria)
-             Nessuna schedule beta, nessun alpha/sigma.
+  [v0.6-J1] Architettura Jamba: blocchi ibridi Mamba2 + Attention
+             Pattern: [Mamba, Mamba, Mamba, Attention] x 9  (36 layer totali)
+             I layer attention sono agli indici: 3, 7, 11, 15, 19, 23, 27, 31, 35
+             (ogni `jamba_attn_every`-esimo layer, 0-indexed: layer_idx % attn_every == attn_every-1)
 
-  [v0.5-M2] compute_loss: Min-SNR weighting rimosso
-             Il target è uniforme su tutti i timestep — non serve pesare.
-             Loss = MSE(vel_pred, v_target) + ce_weight * CE
+  [v0.6-J2] Mamba2Block
+             Wrapper attorno a mamba_ssm.Mamba2 con AdaLN per il conditioning su t.
+             d_state=128, d_conv=4, expand=2 (configurabili via ModelConfig).
+             Input/output: (B, T, d_model) — compatibile con il resto del forward pass.
 
-  [v0.5-M3] eps_pred → vel_pred
-             Il modello predice la velocità del flusso, non il rumore.
-             Stessa architettura, diverso significato dell'output.
+  [v0.6-J3] JambaBlock sostituisce Block
 
-  [v0.5-M4] Scaling a 1B parametri
-             d_model=1280, n_layers=36, n_heads=20, d_ff=3584
+  [v0.6-M1] MoE: 1 shared + 8 routed (top-2)
+             Da 2 shared + 4 routed a 1 shared + 8 routed.
+             Compute attivo per token: 1+2=3 expert fwd (era 2+2=4, -25%).
+             Specializzazione aumentata: top-2 su 8 = 25% pool attivo (era 50%).
+             Delta parametri: +83M (~1.24B totali).
+             Sceglie Mamba2Block o BlockCausalAttention in base all'indice del layer.
+             MoE resta invariato su tutti i layer.
 
-Ottimizzazioni mantenute da v0.4:
-  [OPT-M1] MoE routing vettorializzato
-  [OPT-M2] Sparse mask cache on-device
-  [OPT-M3] Gradient checkpointing
-  [OPT-M5] RoPE cache in bfloat16
-  [OPT-M6] AdaLN con unbind
-  [OPT-M7] Shared experts stack+mean
-  [OPT-M8] add_noise con empty+normal_
+Invariato da v0.5:
+  [v0.5-M1] FlowMatchingSchedule (traiettoria lineare, target v = noise - x0)
+  [v0.5-M2] Loss senza Min-SNR weighting
+  [v0.5-M3] vel_pred (predizione velocità del flusso)
+  [v0.5-M4] Scaling 1B (d_model=1280, n_layers=36, n_heads=20, d_ff=3584)
+  [OPT-M1]  MoE routing vettorializzato
+  [OPT-M2]  Sparse mask cache on-device
+  [OPT-M5]  RoPE cache in bfloat16
+  [OPT-M6]  AdaLN con unbind
+  [OPT-M7]  Shared experts stack+mean
+  [OPT-M8]  add_noise con empty+normal_
+
+Dipendenze aggiuntive rispetto a v0.5:
+  pip install mamba-ssm causal-conv1d
 """
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 from typing import Optional, Tuple, List, Dict, Callable, cast
 from config import ModelConfig
-
 
 class Expert(nn.Module):
     def __init__(self, n_embd: int, hidden_dim: int, dropout: float = 0.0):
@@ -383,34 +391,116 @@ class AdaLN(nn.Module):
         return self.norm(x) * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
-class Block(nn.Module):
+class Mamba2Block(nn.Module):
+    """
+    [v0.6-J2] Wrapper attorno a mamba_ssm.Mamba2 con AdaLN per il conditioning su t.
+
+    Mamba2 opera su sequenze (B, T, d_model) e restituisce (B, T, d_model).
+    L'AdaLN modula l'input prima di passarlo a Mamba2, esattamente come
+    BlockCausalAttention usa AdaLN nel JambaBlock.
+
+    headdim è allineato a head_dim dell'attention (d_model // n_heads = 64)
+    per consistenza interna, ma non è un requisito di Mamba2.
+
+    """
+
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.ada_ln_1 = AdaLN(config.d_model)
-        self.ada_ln_2 = AdaLN(config.d_model)
-        self.attn     = BlockCausalAttention(config)
-        self.moe      = DeepSeekMoELayer(config)
+        try:
+            from mamba_ssm import Mamba2  # type: ignore
+        except ImportError as e:
+            raise ImportError(
+                "mamba-ssm non trovato. Installa con: pip install mamba-ssm causal-conv1d"
+            ) from e
+
+        self.mamba = Mamba2(
+            d_model = config.d_model,
+            d_state = config.mamba_d_state,
+            d_conv  = config.mamba_d_conv,
+            expand  = config.mamba_expand,
+            headdim = config.d_model // config.n_heads,
+        )
+        self.resid_drop = nn.Dropout(config.dropout)
 
     def forward(
         self,
-        x:            torch.Tensor,
-        t_emb:        torch.Tensor,
-        past_kv:      Optional[torch.Tensor] = None,
-        use_cache:    bool = False,
-        kv_offset:    int  = 0,
-        t_normalized: Optional[float] = None,
+        x:               torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: (B, T, d_model) — già normalizzato da AdaLN nel JambaBlock
+        Returns:
+            (B, T, d_model)
+        """
+        return self.resid_drop(self.mamba(x))
+
+
+class JambaBlock(nn.Module):
+    """
+    [v0.6-J3] Blocco ibrido Jamba.
+
+    Se `is_attn_layer=True`:
+        x → AdaLN → BlockCausalAttention → residual
+    Altrimenti:
+        x → AdaLN → Mamba2 → residual
+
+    In entrambi i casi, dopo il mixer:
+        x → AdaLN → DeepSeekMoE → residual (normalizzato)
+
+    Il pattern a livello di modello è determinato da `jamba_attn_every` in config:
+        layer_idx % jamba_attn_every == jamba_attn_every - 1  →  attention
+        altrimenti                                             →  mamba2
+    """
+
+    def __init__(self, config: ModelConfig, is_attn_layer: bool):
+        super().__init__()
+        self.is_attn_layer = is_attn_layer
+
+        self.ada_ln_1 = AdaLN(config.d_model)
+        self.ada_ln_2 = AdaLN(config.d_model)
+
+        if is_attn_layer:
+            self.mixer: nn.Module = BlockCausalAttention(config)
+        else:
+            self.mixer = Mamba2Block(config)
+
+        self.moe = DeepSeekMoELayer(config)
+
+    def forward(
+        self,
+        x:               torch.Tensor,
+        t_emb:           torch.Tensor,
+        past_kv:         Optional[torch.Tensor] = None,
+        use_cache:       bool = False,
+        kv_offset:       int  = 0,
+        t_normalized:    Optional[float] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        attn_out, present_kv = self.attn(
-            self.ada_ln_1(x, t_emb),
-            past_kv=past_kv, use_cache=use_cache, kv_offset=kv_offset,
-        )
-        x       = x + attn_out
+        normed = self.ada_ln_1(x, t_emb)
+
+        if self.is_attn_layer:
+            # BlockCausalAttention ritorna (out, present_kv)
+            mixer_out, present_kv = cast(
+                Tuple[torch.Tensor, Optional[torch.Tensor]],
+                self.mixer(normed, past_kv=past_kv, use_cache=use_cache, kv_offset=kv_offset),
+            )
+        else:
+            # Mamba2 non ha kv cache — present_kv è sempre None per questi layer
+            mixer_out = cast(
+                torch.Tensor,
+                self.mixer(normed),
+            )
+            present_kv = None
+
+        x       = x + mixer_out
         moe_out = self.moe(self.ada_ln_2(x, t_emb), t_emb, t_normalized=t_normalized)
         moe_out = moe_out / (moe_out.norm(dim=-1, keepdim=True).clamp(min=1.0))
         return x + moe_out, present_kv
 
 
-# [v0.5-M1] FlowMatchingSchedule — sostituisce VPSDESchedule
+# ---------------------------------------------------------------------------
+# Flow Matching Schedule (invariato da v0.5-M1)
+# ---------------------------------------------------------------------------
+
 class FlowMatchingSchedule(nn.Module):
     """
     Conditional Flow Matching con traiettoria lineare (Lipman et al. 2022).
@@ -418,14 +508,8 @@ class FlowMatchingSchedule(nn.Module):
     Forward process:
         x_t = (1 - t) * x0 + t * noise,  t in [0, 1]
 
-    A t=0: x_t = x0  (dato pulito)
-    A t=1: x_t = noise  (rumore puro)
-
     Il modello predice la velocità del flusso:
-        v = noise - x0  (costante lungo la traiettoria)
-
-    Questo è equivalente a predire la direzione da x0 verso noise,
-    che è indipendente da t — target molto più stabile di epsilon-prediction.
+        v = noise - x0  (costante lungo la traiettoria, indipendente da t)
 
     sigma_min: piccola quantità di rumore residuo a t=0 per stabilità numerica.
     """
@@ -440,12 +524,6 @@ class FlowMatchingSchedule(nn.Module):
         noise: torch.Tensor,
         t:     torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Interpola linearmente tra x0 e noise al timestep t.
-        x_t = (1 - t_eff) * x0 + t_eff * noise
-        dove t_eff = (1 - sigma_min) * t + sigma_min
-        per garantire un minimo di rumore anche a t=0.
-        """
         t_eff = (1.0 - self.sigma_min) * t + self.sigma_min
         t_eff = t_eff.view(-1, 1, 1)
         return (1.0 - t_eff) * x0 + t_eff * noise
@@ -455,10 +533,6 @@ class FlowMatchingSchedule(nn.Module):
         x0:    torch.Tensor,
         noise: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Velocità target del flusso: v = noise - x0.
-        Costante lungo la traiettoria — indipendente da t.
-        """
         return noise - x0
 
     def add_noise(
@@ -466,16 +540,15 @@ class FlowMatchingSchedule(nn.Module):
         x0: torch.Tensor,
         t:  torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Aggiunge rumore secondo la traiettoria lineare.
-        Ritorna (x_t, noise) per compatibilità con il vecchio VPSDESchedule.
-        """
         noise = torch.empty_like(x0).normal_()
         x_t   = self.interpolate(x0, noise, t)
         return x_t, noise
 
 
-# [v0.5] Harold — Flow Matching 1B
+# ---------------------------------------------------------------------------
+# Harold v0.6 — Flow Matching + Jamba (Mamba2 + Attention) + MoE, 1B
+# ---------------------------------------------------------------------------
+
 class Harold(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -505,21 +578,25 @@ class Harold(nn.Module):
         self.t_freqs: torch.Tensor
         self.register_buffer("t_freqs", freqs)
 
-        self.blocks   = nn.ModuleList([Block(config) for _ in range(config.n_layers)])
-        self.norm_out = nn.LayerNorm(config.d_model)
+        # [v0.6-J3] JambaBlock per ogni layer
+        # layer_idx % jamba_attn_every == jamba_attn_every - 1  →  attention
+        # Con n_layers=36, jamba_attn_every=4: idx 3,7,11,15,19,23,27,31,35 → 9 attention
+        self.blocks = nn.ModuleList([
+            JambaBlock(
+                config,
+                is_attn_layer=((i % config.jamba_attn_every) == (config.jamba_attn_every - 1)),
+            )
+            for i in range(config.n_layers)
+        ])
 
-        # [v0.5-M3] vel_pred invece di eps_pred — predice velocità del flusso
+        self.norm_out = nn.LayerNorm(config.d_model)
         self.vel_pred = nn.Linear(config.d_model, config.d_model, bias=False)
 
         self.ce_head        = nn.Linear(config.d_model, emb_vocab, bias=False)
         self.ce_head.weight = self.token_emb.weight
 
-        # [v0.5-M1] FlowMatchingSchedule invece di VPSDESchedule
-        self.schedule = FlowMatchingSchedule(
-            sigma_min=config.flow_sigma_min,
-        )
+        self.schedule = FlowMatchingSchedule(sigma_min=config.flow_sigma_min)
 
-        self.use_gradient_checkpointing = getattr(config, "gradient_checkpointing", False)
         self._init_weights()
 
     def _init_weights(self):
@@ -540,19 +617,6 @@ class Harold(nn.Module):
         if self.d_model % 2:
             emb = F.pad(emb, (0, 1))
         return emb
-
-    def _block_forward(
-        self,
-        block:        Block,
-        x:            torch.Tensor,
-        t_emb:        torch.Tensor,
-        past_kv:      Optional[torch.Tensor],
-        use_cache:    bool,
-        kv_offset:    int,
-        t_normalized: Optional[float],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        return block(x, t_emb, past_kv=past_kv, use_cache=use_cache,
-                     kv_offset=kv_offset, t_normalized=t_normalized)
 
     def forward(
         self,
@@ -585,27 +649,16 @@ class Harold(nn.Module):
         for i, block in enumerate(self.blocks):
             past_kv = past_key_values[i] if past_key_values is not None else None
 
-            if self.use_gradient_checkpointing and self.training and not use_cache:
-                x, present_kv = cast(
-                    Tuple[torch.Tensor, Optional[torch.Tensor]],
-                    gradient_checkpoint(
-                        self._block_forward,
-                        block, x, t_emb, past_kv, use_cache, kv_offset, t_normalized,
-                        use_reentrant=False,
-                    )
-                )
-            else:
-                x, present_kv = block(
-                    x, t_emb,
-                    past_kv=past_kv, use_cache=use_cache,
-                    kv_offset=kv_offset, t_normalized=t_normalized,
-                )
+            x, present_kv = block(
+                x, t_emb,
+                past_kv=past_kv, use_cache=use_cache,
+                kv_offset=kv_offset, t_normalized=t_normalized
+            )
 
             if present_kvs is not None:
                 present_kvs.append(present_kv)
 
         x_out     = self.norm_out(x)
-        # [v0.5-M3] predice velocità del flusso invece del rumore
         vel_pred  = self.vel_pred(x_out)
         ce_logits = self.ce_head(x_out)
 
@@ -622,12 +675,9 @@ class Harold(nn.Module):
         p_uncond:       float = 0.0,
     ) -> Tuple[torch.Tensor, Dict]:
         """
-        [v0.5-M2] Flow Matching loss — nessun Min-SNR weighting.
-
-        Target: v = noise - x0  (velocità costante lungo la traiettoria)
-        Loss:   MSE(vel_pred, v_target) + ce_weight * CE
-
-        Il target è uniforme su tutti i timestep — nessun peso necessario.
+        Flow Matching loss — invariata da v0.5-M2.
+        Loss = MSE(vel_pred, v_target) + ce_weight * CE
+        Nessun Min-SNR weighting — target uniforme su tutti i t.
         """
         device = x0.device
 
@@ -641,11 +691,8 @@ class Harold(nn.Module):
         with torch.no_grad():
             x0_emb = self.token_emb(x0)
 
-        # [v0.5-M1] Traiettoria lineare
         x_t, noise = self.schedule.add_noise(x0_emb, t)
-
-        # [v0.5-M1] Target: velocità del flusso
-        v_target = self.schedule.target_velocity(x0_emb, noise)
+        v_target   = self.schedule.target_velocity(x0_emb, noise)
 
         self_cond: Optional[torch.Tensor] = None
         if self_cond_prob > 0 and torch.rand(1).item() < self_cond_prob:
@@ -662,7 +709,6 @@ class Harold(nn.Module):
 
         vel_pred, ce_logits, _ = self.forward(x_t, t, self_cond=self_cond, ctx_emb=cfg_emb)
 
-        # [v0.5-M2] Loss senza weighting — target uniforme su tutti i t
         per_token_mse = F.mse_loss(vel_pred, v_target, reduction="none").mean(dim=-1)
         loss_score    = per_token_mse[mask].mean()
 

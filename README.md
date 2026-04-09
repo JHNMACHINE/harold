@@ -1,17 +1,18 @@
-# Harold v0.5 — Flow Matching Mixture-of-Experts Diffusion Language Model
+# Harold v0.6 — Jamba Flow Matching Mixture-of-Experts Diffusion Language Model
 
 [![arXiv](https://img.shields.io/badge/arXiv-2026.xxxxx-b31b1b.svg)](https://arxiv.org/abs/2026.xxxxx)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Harold v0.5 is a **1B-parameter continuous diffusion language model** that combines:
+Harold v0.6 is a **1B-parameter continuous diffusion language model** that combines:
 
-- **Flow Matching** — linear trajectory interpolation with velocity prediction, replacing VP-SDE
-- **DeepSeek MoE** — timestep-conditioned routing via `[token_repr; timestep_emb]`
-- **MLA** (Multi-head Latent Attention) for compressed KV caching
-- **DSA** (Diagonal Sparse Attention) with local window + global tokens
+- **Jamba architecture** — hybrid SSM-Transformer backbone alternating Mamba2 and Attention layers (3:1 ratio)
+- **Flow Matching** — linear trajectory interpolation with velocity prediction
+- **DeepSeek MoE** — timestep-conditioned routing via `[token_repr; timestep_emb]`, on every block
+- **MLA** (Multi-head Latent Attention) with compressed KV caching, on attention layers
+- **DSA** (Diagonal Sparse Attention) with local window + global tokens, on attention layers
 - **YaRN RoPE** scaling for context extension without fine-tuning
 - **Flash Attention 2** with automatic fallback to SDPA
-- **AdaLN** for timestep conditioning
+- **AdaLN** for timestep conditioning on every block
 - **Self-conditioning** for iterative refinement
 - **CFG** (Classifier-Free Guidance) for conditional generation
 
@@ -19,34 +20,48 @@ Harold v0.5 is a **1B-parameter continuous diffusion language model** that combi
 
 | Property | Value |
 |----------|-------|
-| Architecture | Flow Matching Diffusion Transformer + DeepSeek MoE |
-| Parameters | ~1B total |
+| Architecture | Jamba (Mamba2 + Attention) + DeepSeek MoE + Flow Matching |
+| Parameters | ~1.24B total |
 | d_model | 1280 |
-| Layers | 36 |
+| Layers | 36 (27 Mamba2 + 9 Attention, ratio 3:1) |
 | Attention heads | 20 (GQA 4:1, 5 KV heads) |
 | MLA latent dim | 160 |
-| MoE experts | 2 shared SwiGLU + 4 routed GELU (top-2) |
+| Mamba2 d_state | 128 |
+| Mamba2 d_conv | 4 |
+| Mamba2 expand | 2 |
+| MoE experts | 1 shared SwiGLU + 8 routed GELU (top-2) |
 | DSA window size | 256 |
 | DSA global every | 64 |
 | Max seq len | 1024 |
 | Tokenizer | LLaMA-3 BPE (32,000 vocab) |
 | Flow sigma_min | 1e-4 |
 
-## Changes from v0.4
+## Changes from v0.5
 
-| Component | v0.4 | v0.5 |
+| Component | v0.5 | v0.6 |
 |-----------|------|------|
-| Parameters | 733M | ~1B |
-| d_model | 1024 | 1280 |
-| Layers | 32 | 36 |
-| Diffusion | VP-SDE (ε-prediction) | Flow Matching (v-prediction) |
-| Tokenizer | GPT-2 BPE (50,257) | LLaMA-3 BPE (32,000) |
-| Min-SNR weighting | Yes | No (uniform target) |
-| Sampler | DPM-Solver++ | Euler ODE |
+| Backbone | Full Attention (36 layers) | Jamba: 27 Mamba2 + 9 Attention |
+| SSM | — | Mamba2 (d_state=128, expand=2) |
+| Mixer ratio | — | 3 Mamba2 : 1 Attention |
+| Gradient checkpointing | Optional | Removed |
+| Diffusion | Flow Matching (v-prediction) | Flow Matching (v-prediction, unchanged) |
+| MoE | DeepSeek MoE (2 shared + 4 routed) | DeepSeek MoE (1 shared + 8 routed) |
+
+## Architecture: Jamba
+
+Harold v0.6 adopts the **Jamba** hybrid SSM-Transformer design (AI21 Labs, 2024). Each of the 36 blocks follows the pattern:
+
+```
+[Mamba2, Mamba2, Mamba2, Attention] × 9
+```
+
+Attention layers sit at indices 3, 7, 11, 15, 19, 23, 27, 31, 35. Every block — whether Mamba2 or Attention — is followed by a DeepSeek MoE FFN and uses AdaLN for diffusion timestep conditioning.
+
+**Why Jamba for diffusion?** Each denoising step requires a full forward pass. Replacing 3/4 of the attention layers with linear-complexity Mamba2 reduces the per-step cost significantly, which multiplies with the reduction in steps already provided by Flow Matching over VP-SDE.
 
 ## How Flow Matching Works
 
-Harold v0.5 generates text through **ODE integration** along a linear trajectory:
+Harold v0.6 generates text through **ODE integration** along a linear trajectory:
 
 1. Start from pure Gaussian noise `x_1 ~ N(0, I)` in embedding space
 2. For each step `t` from 1 to 0 (20 steps default):
@@ -54,7 +69,7 @@ Harold v0.5 generates text through **ODE integration** along a linear trajectory
    - Integrate: `x_{t-dt} = x_t - dt * v`
 3. Decode final embeddings via the auxiliary CE head
 
-The training target is `v = noise - x0` — constant along the trajectory and uniform across all timesteps, making training significantly more stable than VP-SDE without Min-SNR weighting.
+The training target is `v = noise - x0` — constant along the trajectory and uniform across all timesteps, making training stable without Min-SNR weighting.
 
 The DeepSeek MoE router conditions on both the token representation and the timestep embedding, enabling experts to specialize implicitly across the diffusion trajectory.
 
@@ -78,6 +93,11 @@ The DeepSeek MoE router conditions on both the token representation and the time
 **Self-cond prob:** 0.5  
 **CE loss weight:** 0.1  
 
+**Additional dependencies vs v0.5:**
+```bash
+pip install mamba-ssm causal-conv1d
+```
+
 ## Usage
 
 ```python
@@ -89,8 +109,8 @@ from sampler import HaroldSampler
 
 # Download model from Hugging Face
 ckpt_path = hf_hub_download(
-    repo_id="JHN-MACHINE/harold-v0.5",
-    filename="harold-v0.5-1B.pt",
+    repo_id="JHN-MACHINE/harold-v0.6",
+    filename="harold-v0.6-1B.pt",
 )
 
 # Load model
@@ -120,19 +140,20 @@ print(out)
 
 ## Limitations
 
-- **Training in progress:** The current release covers pretraining only. Generation quality metrics will be reported once the full 100k step run completes.
+- **Training in progress:** The current release covers pretraining only. Generation quality metrics will be reported once the full run completes.
+- **Mamba2 in bidirectional context:** Mamba2 was originally designed for causal autoregressive generation. Harold uses it in a non-causal diffusion setting — this is an active area of research and behavior may differ from causal use cases.
 - **No SFT yet:** Supervised fine-tuning with CFG for conditional generation is planned after pretraining.
 - **CE comparability:** The auxiliary CE loss is computed at various noise levels, not at t=0, and is not directly comparable to autoregressive perplexity.
 
 ## Citation
 
 ```bibtex
-@article{vecchione2026haroldv05,
-  title   = {Harold v0.5: Flow Matching with Mixture-of-Experts for Continuous Diffusion Language Modeling},
+@article{vecchione2026haroldv06,
+  title   = {Harold v0.6: Jamba Flow Matching with Mixture-of-Experts for Continuous Diffusion Language Modeling},
   author  = {Vecchione, Jonathan},
   journal = {arXiv preprint},
   year    = {2026},
-  url     = {https://huggingface.co/JHN-MACHINE/harold-v0.5}
+  url     = {https://huggingface.co/JHN-MACHINE/harold-v0.6}
 }
 ```
 
