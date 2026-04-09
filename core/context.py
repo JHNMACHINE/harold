@@ -14,10 +14,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from transformers import PreTrainedTokenizerBase
 
-from model import Harold
-from trainer import DiffusionTrainer
-from logger import AsyncLogger
-from ddp import DDPContext
+from core.model import Harold
+from training.trainer import DiffusionTrainer
+from utils.logger import AsyncLogger
+from utils.ddp import DDPContext
 
 
 @dataclass

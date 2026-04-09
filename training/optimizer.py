@@ -22,8 +22,8 @@ import torch.nn as nn
 from typing import List, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from config import TrainConfig
-    from model import Harold
+    from core.config import TrainConfig
+    from core.model import Harold
 
 
 # ---------------------------------------------------------------------------

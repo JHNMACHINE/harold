@@ -13,15 +13,15 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoTokenizer
 
-from config import ModelConfig, TrainConfig, HF_FILENAME
-from model import Harold, build_model
-from optimizer import build_optimizer
-from trainer import DiffusionTrainer
-from dataset import build_loaders, build_loaders_ddp
-from logger import AsyncLogger
-from checkpoint import load_checkpoint
-from ddp import DDPContext, is_ddp, is_main, broadcast_model
-from context import TrainingContext
+from core.config import ModelConfig, TrainConfig, HF_FILENAME
+from core.model import Harold, build_model
+from training.optimizer import build_optimizer
+from training.trainer import DiffusionTrainer
+from core.dataset import build_loaders, build_loaders_ddp
+from utils.logger import AsyncLogger
+from utils.checkpoint import load_checkpoint
+from utils.ddp import DDPContext, is_ddp, is_main, broadcast_model
+from core.context import TrainingContext
 
 
 

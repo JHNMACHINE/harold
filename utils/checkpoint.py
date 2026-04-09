@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 from safetensors.torch import save_model
 from huggingface_hub import HfApi
-from config import HF_FILENAME, HF_REPO_ID
+from core.config import HF_FILENAME, HF_REPO_ID
 
 
 def cleanup_old_checkpoints(

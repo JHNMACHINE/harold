@@ -23,13 +23,13 @@ from collections import deque
 import torch
 from tqdm.auto import tqdm
 
-from config import ModelConfig, TrainConfig, get_model_config, get_train_config
-from setup import build_training_context
-from validation import ValidationScheduler, run_validation_step
-from lr_schedule import get_lr
-from trainer import run_grad_accum
-from checkpoint import save_checkpoint
-from ddp import is_main
+from core.config import ModelConfig, TrainConfig, get_model_config, get_train_config
+from training.setup import build_training_context
+from training.validation import ValidationScheduler, run_validation_step
+from training.lr_schedule import get_lr
+from training.trainer import run_grad_accum
+from utils.checkpoint import save_checkpoint
+from utils.ddp import is_main
 
 
 def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:

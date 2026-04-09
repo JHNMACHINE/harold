@@ -5,7 +5,7 @@ Cosine decay con linear warmup.
 """
 
 import math
-from config import TrainConfig
+from core.config import TrainConfig
 
 
 def get_lr(it: int, cfg: TrainConfig) -> float:

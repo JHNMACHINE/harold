@@ -29,12 +29,12 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
-from checkpoint import save_checkpoint, load_checkpoint
-from ddp import DDPContext, is_ddp, is_main, all_reduce_mean, broadcast_model
-from config import ModelConfig, SFTConfig
-from dataset import SFTDataset, build_sft_loaders, load_dataset_config
-from logger import AsyncLogger
-from model import Harold, build_model
+from utils.checkpoint import save_checkpoint, load_checkpoint
+from utils.ddp import DDPContext, is_ddp, is_main, all_reduce_mean, broadcast_model
+from core.config import ModelConfig, SFTConfig
+from core.dataset import SFTDataset, build_sft_loaders, load_dataset_config
+from utils.logger import AsyncLogger
+from core.model import Harold, build_model
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 

@@ -15,14 +15,14 @@ import time
 import torch
 from torch.utils.data import DataLoader
 
-from config import ModelConfig, TrainConfig
-from model import Harold
-from logger import AsyncLogger
-from checkpoint import save_checkpoint
-from ddp import all_reduce_mean
+from core.config import ModelConfig, TrainConfig
+from core.model import Harold
+from utils.logger import AsyncLogger
+from utils.checkpoint import save_checkpoint
+from utils.ddp import all_reduce_mean
 
 if TYPE_CHECKING:
-    from context import TrainingContext
+    from core.context import TrainingContext
 
 
 class ValidationScheduler:

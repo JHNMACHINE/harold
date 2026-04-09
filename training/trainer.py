@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional, Tuple, Protocol, runtime_checkable
 import torch
 from torch.utils.data import DataLoader
 
-from config import MAX_SKIP_RATIO, ModelConfig, TrainConfig
+from core.config import MAX_SKIP_RATIO, ModelConfig, TrainConfig
 
 
 @runtime_checkable
