@@ -550,7 +550,6 @@ class Harold(nn.Module):
         self.mask_token_id = config.vocab_size
 
         self.token_emb = nn.Embedding(emb_vocab, config.d_model)
-        self.pos_emb   = nn.Embedding(config.max_seq_len, config.d_model)
 
         self.time_emb = nn.Sequential(
             nn.Linear(config.d_model, config.d_model * 4),
@@ -618,12 +617,9 @@ class Harold(nn.Module):
         past_key_values: Optional[List[torch.Tensor]] = None,
         use_cache:       bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[List]]:
-        B, L, _ = x_t.shape
-        device  = x_t.device
 
         kv_offset = past_key_values[0].shape[1] if past_key_values is not None else 0
-        pos       = torch.arange(kv_offset, kv_offset + L, device=device).unsqueeze(0).expand(B, -1)
-        x         = x_t + self.pos_emb(pos)
+        x = x_t
 
         t_emb = self.time_emb(self.get_timestep_embedding(t))
 
