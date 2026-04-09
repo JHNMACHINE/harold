@@ -22,7 +22,7 @@ import os
 import threading
 from collections import deque
 from typing import Union
-
+from safetensors.torch import save_model
 import torch
 import torch.nn as nn
 
@@ -85,7 +85,7 @@ def _push_to_hf(
             # Upload pesi in .safetensors (solo model state, memory-mappable)
             sf_filename = HF_FILENAME.replace(".pt", ".safetensors")
             sf_path     = path.replace(".pt", ".safetensors")
-            save_file(model.state_dict(), sf_path)
+            save_model(model, sf_path)
             api.upload_file(
                 path_or_fileobj=sf_path,
                 path_in_repo=sf_filename,
