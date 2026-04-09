@@ -1,20 +1,28 @@
 """
 Harold v0.6 — validation.py
 ============================
-ValidationScheduler: frequenza adattiva basata su stabilità della training loss.
-estimate_loss:       validation completa su t = [0.3, 0.5, 0.7].
+ValidationScheduler:  frequenza adattiva basata su stabilità della training loss.
+estimate_loss:        validation completa su t = [0.3, 0.5, 0.7].
 estimate_loss_single_t: validation rapida a singolo timestep.
+run_validation_step:  orchestrazione completa di un singolo step di validation.
 """
 
 from collections import deque
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
+import time
 import torch
 from torch.utils.data import DataLoader
 
-from config import TrainConfig
+from config import ModelConfig, TrainConfig
 from model import Harold
 from logger import AsyncLogger
+from checkpoint import save_checkpoint
+from ddp import all_reduce_mean
+
+if TYPE_CHECKING:
+    from context import TrainingContext
 
 
 class ValidationScheduler:
@@ -256,3 +264,126 @@ def estimate_loss(
 
     valid = [v for v in per_t_total.values() if v != float("inf")]
     return sum(valid) / len(valid) if valid else float("inf")
+
+
+# ---------------------------------------------------------------------------
+# run_validation_step — orchestrazione completa
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ValidationResult:
+    val_loss:     float
+    val_type:     str       # "full" | "quick"
+    reason:       str
+    is_best:      bool
+    accum_loss:   float     # accum_loss aggiornato (azzerato se full)
+
+
+def run_validation_step(
+    ctx:           "TrainingContext",
+    model_cfg:     ModelConfig,
+    train_cfg:     TrainConfig,
+    val_scheduler: "ValidationScheduler",
+    iter_num:      int,
+    accum_loss:    float,
+    start_time:    float,
+    lr:            float,
+    force_val:     bool,
+) -> Optional[ValidationResult]:
+    """
+    Orchestrazione completa di un singolo step di validation.
+
+    Decide se validare, esegue la validation (full o quick),
+    sincronizza in DDP, logga, salva il checkpoint best se migliorato.
+
+    Args:
+        ctx:          TrainingContext con model, loaders, optimizer, ecc.
+        model_cfg:    configurazione modello (per save_checkpoint)
+        train_cfg:    configurazione training
+        val_scheduler: scheduler adattivo
+        iter_num:     iterazione corrente
+        accum_loss:   loss accumulata dall'ultimo full val (per avg_train)
+        start_time:   timestamp avvio training (per elapsed)
+        lr:           learning rate corrente (per logging)
+        force_val:    forza validation indipendentemente dallo scheduler
+
+    Returns:
+        ``ValidationResult`` se la validation è stata eseguita, ``None`` altrimenti.
+    """
+    current_train_loss = (
+        sum(ctx.train_losses) / len(ctx.train_losses)
+        if ctx.train_losses else accum_loss
+    )
+    should_val, reason = val_scheduler.should_validate(
+        iter_num, current_train_loss, force=force_val,
+    )
+
+    if not should_val or iter_num == 0:
+        return None
+
+    # Scegli tipo di validation
+    if val_scheduler.total_val_calls % 3 == 0 or force_val or "unstable" in reason:
+        local_val = estimate_loss(
+            ctx.model, train_cfg, ctx.val_loader, ctx.pad_token_id,
+            iter_num=iter_num, logger=ctx.logger if ctx.main else None,
+        )
+        val_type = "full"
+    else:
+        local_val = estimate_loss_single_t(
+            ctx.model, train_cfg, ctx.val_loader, ctx.pad_token_id, t=0.5,
+        )
+        val_type = "quick"
+
+    # Sincronizza DDP
+    if ctx.use_ddp:
+        val_tensor = torch.tensor(local_val, device=ctx.device)
+        val_loss   = float(all_reduce_mean(val_tensor, ctx.world_size).item())
+    else:
+        val_loss = local_val
+
+    val_scheduler.record(iter_num, val_loss)
+    is_best   = False
+    new_accum = accum_loss
+
+    if ctx.main:
+        elapsed   = (time.time() - start_time) / 60
+        avg_train = accum_loss / max(iter_num - val_scheduler.last_val_iter, 1)
+
+        if val_type == "full":
+            ctx.val_losses.append(val_loss)
+            new_accum = 0.0
+            print(f"\n[iter {iter_num:7d}] train={avg_train:.4f}  val={val_loss:.4f}  "
+                  f"lr={lr:.2e}  elapsed={elapsed:.1f}min  [{val_type}|{reason}]")
+            if ctx.logger:
+                ctx.logger.log({"type": "val", "iter": iter_num,
+                                "train_loss": round(avg_train, 6),
+                                "val_loss": round(val_loss, 6),
+                                "val_type": val_type, "reason": reason,
+                                "lr": lr, "elapsed_min": round(elapsed, 2)})
+
+            if val_loss < ctx.best_val_loss:
+                is_best   = True
+                best_path = f"{train_cfg.checkpoint_dir}/{train_cfg.checkpoint_prefix}_best.pt"
+                save_checkpoint(best_path, ctx.model, ctx.optimizer, ctx.scaler,
+                                iter_num, val_loss, model_cfg, train_cfg,
+                                ctx.train_losses, ctx.val_losses, push_hf=True)
+                print(f"  ★ Best val loss: {val_loss:.4f} → {best_path}")
+                train_cfg.write_latest(iter_num, best_path)
+                if ctx.logger:
+                    ctx.logger.log({"type": "best_checkpoint", "iter": iter_num,
+                                    "val_loss": round(val_loss, 6), "path": best_path})
+        else:
+            print(f"  [quick val] iter={iter_num} loss={val_loss:.4f} ({reason})")
+            if ctx.logger:
+                ctx.logger.log({"type": "quick_val", "iter": iter_num,
+                                "val_loss": round(val_loss, 6), "reason": reason})
+
+    ctx.active_model.train()
+
+    return ValidationResult(
+        val_loss   = val_loss,
+        val_type   = val_type,
+        reason     = reason,
+        is_best    = is_best,
+        accum_loss = new_accum,
+    )
