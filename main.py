@@ -18,9 +18,12 @@ Modalità:
 """
 
 import argparse
+import os
 import sys
 import warnings
 
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/.torch_cache")
+os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
