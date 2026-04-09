@@ -9,348 +9,38 @@ Avvio multi-GPU (es. 4 GPU):
 
 Comportamento automatico:
   - world_size=1  → single-GPU, torch.compile abilitato, nessun overhead DDP
-  - world_size>1  → DDP attivo, torch.compile disabilitato (instabile con DDP),
-                    dataset partizionato per rank tramite seed offset,
-                    checkpoint/logging/HF push solo su rank 0,
-                    val loss sincronizzata via all_reduce
+  - world_size>1  → DDP attivo, torch.compile disabilitato,
+                    dataset partizionato per rank, val loss sincronizzata via all_reduce
 
-Compatibilità checkpoint:
-  - I checkpoint sono sempre salvati unwrapped (model.module se DDP)
-  - Intercambiabili tra run single-GPU e multi-GPU
-
-Changelog v0.6:
-  - Architettura Jamba (Mamba2 + Attention + MoE)
-  - MuonAdamW optimizer
-  - Rimosso gradient checkpointing
-  - ValidationScheduler: frequenza adattiva basata su stabilità della loss
-  - estimate_loss ottimizzata: t_values [0.3,0.5,0.7], cache fixed_t, accumulatori GPU
-  - estimate_loss_single_t: validation rapida a t=0.5 per monitoring intermedio
+Moduli ausiliari:
+  trainer.py     — DiffusionTrainer, run_grad_accum
+  validation.py  — ValidationScheduler, estimate_loss, estimate_loss_single_t
+  lr_schedule.py — get_lr
+  optimizer.py   — MuonAdamW, build_optimizer
 """
 
-import math
 import os
 import time
 import warnings
 from collections import deque
-from typing import Any, Dict, Optional, Tuple, Union, cast, Protocol, runtime_checkable
+from typing import Union, cast
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
-from config import MAX_SKIP_RATIO, ModelConfig, TrainConfig, get_model_config, get_train_config
-from optimizer import build_optimizer
+from config import ModelConfig, TrainConfig, get_model_config, get_train_config
 from model import Harold, build_model
+from optimizer import build_optimizer
+from trainer import DiffusionTrainer, run_grad_accum
+from validation import ValidationScheduler, estimate_loss, estimate_loss_single_t
+from lr_schedule import get_lr
 from dataset import build_loaders, build_loaders_ddp
 from logger import AsyncLogger
 from checkpoint import save_checkpoint, load_checkpoint
 from ddp import DDPContext, is_ddp, is_main, all_reduce_mean, broadcast_model
 
-@runtime_checkable
-class TrainableModel(Protocol):
-    def compute_loss(
-        self,
-        x0:             torch.Tensor,
-        mask:           torch.Tensor,
-        ce_weight:      float = 0.1,
-        fixed_t:        Optional[torch.Tensor] = None,
-        self_cond_prob: float = 0.0,
-        ctx_emb:        Optional[torch.Tensor] = None,
-        p_uncond:       float = 0.0,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]: ...
-
-    def parameters(self) -> Any: ...
-    def update_router_biases(self) -> None: ...
-    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
-
-class DiffusionTrainer:
-    def __init__(self, model: TrainableModel, config: ModelConfig, train_cfg: TrainConfig,
-                 pad_token_id: int = 0):
-        self.model        = model
-        self.config       = config
-        self.train_cfg    = train_cfg
-        self.pad_token_id = pad_token_id
-
-    def train_step(self, batch: torch.Tensor) -> Optional[Tuple[torch.Tensor, Dict[str, float]]]:
-        mask = (batch != self.pad_token_id)
-        if mask.sum() == 0:
-            return None
-        loss, loss_dict = self.model.compute_loss(
-            x0=batch, mask=mask,
-            ce_weight=self.train_cfg.ce_loss_weight,
-            self_cond_prob=self.train_cfg.self_cond_prob,
-        )
-        return loss, loss_dict
-
-class ValidationScheduler:
-    """
-    Scheduler adattivo per la validation.
-
-    - Loss stabile (bassa varianza, pendenza piatta) → aumenta intervallo
-    - Loss instabile o in risalita → riduce intervallo, forza val se molto instabile
-    """
-
-    def __init__(
-        self,
-        base_interval:       int   = 500,
-        min_interval:        int   = 100,
-        max_interval:        int   = 2000,
-        stability_threshold: float = 0.03,
-        patience:            int   = 3,
-    ):
-        self.base_interval       = base_interval
-        self.min_interval        = min_interval
-        self.max_interval        = max_interval
-        self.current_interval    = base_interval
-        self.stability_threshold = stability_threshold
-        self.patience            = patience
-
-        self._train_losses:  deque = deque(maxlen=100)
-        self._val_losses:    deque = deque(maxlen=20)
-        self._stable_count   = 0
-        self._unstable_count = 0
-        self._last_val_iter  = 0
-        self._skip_count     = 0
-        self._total_val      = 0
-
-    def should_validate(
-        self,
-        iter_num:   int,
-        train_loss: float,
-        force:      bool = False,
-    ) -> Tuple[bool, str]:
-        if force:
-            return True, "forced"
-
-        if self._total_val == 0:
-            if iter_num >= self.base_interval:
-                return True, "first_validation"
-            return False, "waiting_warmup"
-
-        self._train_losses.append(train_loss)
-
-        if len(self._train_losses) >= 10:
-            recent = list(self._train_losses)[-10:]
-            mean   = sum(recent) / len(recent)
-            std    = float(torch.tensor(recent).std())
-            cv     = std / mean if mean > 0 else 0.0
-
-            n    = len(recent)
-            sx   = n * (n - 1) / 2
-            sxx  = sum(i * i for i in range(n))
-            sxy  = sum(i * v for i, v in enumerate(recent))
-            sy   = sum(recent)
-            den  = n * sxx - sx * sx
-            slope = (n * sxy - sx * sy) / den if den != 0 else 0.0
-
-            time_since = iter_num - self._last_val_iter
-
-            if cv < self.stability_threshold and abs(slope) < 0.001:
-                self._stable_count   += 1
-                self._unstable_count  = 0
-                if self._stable_count >= self.patience:
-                    self.current_interval = min(
-                        self.max_interval, int(self.current_interval * 1.5))
-                    self._stable_count = 0
-                if time_since < self.current_interval:
-                    self._skip_count += 1
-                    return False, f"stable(cv={cv:.4f})"
-
-            elif cv > self.stability_threshold * 2 or slope > 0.01:
-                self._unstable_count += 1
-                self._stable_count    = 0
-                if self._unstable_count >= 2:
-                    self.current_interval = max(
-                        self.min_interval, int(self.current_interval * 0.7))
-                    self._unstable_count = 0
-                if cv > 0.2 and time_since > self.min_interval:
-                    return True, f"unstable(cv={cv:.4f})"
-            else:
-                self._stable_count   = 0
-                self._unstable_count = 0
-
-        if iter_num - self._last_val_iter >= self.current_interval:
-            return True, f"interval({self.current_interval})"
-
-        self._skip_count += 1
-        return False, f"skip({self.current_interval - (iter_num - self._last_val_iter)} left)"
-
-    def record(self, iter_num: int, val_loss: float) -> None:
-        self._last_val_iter = iter_num
-        self._total_val    += 1
-        self._val_losses.append(val_loss)
-
-    @property
-    def total_val_calls(self) -> int:
-        return self._total_val
-
-def get_lr(it: int, cfg: TrainConfig) -> float:
-    if it >= cfg.max_iters:
-        return cfg.min_lr
-    if it < cfg.warmup_iters:
-        return cfg.lr * max(it, 1) / cfg.warmup_iters
-    ratio = (it - cfg.warmup_iters) / max(cfg.max_iters - cfg.warmup_iters, 1)
-    return cfg.min_lr + 0.5 * (1.0 + math.cos(math.pi * ratio)) * (cfg.lr - cfg.min_lr)
-
-@torch.no_grad()
-def estimate_loss_single_t(
-    model:        Harold,
-    train_cfg:    TrainConfig,
-    val_loader:   DataLoader,
-    pad_token_id: int,
-    t:            float = 0.5,
-) -> float:
-    """Validation rapida a singolo timestep — usa metà dei batch normali."""
-    device  = next(model.parameters()).device
-    model.eval()
-    losses: list = []
-    t_cache: Dict[int, torch.Tensor] = {}
-
-    for i, batch in enumerate(val_loader):
-        if i >= train_cfg.eval_iters // 2:
-            break
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
-        mask      = (input_ids != pad_token_id)
-        if mask.sum() < 10:
-            continue
-        B = input_ids.shape[0]
-        if B not in t_cache:
-            t_cache[B] = torch.full((B,), t, dtype=torch.float32, device=device)
-        with train_cfg.ctx:
-            _, loss_dict = model.compute_loss(
-                x0=input_ids, mask=mask,
-                ce_weight=train_cfg.ce_loss_weight,
-                fixed_t=t_cache[B], self_cond_prob=0.0,
-            )
-        losses.append(loss_dict["total"])
-
-    model.train()
-    return sum(losses) / len(losses) if losses else float("inf")
-
-
-@torch.no_grad()
-def estimate_loss(
-    model:        Harold,
-    train_cfg:    TrainConfig,
-    val_loader:   DataLoader,
-    pad_token_id: int = 50256,
-    iter_num:     int = 0,
-    logger:       Optional["AsyncLogger"] = None,
-) -> float:
-    """
-    Validation completa su t = [0.3, 0.5, 0.7].
-
-    Ottimizzazioni vs versione originale:
-    - t_values ridotti da 5 a 3 (0.1 e 0.9 poco informativi)
-    - Cache fixed_t per evitare allocazioni GPU ripetute
-    - Accumulatori su GPU invece di liste CPU
-    """
-    device  = next(model.parameters()).device
-    model.eval()
-
-    t_values = [0.3, 0.5, 0.7]
-    n_t      = len(t_values)
-
-    sum_total = torch.zeros(n_t, device=device)
-    sum_score = torch.zeros(n_t, device=device)
-    sum_ce    = torch.zeros(n_t, device=device)
-    count     = torch.zeros(n_t, device=device)
-
-    t_cache: Dict[Tuple[float, int], torch.Tensor] = {}
-
-    iterator = iter(val_loader)
-    for _ in range(train_cfg.eval_iters):
-        try:
-            batch = next(iterator)
-        except StopIteration:
-            break
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
-        mask      = (input_ids != pad_token_id)
-        if mask.sum() < 10:
-            continue
-        B = input_ids.shape[0]
-        for idx, t_val in enumerate(t_values):
-            key = (t_val, B)
-            if key not in t_cache:
-                t_cache[key] = torch.full((B,), t_val, dtype=torch.float32, device=device)
-            with train_cfg.ctx:
-                _, loss_dict = model.compute_loss(
-                    x0=input_ids, mask=mask,
-                    ce_weight=train_cfg.ce_loss_weight,
-                    fixed_t=t_cache[key], self_cond_prob=0.0,
-                )
-            sum_total[idx] += loss_dict["total"]
-            sum_score[idx] += loss_dict["score"]
-            sum_ce[idx]    += loss_dict["ce"]
-            count[idx]     += 1
-
-    model.train()
-
-    c         = count.clamp(min=1)
-    avg_total = (sum_total / c).cpu().tolist()
-    avg_score = (sum_score / c).cpu().tolist()
-    avg_ce    = (sum_ce    / c).cpu().tolist()
-
-    per_t_total = {t: avg_total[i] for i, t in enumerate(t_values)}
-    per_t_score = {t: avg_score[i] for i, t in enumerate(t_values)}
-    per_t_ce    = {t: avg_ce[i]    for i, t in enumerate(t_values)}
-
-    print("  val total: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_total.items()))
-    print("  val score: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_score.items()))
-    print("  val CE:    " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_ce.items()))
-
-    if logger is not None:
-        logger.log({
-            "type":        "val_detail",
-            "iter":        iter_num,
-            "total_per_t": {str(t): round(v, 6) for t, v in per_t_total.items()},
-            "score_per_t": {str(t): round(v, 6) for t, v in per_t_score.items()},
-            "ce_per_t":    {str(t): round(v, 6) for t, v in per_t_ce.items()},
-        })
-
-    valid = [v for v in per_t_total.values() if v != float("inf")]
-    return sum(valid) / len(valid) if valid else float("inf")
-
-def _run_grad_accum(
-    trainer:      DiffusionTrainer,
-    train_iter:   Any,
-    train_loader: DataLoader,
-    train_cfg:    TrainConfig,
-    scaler:       torch.GradScaler,
-    device:       str,
-) -> Tuple[float, float, float, int, Any]:
-    step_loss_sum = step_score_sum = step_ce_sum = 0.0
-    valid_count = mb_idx = 0
-    max_skip = train_cfg.grad_accum * MAX_SKIP_RATIO
-
-    while valid_count < train_cfg.grad_accum:
-        if mb_idx > max_skip:
-            break
-        try:
-            batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            batch      = next(train_iter)
-
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
-        with train_cfg.ctx:
-            result = trainer.train_step(input_ids)
-
-        if result is None:
-            mb_idx += 1
-            continue
-
-        loss, loss_dict = result
-        scaler.scale(loss / train_cfg.grad_accum).backward()
-        step_loss_sum  += loss.item()
-        step_score_sum += loss_dict.get("score", 0.0)
-        step_ce_sum    += loss_dict.get("ce",    0.0)
-        valid_count += 1
-        mb_idx      += 1
-
-    return step_loss_sum, step_score_sum, step_ce_sum, valid_count, train_iter
 
 def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
@@ -426,7 +116,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         active_model.module if isinstance(active_model, DDP) else active_model,
     )
 
-    # ── Optimizer ─────────────────────────────────────────────────────────
+    # ── Optimizer + scaler ────────────────────────────────────────────────
     optimizer = build_optimizer(active_model, train_cfg)
     scaler    = torch.GradScaler("cuda", enabled=train_cfg.use_scaler)
 
@@ -497,8 +187,8 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
         optimizer.zero_grad(set_to_none=True)
 
-        step_loss_sum, step_score_sum, step_ce_sum, valid_count, train_iter = (
-            _run_grad_accum(trainer, train_iter, train_loader, train_cfg, scaler, device)
+        loss_sum, score_sum, ce_sum, valid_count, train_iter = run_grad_accum(
+            trainer, train_iter, train_loader, train_cfg, scaler, device,
         )
         if valid_count == 0:
             continue
@@ -510,9 +200,9 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         scaler.update()
         raw_model.update_router_biases()
 
-        avg_loss  = step_loss_sum  / valid_count
-        avg_score = step_score_sum / valid_count
-        avg_ce    = step_ce_sum    / valid_count
+        avg_loss  = loss_sum  / valid_count
+        avg_score = score_sum / valid_count
+        avg_ce    = ce_sum    / valid_count
         accum_loss += avg_loss
         window_losses.append(avg_loss)
         train_losses.append(avg_loss)
@@ -535,7 +225,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         )
 
         if should_val and iter_num > 0:
-            # Ogni 3 chiamate: validation completa; altrimenti rapida
+            # Ogni 3 validation: completa; altrimenti rapida
             if val_scheduler.total_val_calls % 3 == 0 or force_val or "unstable" in reason:
                 local_val = estimate_loss(
                     raw_model, train_cfg, val_loader, pad_token_id,
@@ -558,7 +248,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
             if main:
                 elapsed   = (time.time() - start_time) / 60
-                avg_train = accum_loss / max(iter_num - val_scheduler._last_val_iter, 1)
+                avg_train = accum_loss / max(iter_num - val_scheduler.last_val_iter, 1)
 
                 if val_type == "full":
                     val_losses.append(val_loss)
