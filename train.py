@@ -301,13 +301,11 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
             if train_cfg.preload == "latest"
             else train_cfg.preload
         )
-        if ckpt_path and os.path.isfile(ckpt_path):
+        if ckpt_path:
             initial_iter, best_val_loss, _tl, val_losses = load_checkpoint(
                 ckpt_path, raw_model, optimizer, scaler, device
             )
             train_losses.extend(_tl)
-        elif main:
-            print("Nessun checkpoint trovato, parto da zero.")
 
     if use_ddp:
         broadcast_model(raw_model)
