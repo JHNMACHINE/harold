@@ -496,11 +496,6 @@ class JambaBlock(nn.Module):
         moe_out = moe_out / (moe_out.norm(dim=-1, keepdim=True).clamp(min=1.0))
         return x + moe_out, present_kv
 
-
-# ---------------------------------------------------------------------------
-# Flow Matching Schedule (invariato da v0.5-M1)
-# ---------------------------------------------------------------------------
-
 class FlowMatchingSchedule(nn.Module):
     """
     Conditional Flow Matching con traiettoria lineare (Lipman et al. 2022).
@@ -544,10 +539,6 @@ class FlowMatchingSchedule(nn.Module):
         x_t   = self.interpolate(x0, noise, t)
         return x_t, noise
 
-
-# ---------------------------------------------------------------------------
-# Harold v0.6 — Flow Matching + Jamba (Mamba2 + Attention) + MoE, 1B
-# ---------------------------------------------------------------------------
 
 class Harold(nn.Module):
     def __init__(self, config: ModelConfig):

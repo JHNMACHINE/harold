@@ -90,11 +90,23 @@ class TrainConfig:
     checkpoint_dir:    str = "checkpoints_v6"
     checkpoint_prefix: str = "harold_v06"
     preload:           str = "latest"
-    save_every:        int = 2500
+    save_every:        int = 5000
 
     # torch.compile
     use_compile:  bool = True
     compile_mode: str  = "max-autotune"
+
+    # Optimizer
+    # use_muon=True  → MuonAdamW (Muon per matrici 2D, AdamW per il resto)
+    # use_muon=False → AdamW puro (comportamento precedente)
+    use_muon:      bool  = True
+    muon_momentum: float = 0.95
+    muon_beta2:    float = 0.95
+    muon_ns_steps: int   = 5       # step di orthogonalizzazione polare
+    muon_wd:       float = 0.01
+    adamw_betas:   tuple = (0.9, 0.95)
+    adamw_eps:     float = 1e-8
+    adamw_wd:      float = 0.1
 
     # Storico loss
     loss_history_size: int = 100_000

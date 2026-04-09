@@ -1,5 +1,5 @@
 """
-Harold v0.4 — train.py  (unified single-GPU + DDP)
+Harold v0.6 — train.py  (unified single-GPU + DDP)
 ====================================================
 Entry point unico per training single-GPU e multi-GPU DDP.
 
@@ -20,13 +20,9 @@ Compatibilità checkpoint:
   - I checkpoint sono sempre salvati unwrapped (model.module se DDP)
   - Intercambiabili tra run single-GPU e multi-GPU
 
-Changelog:
-  - Rimosso _patch_loader_for_perf (gestito in dataset.py)
-  - use_compile letto da train_cfg
-  - estimate_loss: loop per t_value (evita OOM su GPU < 80GB)
-  - Deque con maxlen da train_cfg.loss_history_size
-  - save_checkpoint: full=True (best/final) vs full=False (periodici)
-  - DDP: partizionamento dataset per seed, all_reduce val loss
+Changelog v0.6:
+  - Aggiornato per Harold v0.6 (architettura Jamba: Mamba2 + Attention + MoE)
+  - Rimosso gradient checkpointing (non utilizzato)
 """
 
 import math
@@ -45,6 +41,7 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from config import MAX_SKIP_RATIO, ModelConfig, TrainConfig, get_model_config, get_train_config
+from optimizer import build_optimizer
 from model import Harold, build_model
 from dataset import build_loaders, build_loaders_ddp
 from logger import AsyncLogger
@@ -68,7 +65,6 @@ class TrainableModel(Protocol):
     def parameters(self) -> Any: ...
     def update_router_biases(self) -> None: ...
     def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
-
 
 
 class DiffusionTrainer:
@@ -222,7 +218,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         print(f"Device:         {device}")
         print(f"Dtype:          {train_cfg.dtype}  (scaler={'ON' if train_cfg.use_scaler else 'OFF'})")
         eff = train_cfg.batch_size * train_cfg.grad_accum * world_size
-        print(f"Batch effettivo: {eff}  ({train_cfg.batch_size} x {train_cfg.grad_accum} x {world_size} GPU)")
+        print(f"Batch effettivo: {eff}  ({train_cfg.batch_size} × {train_cfg.grad_accum} × {world_size} GPU)")
 
     if device.startswith("cuda"):
         torch.backends.cudnn.benchmark = True
@@ -271,10 +267,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     raw_model: Harold = cast(Harold, active_model.module if isinstance(active_model, DDP) else active_model)
 
     # ── Optimizer ─────────────────────────────────────────────────────────
-    optimizer = torch.optim.AdamW(
-        active_model.parameters(), lr=train_cfg.lr,
-        betas=(0.9, 0.95), weight_decay=0.1, fused=True,
-    )
+    optimizer = build_optimizer(active_model, train_cfg)
     scaler = torch.GradScaler("cuda", enabled=train_cfg.use_scaler)
 
     # ── Dataset ───────────────────────────────────────────────────────────
@@ -283,7 +276,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
     else:
         train_loader, val_loader = build_loaders(train_cfg, tokenizer)
 
-    # Trainer 
+    # Trainer
     trainer = DiffusionTrainer(raw_model, model_cfg, train_cfg, pad_token_id=pad_token_id)
 
     # ── Checkpoint resume ─────────────────────────────────────────────────
