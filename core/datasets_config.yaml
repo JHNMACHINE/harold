@@ -59,6 +59,7 @@ pretraining:
 
   - name: pes2o
     path: allenai/peS2o
+    config: v2
     split: train
     text_field: text
     weight: 0.09
