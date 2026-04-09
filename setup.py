@@ -13,7 +13,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoTokenizer
 
-from config import ModelConfig, TrainConfig
+from config import ModelConfig, TrainConfig, HF_FILENAME
 from model import Harold, build_model
 from optimizer import build_optimizer
 from trainer import DiffusionTrainer
@@ -132,16 +132,21 @@ def build_training_context(
     val_losses:   list  = []
 
     if train_cfg.preload:
-        ckpt_path = (
-            (train_cfg.read_latest() or (None, None))[1]
-            if train_cfg.preload == "latest"
-            else train_cfg.preload
+        # Cerca il checkpoint nell'ordine: latest.json → path esplicito → HuggingFace
+        if train_cfg.preload == "latest":
+            ckpt_path = (train_cfg.read_latest() or (None, None))[1]
+        else:
+            ckpt_path = train_cfg.preload
+
+        # Se non trovato localmente, usa il path HF come fallback
+        # load_checkpoint scaricherà da HF se il file non esiste
+        if not ckpt_path:
+            ckpt_path = os.path.join(train_cfg.checkpoint_dir, HF_FILENAME)
+
+        initial_iter, best_val_loss, _tl, val_losses = load_checkpoint(
+            ckpt_path, raw_model, optimizer, scaler, device
         )
-        if ckpt_path:
-            initial_iter, best_val_loss, _tl, val_losses = load_checkpoint(
-                ckpt_path, raw_model, optimizer, scaler, device
-            )
-            train_losses.extend(_tl)
+        train_losses.extend(_tl)
 
     if use_ddp:
         broadcast_model(raw_model)
