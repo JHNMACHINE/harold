@@ -238,7 +238,7 @@ def load_checkpoint(
     if "scaler_state" in state:
         scaler.load_state_dict(state["scaler_state"])
  
-    iter_num     = state.get("iter_num", 0) + 1
+    iter_num     = state.get("iter_num", 0)
     best_val     = state.get("val_loss", float("inf"))
     train_losses = state.get("train_losses", [])
     val_losses   = state.get("val_losses", [])
