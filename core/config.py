@@ -24,9 +24,9 @@ class ModelConfig:
     d_ff:       int = 3584
 
     # MoE
-    moe_n_routed_experts:    int = 8
+    moe_n_routed_experts:    int = 4
     moe_top_k:               int = 2
-    ds_moe_n_shared_experts: int = 1
+    ds_moe_n_shared_experts: int = 2
 
     # MLA
     mla_latent_dim: int = 160
