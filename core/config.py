@@ -48,7 +48,7 @@ class ModelConfig:
     # RoPE
     rope_theta:                float = 500000.0
     rope_original_max_seq_len: int   = 1024
-    rope_scale_factor:         float = 2.0
+    rope_scale_factor:         float = 1.0
 
     # Flash Attention 2
     use_flash_attention: bool = True
