@@ -99,7 +99,7 @@ class TrainConfig:
     # Optimizer
     # use_muon=True  → MuonAdamW (Muon per matrici 2D, AdamW per il resto)
     # use_muon=False → AdamW puro (comportamento precedente)
-    use_muon:      bool  = True
+    use_muon:      bool  = False
     muon_momentum: float = 0.95
     muon_beta2:    float = 0.95
     muon_ns_steps: int   = 5       # step di orthogonalizzazione polare
