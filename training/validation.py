@@ -82,15 +82,17 @@ class ValidationScheduler:
 
         if len(self._train_losses) >= 10:
             recent = list(self._train_losses)[-10:]
-            mean   = sum(recent) / len(recent)
-            std    = float(torch.tensor(recent).std())
+            n      = len(recent)
+            mean   = sum(recent) / n
+            # std pura Python — evita allocazione torch.tensor ad ogni step
+            var    = sum((x - mean) ** 2 for x in recent) / n
+            std    = var ** 0.5
             cv     = std / mean if mean > 0 else 0.0
-
-            n    = len(recent)
+            # slope lineare pura Python
             sx   = n * (n - 1) / 2
-            sxx  = sum(i * i for i in range(n))
+            sxx  = n * (n - 1) * (2 * n - 1) / 6
             sxy  = sum(i * v for i, v in enumerate(recent))
-            sy   = sum(recent)
+            sy   = mean * n
             den  = n * sxx - sx * sx
             slope = (n * sxy - sx * sy) / den if den != 0 else 0.0
 
@@ -312,10 +314,7 @@ def run_validation_step(
     Returns:
         ``ValidationResult`` se la validation è stata eseguita, ``None`` altrimenti.
     """
-    current_train_loss = (
-        sum(ctx.train_losses) / len(ctx.train_losses)
-        if ctx.train_losses else accum_loss
-    )
+    current_train_loss = accum_loss / max(steps_since_val, 1)
     should_val, reason = val_scheduler.should_validate(
         iter_num, current_train_loss, force=force_val,
     )
