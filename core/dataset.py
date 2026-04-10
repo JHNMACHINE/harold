@@ -1,24 +1,20 @@
 """
-dataset.py — Harold v0.4  (ottimizzato)
+dataset.py — Harold v0.6  (ottimizzato)
 =========================================
 Ottimizzazioni rispetto alla versione originale:
 
   [OPT-D1] DataLoader: aggiunto prefetch_factor=2 — i worker prelevano
            il prossimo batch mentre la GPU elabora quello corrente.
-           Elimina quasi completamente l'idle time del DataLoader.
-           Compatibile con persistent_workers=True già presente.
 
   [OPT-D2] MixedStreamingDataset.__iter__: rimossa la lista carry con
            slicing O(n) — sostituita con deque + popleft O(1).
-           Su sequenze lunghe (seq_len=1024) con molti documenti,
-           evita riallocazioni frequenti della lista.
 
-  [OPT-D3] worker_init_fn: aggiunto anche al val_loader (era assente)
-           per garantire partizionamento corretto degli stream anche
-           in validazione.
+  [OPT-D3] worker_init_fn: aggiunto anche al val_loader.
 
-  [OPT-D4] num_workers auto-selezionato in base ai core disponibili
-           invece di hardcoded=4. Usa min(4, os.cpu_count()//2).
+  [OPT-D4] num_workers auto-selezionato in base ai core disponibili.
+
+  [OPT-D5] Fix Python 3.14: worker_init_fn DDP spostata a livello di
+           modulo con functools.partial — evita PicklingError su closure.
 """
 
 from __future__ import annotations
@@ -26,6 +22,7 @@ from collections import deque
 from pathlib import Path
 from typing import Iterator, Optional
 import os
+import functools
 import yaml
 import torch
 from transformers import BatchEncoding, PreTrainedTokenizer
@@ -71,17 +68,12 @@ def _first_token_id(val) -> int | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _optimal_num_workers(max_workers: int = 4) -> int:
-    """
-    Calcola il numero ottimale di worker in base ai core disponibili.
-    Usa metà dei core fisici, fino a max_workers.
-    Su sistemi con pochi core (es. Colab), ritorna 0 per evitare overhead.
-    """
     try:
         n_cpu = os.cpu_count() or 1
     except Exception:
         n_cpu = 1
     if n_cpu <= 2:
-        return 0   # single-process — meno overhead su macchine piccole
+        return 0
     return min(max_workers, n_cpu // 2)
 
 
@@ -92,7 +84,6 @@ def _optimal_num_workers(max_workers: int = 4) -> int:
 def load_dataset_config(yaml_path: str = "datasets_config.yaml") -> dict:
     path = Path(yaml_path)
     if not path.is_absolute() and not path.exists():
-        # Cerca nella stessa directory di dataset.py (core/)
         path = Path(__file__).parent / yaml_path
     if not path.exists():
         raise FileNotFoundError(
@@ -247,12 +238,12 @@ def _iter_sft_dataset(
             doc_idx += 1
 
     elif structure == "ranked_pairs":
-        role_f   = fields.get("role", "role")
-        text_f   = fields.get("text", "text")
-        rank_f   = fields.get("rank", "rank")
-        prompter = fields.get("prompter_role", "prompter")
+        role_f    = fields.get("role", "role")
+        text_f    = fields.get("text", "text")
+        rank_f    = fields.get("rank", "rank")
+        prompter  = fields.get("prompter_role", "prompter")
         assistant = fields.get("assistant_role", "assistant")
-        doc_idx  = 0
+        doc_idx   = 0
         buffer: list[dict] = []
         for example in ds:
             role = str(example.get(role_f) or "")
@@ -270,10 +261,10 @@ def _iter_sft_dataset(
                 buffer = []
 
     elif structure == "multiturn":
-        msg_f  = fields.get("messages", "messages")
-        role_f = fields.get("role_field", "role")
-        cont_f = fields.get("content_field", "content")
-        asst   = fields.get("assistant_role", "assistant")
+        msg_f   = fields.get("messages", "messages")
+        role_f  = fields.get("role_field", "role")
+        cont_f  = fields.get("content_field", "content")
+        asst    = fields.get("assistant_role", "assistant")
         doc_idx = 0
         for example in ds:
             messages = _to_list(example.get(msg_f, []))
@@ -345,7 +336,6 @@ class MixedStreamingDataset(IterableDataset):
     def __iter__(self) -> Iterator[dict]:
         iters    = self._make_iterators()
         names    = list(iters.keys())
-        # [OPT-D2] deque invece di lista + slicing — append/popleft O(1)
         carry: deque[int] = deque()
         counters = {n: 0.0 for n in names}
         incs     = {n: 1.0 / self.weights[n] for n in names}
@@ -365,7 +355,6 @@ class MixedStreamingDataset(IterableDataset):
             carry.extend(ids)
 
             while len(carry) >= self.seq_len:
-                # [OPT-D2] Preleva seq_len elementi dalla deque O(1) per elem
                 chunk = [carry.popleft() for _ in range(self.seq_len)]
                 input_ids = torch.tensor(chunk, dtype=torch.long)
                 yield {"input_ids": input_ids}
@@ -452,7 +441,7 @@ class SFTDataset(IterableDataset):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Factory
+# Worker init functions — a livello di modulo per serializzabilità Python 3.14
 # ─────────────────────────────────────────────────────────────────────────────
 
 def worker_init_fn(worker_id: int) -> None:
@@ -462,6 +451,19 @@ def worker_init_fn(worker_id: int) -> None:
         ds = worker_info.dataset
         current_seed = getattr(ds, "seed", 42)
         setattr(ds, "seed", current_seed + worker_info.id * 31)
+
+
+def _worker_init_fn_ddp(worker_id: int, rank_seed: int = 42) -> None:
+    """[OPT-D5] worker_init_fn serializzabile per DDP — usa functools.partial per il seed."""
+    wi = torch.utils.data.get_worker_info()
+    if wi is not None:
+        ds = wi.dataset
+        setattr(ds, "seed", getattr(ds, "seed", rank_seed) + wi.id * 31)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Factory
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_loaders(
     train_cfg,
@@ -483,8 +485,6 @@ def build_loaders(
         split="val", val_every=train_cfg.val_every,
         seed=42, buffer_size=train_cfg.stream_buffer_size,
     )
-
-
 
     num_workers = _optimal_num_workers(max_workers=4)
     prefetch    = 2 if num_workers > 0 else None
@@ -565,12 +565,10 @@ def build_loaders_ddp(
     Costruisce i DataLoader partizionati per rank DDP.
 
     Con IterableDataset in streaming non esiste DistributedSampler —
-    la partizionamento avviene tramite seed offset per rank, così ogni
-    GPU vede porzioni diverse dello stream senza duplicati:
+    il partizionamento avviene tramite seed offset per rank:
       rank 0: seed=42
       rank 1: seed=1042
       rank 2: seed=2042
-      ...
     """
     cfg         = load_dataset_config(yaml_path)
     dataset_cfg = cfg["pretraining"]
@@ -588,24 +586,21 @@ def build_loaders_ddp(
         seed=rank_seed, buffer_size=train_cfg.stream_buffer_size,
     )
 
-    def worker_init_fn(_: int) -> None:
-        wi = torch.utils.data.get_worker_info()
-        if wi is not None:
-            ds = wi.dataset
-            setattr(ds, "seed", getattr(ds, "seed", rank_seed) + wi.id * 31)
+    # [OPT-D5] functools.partial invece di closure — serializzabile in Python 3.14
+    ddp_init_fn = functools.partial(_worker_init_fn_ddp, rank_seed=rank_seed)
 
     num_workers = _optimal_num_workers(max_workers=4)
     prefetch    = 2 if num_workers > 0 else None
     train_loader = DataLoader(
         train_ds, batch_size=train_cfg.batch_size,
-        pin_memory=True, worker_init_fn=worker_init_fn,
+        pin_memory=True, worker_init_fn=ddp_init_fn,
         num_workers=num_workers,
         prefetch_factor=prefetch,
         persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
         val_ds, batch_size=train_cfg.batch_size,
-        pin_memory=True, worker_init_fn=worker_init_fn,
+        pin_memory=True, worker_init_fn=ddp_init_fn,
         num_workers=num_workers,
         prefetch_factor=prefetch,
         persistent_workers=num_workers > 0,
