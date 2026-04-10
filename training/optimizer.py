@@ -21,6 +21,8 @@ import torch
 import torch.nn as nn
 from typing import List, TYPE_CHECKING
 
+from utils.ddp import is_main
+
 if TYPE_CHECKING:
     from core.config import TrainConfig
     from core.model import Harold
@@ -278,7 +280,8 @@ def build_optimizer(
 
     n_muon  = sum(p.numel() for p in muon_params)
     n_adamw = sum(p.numel() for p in adamw_params)
-    print(f"MuonAdamW — Muon: {n_muon/1e6:.1f}M params  |  AdamW: {n_adamw/1e6:.1f}M params")
+    if is_main():
+        print(f"MuonAdamW — Muon: {n_muon/1e6:.1f}M params  |  AdamW: {n_adamw/1e6:.1f}M params")
 
     param_groups = [
         {

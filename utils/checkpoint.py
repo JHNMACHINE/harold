@@ -35,6 +35,7 @@ from core.config import HF_FILENAME, HF_REPO_ID
 import sys
 from core import config as _core_config
 from core import model as _core_model
+from utils.ddp import is_main
 sys.modules.setdefault("config", _core_config)
 sys.modules.setdefault("model", _core_model)
 
@@ -253,16 +254,18 @@ def load_checkpoint(
         if not _load_from_hf(path):
             print("  Nessun checkpoint trovato — parto da zero.")
             return _default_result(load_stage)
-
-    print(f"Carico checkpoint: {path}")
+    if is_main():
+        print(f"Carico checkpoint: {path}")
     state = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(state["model_state"])
 
     if "optimizer_state" in state:
         optimizer.load_state_dict(state["optimizer_state"])
-        print("  optimizer state caricato")
+        if is_main():
+            print("  optimizer state caricato")
     else:
-        print("  optimizer state assente (checkpoint periodico) — riparte da zero")
+        if is_main():
+            print("  optimizer state assente (checkpoint periodico) — riparte da zero")
 
     if "scaler_state" in state:
         scaler.load_state_dict(state["scaler_state"])
