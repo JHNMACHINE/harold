@@ -9,7 +9,7 @@ pretraining:
 
   - name: fineweb
     path: HuggingFaceFW/fineweb-edu
-    config: CC-MAIN-2024-10
+    config: sample-10BT
     split: train
     text_field: text
     weight: 0.50
