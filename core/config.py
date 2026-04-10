@@ -36,8 +36,8 @@ class ModelConfig:
     dsa_global_every: int = 64
 
     # Sequenza
-    max_seq_len: int = 2048
-    block_size:  int = 2048
+    max_seq_len: int = 1024
+    block_size:  int = 1024
 
     # Flow Matching
     flow_sigma_min: float = 1e-4
