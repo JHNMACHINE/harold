@@ -1,32 +1,9 @@
 # Harold v0.6 — Dataset Configuration
 # =====================================
-# Modifica questo file per cambiare dataset senza toccare il codice Python.
-#
-# Campi per ogni dataset:
-#   name:       identificatore univoco (usato nei log e nei pesi)
-#   path:       HuggingFace dataset path
-#   config:     (opzionale) nome della configurazione HF
-#   split:      split HF da usare ("train", "train[:10%]", ecc.)
-#   text_field: campo del dataset contenente il testo
-#   weight:     proporzione nel mix (devono sommare a 1.0)
-#   format:     (opzionale) handler speciale per formati non-standard
-#               valori: "standard" (default), "codecontests", "oasst2", "openorca"
-#
-# I pesi devono sommare a 1.0 per sezione (pretraining e sft separatamente).
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pretraining
+# Pretraining — mix minimo ad alta qualità
 # ─────────────────────────────────────────────────────────────────────────────
-#
-# Mix progettato per Harold v0.6 (1.5B):
-#   - FineWeb-Edu + Wikipedia + C4: base general-purpose di alta qualità
-#   - SlimPajama: diversità tematica e stilistica
-#   - peS2o: paper scientifici open-access, migliora coerenza long-form
-#   - pg19: libri Project Gutenberg, coerenza su sequenze lunghe
-#   - github-code: codice variegato (meglio di CodeContests per 1.5B)
-#   - OpenMathInstruct: ridotto al 3% per evitare overspecialization
-#
-# Rimosso: CodeContests (troppo difficile per 1.5B, rumore > segnale)
 
 pretraining:
 
@@ -35,7 +12,13 @@ pretraining:
     config: CC-MAIN-2024-10
     split: train
     text_field: text
-    weight: 0.25
+    weight: 0.50
+
+  - name: slimpajama
+    path: DKYoon/SlimPajama-6B
+    split: train
+    text_field: text
+    weight: 0.35
 
   - name: wikipedia
     path: wikimedia/wikipedia
@@ -44,72 +27,16 @@ pretraining:
     text_field: text
     weight: 0.15
 
-  - name: slimpajama
-    path: DKYoon/SlimPajama-6B
-    split: train
-    text_field: text
-    weight: 0.20
-
-  - name: c4
-    path: allenai/c4
-    config: en
-    split: train
-    text_field: text
-    weight: 0.13
-
-  - name: arxiv
-    path: ccdv/arxiv-summarization
-    split: train
-    text_field: article
-    weight: 0.09
-
-  - name: pg19
-    path: emozilla/pg19
-    split: train
-    text_field: text
-    weight: 0.12
-
-  - name: python_code
-    path: flytech/python-codes-25k
-    split: train
-    text_field: output
-    weight: 0.03
-
-  - name: openmath
-    path: nvidia/OpenMathInstruct-1
-    split: train
-    text_field: generated_solution
-    weight: 0.03  # ridotto al 3% — evita overspecialization in pretraining
-
 # ─────────────────────────────────────────────────────────────────────────────
-# SFT (Supervised Fine-Tuning)
+# SFT — mix minimo
 # ─────────────────────────────────────────────────────────────────────────────
-#
-# Mix aggiornato per il 2026:
-#   - ultrafeedback: preferenze binarizzate di alta qualità (sostituisce oasst2)
-#   - tulu3: mix SFT curato da AllenAI, molto vario
-#   - magpie_ultra: conversazioni sintetiche di alta qualità
-#   - openorca: Q&A chain-of-thought, mantenuto
-#
-# Rimosso: oasst2 (dataset 2023, piccolo, qualità variabile)
 
 sft:
-
-  - name: ultrafeedback
-    path: HuggingFaceH4/ultrafeedback_binarized
-    split: train_sft
-    weight: 0.35
-    structure: multiturn
-    fields:
-      messages: messages
-      role_field: role
-      content_field: content
-      assistant_role: assistant
 
   - name: tulu3
     path: allenai/tulu-3-sft-mixture
     split: train
-    weight: 0.30
+    weight: 0.60
     structure: multiturn
     fields:
       messages: messages
@@ -117,19 +44,10 @@ sft:
       content_field: content
       assistant_role: assistant
 
-  - name: magpie_ultra
-    path: argilla/magpie-ultra-v0.1
-    split: train
-    weight: 0.15
-    structure: pairs
-    fields:
-      context: instruction
-      response: response
-
   - name: openorca
     path: Open-Orca/OpenOrca
     split: train
-    weight: 0.20
+    weight: 0.40
     structure: pairs
     fields:
       context: [system_prompt, question]
