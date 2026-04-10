@@ -455,6 +455,14 @@ class SFTDataset(IterableDataset):
 # Factory
 # ─────────────────────────────────────────────────────────────────────────────
 
+def worker_init_fn(worker_id: int) -> None:
+    """Partiziona lo stream tra i worker per evitare duplicati."""
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is not None:
+        ds = worker_info.dataset
+        current_seed = getattr(ds, "seed", 42)
+        setattr(ds, "seed", current_seed + worker_info.id * 31)
+
 def build_loaders(
     train_cfg,
     tokenizer: PreTrainedTokenizer,
@@ -476,13 +484,7 @@ def build_loaders(
         seed=42, buffer_size=train_cfg.stream_buffer_size,
     )
 
-    def worker_init_fn(worker_id: int) -> None:
-        """Partiziona lo stream tra i worker per evitare duplicati."""
-        worker_info = torch.utils.data.get_worker_info()
-        if worker_info is not None:
-            ds = worker_info.dataset
-            current_seed = getattr(ds, "seed", 42)
-            setattr(ds, "seed", current_seed + worker_info.id * 31)
+
 
     num_workers = _optimal_num_workers(max_workers=4)
     prefetch    = 2 if num_workers > 0 else None
