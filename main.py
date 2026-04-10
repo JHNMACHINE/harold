@@ -24,6 +24,7 @@ import warnings
 
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/.torch_cache")
 os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "10.0")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
