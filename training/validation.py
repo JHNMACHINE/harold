@@ -9,7 +9,8 @@ run_validation_step:  orchestrazione completa di un singolo step di validation.
 
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+from contextlib import AbstractContextManager
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Protocol, Tuple, runtime_checkable
 
 import time
 import torch
@@ -18,6 +19,17 @@ from torch.utils.data import DataLoader
 from core.config import ModelConfig, TrainConfig
 from core.model import Harold
 from utils.logger import AsyncLogger
+
+
+@runtime_checkable
+class ValCfg(Protocol):
+    """Protocol con i campi minimi richiesti da estimate_loss e estimate_loss_single_t.
+    Soddisfatto sia da TrainConfig che da SFTConfig senza ereditarietà."""
+    eval_iters:     int
+    ce_loss_weight: float
+
+    @property
+    def ctx(self) -> "AbstractContextManager": ...
 from utils.checkpoint import save_checkpoint
 from utils.ddp import all_reduce_mean
 
@@ -146,16 +158,19 @@ class ValidationScheduler:
 @torch.no_grad()
 def estimate_loss_single_t(
     model:        Harold,
-    train_cfg:    TrainConfig,
+    train_cfg:    ValCfg,
     val_loader:   DataLoader,
     pad_token_id: int,
     t:            float = 0.5,
+    encode_fn:    Optional[Callable] = None,
 ) -> float:
     """
     Validation rapida a singolo timestep — usa metà dei batch normali.
 
     Args:
-        t: timestep fisso per la validation (default: 0.5, punto medio della traiettoria)
+        t:         timestep fisso per la validation (default: 0.5)
+        encode_fn: funzione opzionale (batch, device) -> ctx_emb per SFT CFG.
+                   Se None, ctx_emb non viene passato (pretraining).
     """
     device  = next(model.parameters()).device
     model.eval()
@@ -165,18 +180,22 @@ def estimate_loss_single_t(
     for i, batch in enumerate(val_loader):
         if i >= train_cfg.eval_iters // 2:
             break
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
-        mask      = (input_ids != pad_token_id)
+        input_ids = batch.get("input_ids", batch.get("response_ids")).to(device, non_blocking=True)
+        mask      = batch.get("response_mask", (input_ids != pad_token_id))
+        if isinstance(mask, torch.Tensor):
+            mask = mask.to(device, non_blocking=True)
         if mask.sum() < 10:
             continue
         B = input_ids.shape[0]
         if B not in t_cache:
             t_cache[B] = torch.full((B,), t, dtype=torch.float32, device=device)
+        ctx_emb = encode_fn(batch, device) if encode_fn is not None else None
         with train_cfg.ctx:
             _, loss_dict = model.compute_loss(
                 x0=input_ids, mask=mask,
                 ce_weight=train_cfg.ce_loss_weight,
                 fixed_t=t_cache[B], self_cond_prob=0.0,
+                ctx_emb=ctx_emb,
             )
         losses.append(loss_dict["total"])
 
@@ -187,11 +206,12 @@ def estimate_loss_single_t(
 @torch.no_grad()
 def estimate_loss(
     model:        Harold,
-    train_cfg:    TrainConfig,
+    train_cfg:    ValCfg,
     val_loader:   DataLoader,
     pad_token_id: int = 50256,
     iter_num:     int = 0,
     logger:       Optional[AsyncLogger] = None,
+    encode_fn:    Optional[Callable] = None,
 ) -> float:
     """
     Validation completa su t = [0.3, 0.5, 0.7].
@@ -200,6 +220,8 @@ def estimate_loss(
     - t_values ridotti da 5 a 3 (0.1 e 0.9 poco informativi per Flow Matching)
     - Cache ``fixed_t`` per evitare allocazioni GPU ripetute
     - Accumulatori su GPU invece di liste CPU
+    - encode_fn opzionale (batch, device) -> ctx_emb per SFT CFG.
+      Se None, ctx_emb non viene passato (pretraining).
     """
     device  = next(model.parameters()).device
     model.eval()
@@ -220,11 +242,14 @@ def estimate_loss(
             batch = next(iterator)
         except StopIteration:
             break
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
-        mask      = (input_ids != pad_token_id)
+        input_ids = batch.get("input_ids", batch.get("response_ids")).to(device, non_blocking=True)
+        mask      = batch.get("response_mask", (input_ids != pad_token_id))
+        if isinstance(mask, torch.Tensor):
+            mask = mask.to(device, non_blocking=True)
         if mask.sum() < 10:
             continue
         B = input_ids.shape[0]
+        ctx_emb = encode_fn(batch, device) if encode_fn is not None else None
         for idx, t_val in enumerate(t_values):
             key = (t_val, B)
             if key not in t_cache:
@@ -234,6 +259,7 @@ def estimate_loss(
                     x0=input_ids, mask=mask,
                     ce_weight=train_cfg.ce_loss_weight,
                     fixed_t=t_cache[key], self_cond_prob=0.0,
+                    ctx_emb=ctx_emb,
                 )
             sum_total[idx] += loss_dict["total"]
             sum_score[idx] += loss_dict["score"]

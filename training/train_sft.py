@@ -18,7 +18,7 @@ Ottimizzazioni rispetto alla versione precedente:
   [OPT-S2] ValidationScheduler adattivo - frequenza variabile in base alla stabilità
   [OPT-S3] Quick validation - alterna full (5 t) e quick (t=0.5) per risparmiare tempo
   [OPT-S4] Fix allocazioni CPU - sum/mean puri Python invece di torch.tensor(v).mean()
-  [OPT-S5] non_blocking=True in estimate_sft_loss
+  [OPT-S5] non_blocking=True in estimate_loss (validation.py)
   [OPT-S6] _optimal_num_workers per stage 2
 
 Avvio:
@@ -43,7 +43,7 @@ from core.config import ModelConfig, SFTConfig
 from core.dataset import SFTDataset, build_sft_loaders, load_dataset_config, _optimal_num_workers
 from utils.logger import AsyncLogger
 from core.model import Harold, build_model
-from training.validation import ValidationScheduler
+from training.validation import ValidationScheduler, estimate_loss, estimate_loss_single_t
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 
@@ -72,93 +72,12 @@ def get_lr(it: int, cfg: SFTConfig, max_iters: int, base_lr: float) -> float:
     return cfg.min_lr + 0.5 * (1.0 + math.cos(math.pi * ratio)) * (base_lr - cfg.min_lr)
 
 
-@torch.no_grad()
-def estimate_sft_loss(
-    model:        Harold,
-    sft_cfg:      SFTConfig,
-    val_loader:   DataLoader,
-    pad_token_id: int,
-    iter_num:     int = 0,
-    logger:       Optional[AsyncLogger] = None,
-    quick:        bool = False,
-) -> float:
-    """
-    Validation SFT.
-
-    quick=True  -> solo t=0.5, metà dei batch - rapida tra le full
-    quick=False -> t = [0.1, 0.3, 0.5, 0.7, 0.9], completa
-    """
-    device   = next(model.parameters()).device
-    model.eval()
-
-    # [OPT-S3] Quick validation usa solo t=0.5
-    t_values  = [0.5] if quick else [0.1, 0.3, 0.5, 0.7, 0.9]
-    eval_iters = sft_cfg.eval_iters // 2 if quick else sft_cfg.eval_iters
-
-    # [OPT-S4] Accumulatori puri Python invece di liste + torch.tensor().mean()
-    sum_total = {t: 0.0 for t in t_values}
-    sum_score = {t: 0.0 for t in t_values}
-    sum_ce    = {t: 0.0 for t in t_values}
-    count     = {t: 0   for t in t_values}
-
-    t_cache: dict = {}
-    iterator = iter(val_loader)
-
-    for _ in range(eval_iters):
-        try:
-            batch = next(iterator)
-        except StopIteration:
-            break
-
-        # [OPT-S5] non_blocking=True
-        prompt_ids   = batch["prompt_ids"].to(device, non_blocking=True)
-        response_ids = batch["response_ids"].to(device, non_blocking=True)
-        resp_mask    = batch["response_mask"].to(device, non_blocking=True)
-        if resp_mask.sum() == 0:
-            continue
-
-        ctx_emb = encode_context(model, prompt_ids, pad_token_id)
-        B = response_ids.shape[0]
-
-        for t_val in t_values:
-            key = (t_val, B)
-            if key not in t_cache:
-                t_cache[key] = torch.full((B,), t_val, dtype=torch.float32, device=device)
-            with sft_cfg.ctx:
-                _, loss_dict = model.compute_loss(
-                    x0=response_ids, mask=resp_mask,
-                    ce_weight=sft_cfg.ce_loss_weight,
-                    fixed_t=t_cache[key], self_cond_prob=0.0,
-                    ctx_emb=ctx_emb, p_uncond=0.0,
-                )
-            sum_total[t_val] += loss_dict["total"]
-            sum_score[t_val] += loss_dict["score"]
-            sum_ce[t_val]    += loss_dict["ce"]
-            count[t_val]     += 1
-
-    model.train()
-
-    per_t_total = {t: sum_total[t] / max(count[t], 1) for t in t_values}
-    per_t_score = {t: sum_score[t] / max(count[t], 1) for t in t_values}
-    per_t_ce    = {t: sum_ce[t]    / max(count[t], 1) for t in t_values}
-
-    if is_main():
-        if not quick:
-            print("  val total: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_total.items()))
-            print("  val score: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_score.items()))
-            print("  val CE:    " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_ce.items()))
-        if logger:
-            logger.log({
-                "type":        "val_detail",
-                "iter":        iter_num,
-                "quick":       quick,
-                "total_per_t": {str(t): round(v, 6) for t, v in per_t_total.items()},
-                "score_per_t": {str(t): round(v, 6) for t, v in per_t_score.items()},
-                "ce_per_t":    {str(t): round(v, 6) for t, v in per_t_ce.items()},
-            })
-
-    valid = [v for v in per_t_total.values() if v < float("inf")]
-    return sum(valid) / len(valid) if valid else float("inf")
+def _make_sft_encode_fn(model: Harold, pad_token_id: int):
+    """Crea l'encode_fn per la SFT validation - passa ctx_emb a compute_loss."""
+    def _encode(batch: dict, device: str) -> torch.Tensor:
+        prompt_ids = batch["prompt_ids"].to(device, non_blocking=True)
+        return encode_context(model, prompt_ids, pad_token_id)
+    return _encode
 
 
 def run_stage(
@@ -296,14 +215,22 @@ def run_stage(
         if should_val and iter_num > 0:
             # [OPT-S3] alterna full e quick validation
             is_quick = (val_scheduler.total_val_calls % 3 != 0
-                        and not "unstable" in reason
+                        and "unstable" not in reason
                         and iter_num != max_iters - 1)
 
-            local_val = estimate_sft_loss(
-                model, sft_cfg, val_loader, pad_token_id,
-                iter_num=iter_num, logger=logger if is_main() else None,
-                quick=is_quick,
-            )
+            encode_fn = _make_sft_encode_fn(model, pad_token_id)
+            if is_quick:
+                local_val = estimate_loss_single_t(
+                    model, sft_cfg, val_loader, pad_token_id,
+                    t=0.5, encode_fn=encode_fn,
+                )
+            else:
+                local_val = estimate_loss(
+                    model, sft_cfg, val_loader, pad_token_id,
+                    iter_num=iter_num,
+                    logger=logger if is_main() else None,
+                    encode_fn=encode_fn,
+                )
 
             if is_ddp():
                 val_tensor = torch.tensor(local_val, device=device)
@@ -580,8 +507,10 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
         logger=logger,
     )
 
-    final_path = os.path.join(sft_cfg.checkpoint_dir, f"{sft_cfg.checkpoint_prefix}_final.pt")
+    final_path = ""
     if is_main():
+        final_path = os.path.join(sft_cfg.checkpoint_dir,
+                                  f"{sft_cfg.checkpoint_prefix}_final.pt")
         save_checkpoint(
             final_path, raw_model, optimizer, scaler,
             sft_cfg.stage2_max_iters, best_val2, model_cfg, sft_cfg,
@@ -601,6 +530,7 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
         "best_val_s2":     best_val2,
         "train_losses":    train_losses,
         "val_losses":      val_losses,
+        "checkpoint_path": final_path,
         "best_val_loss":   min(best_val, best_val2),
     }
 
