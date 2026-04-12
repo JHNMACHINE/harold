@@ -1,5 +1,5 @@
 """
-Harold v0.5 — train_sft.py
+Harold v0.6 — train_sft.py
 ===========================
 Supervised Fine-Tuning con Classifier-Free Guidance (CFG).
 
@@ -159,7 +159,7 @@ def run_stage(
 
     pbar = tqdm(
         range(initial_iter, max_iters),
-        desc=f"Harold v0.5 SFT s{stage}",
+        desc=f"Harold v0.6 SFT s{stage}",
         disable=not is_main(),
     )
 
@@ -326,7 +326,7 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
     sft_cfg.world_size = world_size
 
     if is_main():
-        print("Harold v0.5 — SFT con CFG (Flow Matching)")
+        print("Harold v0.6 — SFT con CFG (Flow Matching)")
         print(f"Modalità:       {'DDP (' + str(world_size) + ' GPU)' if use_ddp else 'Single-GPU'}")
         print(f"Device:         {device}")
         print(f"Dtype:          {sft_cfg.dtype}")
@@ -368,9 +368,9 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
     if is_main():
         n_params = sum(p.numel() for p in model.parameters()) / 1e6
         if n_params >= 1000:
-            print(f"Harold v0.5 SFT — {n_params/1000:.2f}B parametri")
+            print(f"Harold v0.6 SFT — {n_params/1000:.2f}B parametri")
         else:
-            print(f"Harold v0.5 SFT — {n_params:.1f}M parametri")
+            print(f"Harold v0.6 SFT — {n_params:.1f}M parametri")
 
     cfg_params   = list(raw_model.cfg_proj.parameters())
     other_params = [p for n, p in raw_model.named_parameters()
@@ -419,7 +419,7 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
     # ── Strato 1 ──────────────────────────────────────────────────────────────
     if initial_stage <= 1:
         if is_main():
-            print(f"\nStrato 1: oasst2 + OpenOrca — {sft_cfg.max_iters} step\n")
+            print(f"\nStrato 1: tulu3 + OpenOrca — {sft_cfg.max_iters} step\n")
 
         train_loader, val_loader = build_sft_loaders(
             sft_cfg, tokenizer,
@@ -518,6 +518,8 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
         "best_val_s2":     best_val2,
         "train_losses":    train_losses,
         "val_losses":      val_losses,
+        "checkpoint_path": final_path,  # aggiunto
+        "best_val_loss":   min(best_val, best_val2),  # aggiunto
     }
 
 
