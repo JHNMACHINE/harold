@@ -194,8 +194,8 @@ class SFTConfig:
     max_grad_norm: float = 1.0
     eval_interval: int   = 500
     eval_iters:    int   = 20
-    max_ctx_len:   int   = 128
-    max_resp_len:  int   = 128
+    max_ctx_len:   int   = 512
+    max_resp_len:  int   = 512
     max_ctx_turns: int   = 3
     p_uncond:      float = 0.1
     cfg_scale:     float = 3.0
