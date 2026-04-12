@@ -209,6 +209,8 @@ class SFTConfig:
     checkpoint_prefix: str = "harold_v06_sft"
     save_every:        int = 1000
     preload:           str = "latest"
+    use_compile:  bool = True
+    compile_mode: str  = "max-autotune"
     world_size: int = 0
     device: str = field(init=False)
     dtype:  str = field(init=False)
