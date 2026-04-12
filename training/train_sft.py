@@ -4,8 +4,8 @@ Harold v0.6 — train_sft.py
 Supervised Fine-Tuning con Classifier-Free Guidance (CFG).
 
 Pipeline:
-  1. Carica checkpoint del pretraining (harold_v05_final.pt)
-  2. Strato 1: oasst2 60% + OpenOrca 40% (mix YAML)
+  1. Carica checkpoint del pretraining
+  2. Strato 1: tulu3 60% + OpenOrca 40% (mix YAML)
   3. Strato 2: OpenOrca 100% (Q&A chain-of-thought)
 
 CFG (Flow Matching):
@@ -13,15 +13,23 @@ CFG (Flow Matching):
   - p_uncond=0.1 -> ctx_emb azzerato durante training (unconditional dropout)
   - In inferenza: vel_guided = vel_uncond + cfg_scale*(vel_cond - vel_uncond)
 
+Ottimizzazioni rispetto alla versione precedente:
+  [OPT-S1] torch.compile — stesso compile mode del pretraining
+  [OPT-S2] ValidationScheduler adattivo — frequenza variabile in base alla stabilità
+  [OPT-S3] Quick validation — alterna full (5 t) e quick (t=0.5) per risparmiare tempo
+  [OPT-S4] Fix allocazioni CPU — sum/mean puri Python invece di torch.tensor(v).mean()
+  [OPT-S5] non_blocking=True in estimate_sft_loss
+  [OPT-S6] _optimal_num_workers per stage 2
+
 Avvio:
-  torchrun --nproc_per_node=1 train_sft.py
-  python train_sft.py
+  torchrun --nproc_per_node=1 main.py --mode sft
 """
 
 import math
 import os
 import time
 import warnings
+from collections import deque
 from typing import Optional, Tuple, Union, cast
 
 import torch
@@ -32,9 +40,10 @@ from transformers import AutoTokenizer
 from utils.checkpoint import save_checkpoint, load_checkpoint
 from utils.ddp import DDPContext, is_ddp, is_main, all_reduce_mean, broadcast_model
 from core.config import ModelConfig, SFTConfig
-from core.dataset import SFTDataset, build_sft_loaders, load_dataset_config
+from core.dataset import SFTDataset, build_sft_loaders, load_dataset_config, _optimal_num_workers
 from utils.logger import AsyncLogger
 from core.model import Harold, build_model
+from training.validation import ValidationScheduler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 
@@ -71,25 +80,40 @@ def estimate_sft_loss(
     pad_token_id: int,
     iter_num:     int = 0,
     logger:       Optional[AsyncLogger] = None,
+    quick:        bool = False,
 ) -> float:
-    device    = next(model.parameters()).device
+    """
+    Validation SFT.
+
+    quick=True  -> solo t=0.5, metà dei batch — rapida tra le full
+    quick=False -> t = [0.1, 0.3, 0.5, 0.7, 0.9], completa
+    """
+    device   = next(model.parameters()).device
     model.eval()
 
-    t_values  = [0.1, 0.3, 0.5, 0.7, 0.9]
-    all_total = {t: [] for t in t_values}
-    all_score = {t: [] for t in t_values}
-    all_ce    = {t: [] for t in t_values}
-    iterator  = iter(val_loader)
+    # [OPT-S3] Quick validation usa solo t=0.5
+    t_values  = [0.5] if quick else [0.1, 0.3, 0.5, 0.7, 0.9]
+    eval_iters = sft_cfg.eval_iters // 2 if quick else sft_cfg.eval_iters
 
-    for _ in range(sft_cfg.eval_iters):
+    # [OPT-S4] Accumulatori puri Python invece di liste + torch.tensor().mean()
+    sum_total = {t: 0.0 for t in t_values}
+    sum_score = {t: 0.0 for t in t_values}
+    sum_ce    = {t: 0.0 for t in t_values}
+    count     = {t: 0   for t in t_values}
+
+    t_cache: dict = {}
+    iterator = iter(val_loader)
+
+    for _ in range(eval_iters):
         try:
             batch = next(iterator)
         except StopIteration:
             break
 
-        prompt_ids   = batch["prompt_ids"].to(device)
-        response_ids = batch["response_ids"].to(device)
-        resp_mask    = batch["response_mask"].to(device)
+        # [OPT-S5] non_blocking=True
+        prompt_ids   = batch["prompt_ids"].to(device, non_blocking=True)
+        response_ids = batch["response_ids"].to(device, non_blocking=True)
+        resp_mask    = batch["response_mask"].to(device, non_blocking=True)
         if resp_mask.sum() == 0:
             continue
 
@@ -97,38 +121,43 @@ def estimate_sft_loss(
         B = response_ids.shape[0]
 
         for t_val in t_values:
-            fixed_t = torch.full((B,), t_val, dtype=torch.float32, device=device)
+            key = (t_val, B)
+            if key not in t_cache:
+                t_cache[key] = torch.full((B,), t_val, dtype=torch.float32, device=device)
             with sft_cfg.ctx:
                 _, loss_dict = model.compute_loss(
                     x0=response_ids, mask=resp_mask,
                     ce_weight=sft_cfg.ce_loss_weight,
-                    fixed_t=fixed_t, self_cond_prob=0.0,
+                    fixed_t=t_cache[key], self_cond_prob=0.0,
                     ctx_emb=ctx_emb, p_uncond=0.0,
                 )
-            all_total[t_val].append(loss_dict["total"])
-            all_score[t_val].append(loss_dict["score"])
-            all_ce[t_val].append(loss_dict["ce"])
+            sum_total[t_val] += loss_dict["total"]
+            sum_score[t_val] += loss_dict["score"]
+            sum_ce[t_val]    += loss_dict["ce"]
+            count[t_val]     += 1
 
     model.train()
 
-    per_t_total = {t: float(torch.tensor(v).mean()) if v else float("inf") for t, v in all_total.items()}
-    per_t_score = {t: float(torch.tensor(v).mean()) if v else float("inf") for t, v in all_score.items()}
-    per_t_ce    = {t: float(torch.tensor(v).mean()) if v else float("inf") for t, v in all_ce.items()}
+    per_t_total = {t: sum_total[t] / max(count[t], 1) for t in t_values}
+    per_t_score = {t: sum_score[t] / max(count[t], 1) for t in t_values}
+    per_t_ce    = {t: sum_ce[t]    / max(count[t], 1) for t in t_values}
 
     if is_main():
-        print("  val total: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_total.items()))
-        print("  val score: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_score.items()))
-        print("  val CE:    " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_ce.items()))
+        if not quick:
+            print("  val total: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_total.items()))
+            print("  val score: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_score.items()))
+            print("  val CE:    " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_ce.items()))
         if logger:
             logger.log({
                 "type":        "val_detail",
                 "iter":        iter_num,
+                "quick":       quick,
                 "total_per_t": {str(t): round(v, 6) for t, v in per_t_total.items()},
                 "score_per_t": {str(t): round(v, 6) for t, v in per_t_score.items()},
                 "ce_per_t":    {str(t): round(v, 6) for t, v in per_t_ce.items()},
             })
 
-    valid = [v for v in per_t_total.values() if v != float("inf")]
+    valid = [v for v in per_t_total.values() if v < float("inf")]
     return sum(valid) / len(valid) if valid else float("inf")
 
 
@@ -150,12 +179,22 @@ def run_stage(
     val_losses:   list,
     logger:       Optional[AsyncLogger],
 ) -> Tuple[float, list, list]:
-    _logger = cast(AsyncLogger, logger)  # sempre non-None su rank 0
+    _logger    = cast(AsyncLogger, logger)
     device     = sft_cfg.device
-    world_size = sft_cfg.world_size if hasattr(sft_cfg, 'world_size') else 1
+    world_size = sft_cfg.world_size if hasattr(sft_cfg, "world_size") else 1
     start_time = time.time()
     train_iter = iter(train_loader)
-    accum_loss = 0.0
+    accum_loss      = 0.0
+    steps_since_val = 0
+
+    # [OPT-S2] ValidationScheduler adattivo
+    val_scheduler = ValidationScheduler(
+        base_interval       = sft_cfg.eval_interval,
+        min_interval        = max(100, sft_cfg.eval_interval // 5),
+        max_interval        = sft_cfg.eval_interval * 4,
+        stability_threshold = 0.03,
+        patience            = 3,
+    )
 
     pbar = tqdm(
         range(initial_iter, max_iters),
@@ -217,15 +256,15 @@ def run_stage(
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), sft_cfg.max_grad_norm)
         scaler.step(optimizer)
         scaler.update()
-        
-        # Assicurati che model abbia il metodo update_router_biases
-        if hasattr(model, 'update_router_biases'):
+
+        if hasattr(model, "update_router_biases"):
             model.update_router_biases()
 
         avg_loss  = step_loss_sum  / valid_count
         avg_score = step_score_sum / valid_count
         avg_ce    = step_ce_sum    / valid_count
-        accum_loss += avg_loss
+        accum_loss      += avg_loss
+        steps_since_val += 1
         train_losses.append(avg_loss)
 
         if is_main():
@@ -248,35 +287,56 @@ def run_stage(
                 "elapsed_min": round((time.time() - start_time) / 60, 2),
             })
 
-        # Valutazione
-        if iter_num % sft_cfg.eval_interval == 0 or iter_num == max_iters - 1:
-            if iter_num == 0:
-                continue
+        # ── Validation adattiva ───────────────────────────────────────────
+        current_loss = accum_loss / max(steps_since_val, 1)
+        should_val, reason = val_scheduler.should_validate(
+            iter_num, current_loss, force=(iter_num == max_iters - 1),
+        )
 
-            local_val = estimate_sft_loss(model, sft_cfg, val_loader, pad_token_id, iter_num, logger)
+        if should_val and iter_num > 0:
+            # [OPT-S3] alterna full e quick validation
+            is_quick = (val_scheduler.total_val_calls % 3 != 0
+                        and not "unstable" in reason
+                        and iter_num != max_iters - 1)
+
+            local_val = estimate_sft_loss(
+                model, sft_cfg, val_loader, pad_token_id,
+                iter_num=iter_num, logger=logger if is_main() else None,
+                quick=is_quick,
+            )
+
             if is_ddp():
-                val_loss = float(all_reduce_mean(
-                    torch.tensor(local_val, device=device), world_size
-                ).item())
+                val_tensor = torch.tensor(local_val, device=device)
+                val_loss   = float(all_reduce_mean(val_tensor, world_size).item())
             else:
                 val_loss = local_val
-            val_losses.append(val_loss)
-            avg_train  = accum_loss / max(sft_cfg.eval_interval, 1)
-            accum_loss = 0.0
-            elapsed    = (time.time() - start_time) / 60
+
+            val_scheduler.record(iter_num, val_loss)
+            avg_train       = accum_loss / max(steps_since_val, 1)
+            accum_loss      = 0.0
+            steps_since_val = 0
+            elapsed         = (time.time() - start_time) / 60
 
             if is_main():
-                print(
-                    f"\n[s{stage} iter {iter_num:7d}] "
-                    f"train={avg_train:.4f}  val={val_loss:.4f}  "
-                    f"lr={lr:.2e}  elapsed={elapsed:.1f}min"
-                )
+                val_type = "quick" if is_quick else "full"
+                if not is_quick:
+                    val_losses.append(val_loss)
+                    print(
+                        f"\n[s{stage} iter {iter_num:7d}] "
+                        f"train={avg_train:.4f}  val={val_loss:.4f}  "
+                        f"lr={lr:.2e}  elapsed={elapsed:.1f}min  [{val_type}|{reason}]"
+                    )
+                else:
+                    print(f"  [quick val] iter={iter_num} loss={val_loss:.4f} ({reason})")
+
                 _logger.log({
                     "type":        "val",
                     "stage":       stage,
                     "iter":        iter_num,
                     "train_loss":  round(avg_train, 6),
                     "val_loss":    round(val_loss,  6),
+                    "val_type":    val_type,
+                    "reason":      reason,
                     "lr":          lr,
                     "elapsed_min": round(elapsed, 2),
                 })
@@ -292,15 +352,15 @@ def run_stage(
                         iter_num, val_loss, model_cfg, sft_cfg,
                         train_losses, val_losses, stage=stage,
                     )
-                    print(f"  Best val loss s{stage}: {val_loss:.4f} -> {best_path}")
+                    print(f"  ★ Best val loss s{stage}: {val_loss:.4f} → {best_path}")
                     sft_cfg.write_latest(stage, iter_num, best_path)
                     _logger.log({"type": "best_checkpoint", "stage": stage,
-                                "iter": iter_num, "val_loss": round(val_loss, 6),
-                                "path": best_path})
+                                 "iter": iter_num, "val_loss": round(val_loss, 6),
+                                 "path": best_path})
 
             model.train()
 
-        # Checkpoint periodico
+        # ── Checkpoint periodico ──────────────────────────────────────────
         if iter_num > 0 and iter_num % sft_cfg.save_every == 0 and is_main():
             p = sft_cfg.ckpt_path(stage, iter_num)
             save_checkpoint(
@@ -309,20 +369,18 @@ def run_stage(
                 train_losses, val_losses, full=False, stage=stage,
             )
             sft_cfg.write_latest(stage, iter_num, p)
-            print(f"  Checkpoint periodico -> {p}")
+            print(f"  Checkpoint periodico → {p}")
             _logger.log({"type": "periodic_checkpoint", "stage": stage,
-                        "iter": iter_num, "path": p})
+                         "iter": iter_num, "path": p})
 
     return best_val, train_losses, val_losses
 
 
 def run_sft(sft_cfg: SFTConfig) -> dict:
-    ctx = DDPContext(default_device=sft_cfg.device).setup()
+    ctx        = DDPContext(default_device=sft_cfg.device).setup()
     device     = ctx.device
     world_size = ctx.world_size
     use_ddp    = ctx.active
-    
-    # Aggiungi world_size a sft_cfg per uso in run_stage
     sft_cfg.world_size = world_size
 
     if is_main():
@@ -334,7 +392,15 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
         print(f"p_uncond:       {sft_cfg.p_uncond}  (CFG dropout)")
         print(f"ctx_len:        {sft_cfg.max_ctx_len}  resp_len: {sft_cfg.max_resp_len}")
 
-    tokenizer = AutoTokenizer.from_pretrained(sft_cfg.tokenizer_model)
+    if device.startswith("cuda"):
+        torch.backends.cudnn.benchmark     = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        sft_cfg.tokenizer_model,
+        token=os.environ.get("HF_TOKEN"),
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     pad_token_id: int = int(tokenizer.pad_token_id)
@@ -345,32 +411,37 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
     model_cfg = state["model_cfg"]
     model     = build_model(model_cfg).to(device)
 
-    model: Union[Harold, DDP] = (
+    # [OPT-S1] torch.compile — solo single-GPU (DDP non supportato)
+    if not use_ddp:
+        use_compile = (
+            getattr(sft_cfg, "use_compile", True)
+            and hasattr(torch, "compile")
+            and device.startswith("cuda")
+            and torch.cuda.get_device_capability()[0] >= 7
+        )
+        if use_compile:
+            compile_mode = getattr(sft_cfg, "compile_mode", "reduce-overhead")
+            if is_main():
+                print(f"torch.compile() abilitato (mode='{compile_mode}')")
+            model = cast(Harold, torch.compile(model, mode=compile_mode))
+        elif is_main():
+            print("torch.compile() disabilitato")
+    elif is_main():
+        print("torch.compile() disabilitato (DDP)")
+
+    active_model: Union[Harold, DDP] = (
         DDP(model, device_ids=[ctx.local_rank], find_unused_parameters=True)
         if use_ddp else model
     )
+    raw_model: Harold = cast(Harold, active_model.module if isinstance(active_model, DDP) else active_model)
 
-    raw_model: Harold = cast(Harold, model.module if isinstance(model, DDP) else model)
-
-    # Gestisci il caricamento dei pesi con DDP
-    if use_ddp:
-        missing, unexpected = model.load_state_dict(state["model_state"], strict=False)
-    else:
-        missing, unexpected = model.load_state_dict(state["model_state"], strict=False)
-    
-    if is_main():
-        if missing:
-            print(f"Pesi mancanti (nuovi layer): {missing}")
-        if unexpected:
-            print(f"Pesi inattesi (ignorati): {unexpected}")
+    raw_model.load_state_dict(state["model_state"], strict=False)
     del state
 
     if is_main():
-        n_params = sum(p.numel() for p in model.parameters()) / 1e6
-        if n_params >= 1000:
-            print(f"Harold v0.6 SFT — {n_params/1000:.2f}B parametri")
-        else:
-            print(f"Harold v0.6 SFT — {n_params:.1f}M parametri")
+        n_params = sum(p.numel() for p in raw_model.parameters()) / 1e6
+        print(f"Harold v0.6 SFT — {n_params/1000:.2f}B parametri" if n_params >= 1000
+              else f"Harold v0.6 SFT — {n_params:.1f}M parametri")
 
     cfg_params   = list(raw_model.cfg_proj.parameters())
     other_params = [p for n, p in raw_model.named_parameters()
@@ -392,7 +463,7 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
         os.makedirs(sft_cfg.checkpoint_dir, exist_ok=True)
         log_path = os.path.join(sft_cfg.checkpoint_dir, "training_sft.log")
         logger   = AsyncLogger(log_path)
-        print(f"Log SFT -> {log_path}\n")
+        print(f"Log SFT → {log_path}\n")
 
     initial_stage = 1
     initial_iter  = 0
@@ -411,10 +482,13 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
 
         if ckpt_path and os.path.isfile(ckpt_path):
             initial_stage, initial_iter, best_val, train_losses, val_losses = load_checkpoint(
-                ckpt_path, model, optimizer, scaler, device, load_stage=True,
+                ckpt_path, raw_model, optimizer, scaler, device, load_stage=True,
             )
         elif is_main():
             print("Nessun SFT checkpoint trovato, parto dal pretraining.")
+
+    if use_ddp:
+        broadcast_model(raw_model)
 
     # ── Strato 1 ──────────────────────────────────────────────────────────────
     if initial_stage <= 1:
@@ -429,7 +503,7 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
             yaml_path="datasets_config.yaml",
         )
 
-        model.train()
+        active_model.train()
         best_val, train_losses, val_losses = run_stage(
             stage=1,
             model=raw_model, model_cfg=model_cfg, sft_cfg=sft_cfg,
@@ -448,11 +522,11 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
             s1_final = os.path.join(sft_cfg.checkpoint_dir,
                                     f"{sft_cfg.checkpoint_prefix}_s1_final.pt")
             save_checkpoint(
-                s1_final, model, optimizer, scaler,
+                s1_final, raw_model, optimizer, scaler,
                 sft_cfg.max_iters, best_val, model_cfg, sft_cfg,
                 train_losses, val_losses, stage=1,
             )
-            print(f"\nStrato 1 completato -> {s1_final}")
+            print(f"\nStrato 1 completato → {s1_final}")
 
     # ── Strato 2: OpenOrca 100% ───────────────────────────────────────────────
     if is_main():
@@ -462,6 +536,10 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
     s2_ds_cfg = [d for d in full_cfg["sft"] if d["name"] == "openorca"]
     for d in s2_ds_cfg:
         d["weight"] = 1.0
+
+    # [OPT-S6] _optimal_num_workers invece di hardcoded 0
+    num_workers = _optimal_num_workers(max_workers=2)
+    prefetch    = 2 if num_workers > 0 else None
 
     train_ds2 = SFTDataset(
         tokenizer=tokenizer, dataset_cfg=s2_ds_cfg, split="train",
@@ -473,15 +551,21 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
         max_ctx_len=sft_cfg.max_ctx_len, max_resp_len=sft_cfg.max_resp_len,
         max_ctx_turns=sft_cfg.max_ctx_turns, val_every=sft_cfg.val_every, seed=43,
     )
-    train_loader2 = DataLoader(train_ds2, batch_size=sft_cfg.batch_size,
-                               num_workers=0, pin_memory=False)
-    val_loader2   = DataLoader(val_ds2,   batch_size=sft_cfg.batch_size,
-                               num_workers=0, pin_memory=False)
+    train_loader2 = DataLoader(
+        train_ds2, batch_size=sft_cfg.batch_size,
+        num_workers=num_workers, pin_memory=True,
+        prefetch_factor=prefetch, persistent_workers=num_workers > 0,
+    )
+    val_loader2 = DataLoader(
+        val_ds2, batch_size=sft_cfg.batch_size,
+        num_workers=num_workers, pin_memory=True,
+        prefetch_factor=prefetch, persistent_workers=num_workers > 0,
+    )
 
     for pg in optimizer.param_groups:
         pg["lr"] = sft_cfg.stage2_lr
 
-    model.train()
+    active_model.train()
     best_val2, train_losses, val_losses = run_stage(
         stage=2,
         model=raw_model, model_cfg=model_cfg, sft_cfg=sft_cfg,
@@ -496,11 +580,10 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
         logger=logger,
     )
 
+    final_path = os.path.join(sft_cfg.checkpoint_dir, f"{sft_cfg.checkpoint_prefix}_final.pt")
     if is_main():
-        final_path = os.path.join(sft_cfg.checkpoint_dir,
-                                  f"{sft_cfg.checkpoint_prefix}_final.pt")
         save_checkpoint(
-            final_path, model, optimizer, scaler,
+            final_path, raw_model, optimizer, scaler,
             sft_cfg.stage2_max_iters, best_val2, model_cfg, sft_cfg,
             train_losses, val_losses, stage=2,
         )
@@ -509,7 +592,7 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
         logger.log({"type": "finished", "best_val_s1": round(best_val, 6),
                     "best_val_s2": round(best_val2, 6), "path": final_path})
         logger.close()
-        print(f"\nSFT completato -> {final_path}")
+        print(f"\nSFT completato → {final_path}")
 
     ctx.teardown()
 
@@ -518,8 +601,7 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
         "best_val_s2":     best_val2,
         "train_losses":    train_losses,
         "val_losses":      val_losses,
-        "checkpoint_path": final_path,  # aggiunto
-        "best_val_loss":   min(best_val, best_val2),  # aggiunto
+        "best_val_loss":   min(best_val, best_val2),
     }
 
 
