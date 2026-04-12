@@ -7,3 +7,4 @@ checkpoints
 .env
 files
 *.log
+output/
