@@ -1,5 +1,5 @@
 """
-Harold v0.6 — train_sft.py
+Harold v0.6 - train_sft.py
 ===========================
 Supervised Fine-Tuning con Classifier-Free Guidance (CFG).
 
@@ -14,10 +14,10 @@ CFG (Flow Matching):
   - In inferenza: vel_guided = vel_uncond + cfg_scale*(vel_cond - vel_uncond)
 
 Ottimizzazioni rispetto alla versione precedente:
-  [OPT-S1] torch.compile — stesso compile mode del pretraining
-  [OPT-S2] ValidationScheduler adattivo — frequenza variabile in base alla stabilità
-  [OPT-S3] Quick validation — alterna full (5 t) e quick (t=0.5) per risparmiare tempo
-  [OPT-S4] Fix allocazioni CPU — sum/mean puri Python invece di torch.tensor(v).mean()
+  [OPT-S1] torch.compile - stesso compile mode del pretraining
+  [OPT-S2] ValidationScheduler adattivo - frequenza variabile in base alla stabilità
+  [OPT-S3] Quick validation - alterna full (5 t) e quick (t=0.5) per risparmiare tempo
+  [OPT-S4] Fix allocazioni CPU - sum/mean puri Python invece di torch.tensor(v).mean()
   [OPT-S5] non_blocking=True in estimate_sft_loss
   [OPT-S6] _optimal_num_workers per stage 2
 
@@ -85,7 +85,7 @@ def estimate_sft_loss(
     """
     Validation SFT.
 
-    quick=True  -> solo t=0.5, metà dei batch — rapida tra le full
+    quick=True  -> solo t=0.5, metà dei batch - rapida tra le full
     quick=False -> t = [0.1, 0.3, 0.5, 0.7, 0.9], completa
     """
     device   = next(model.parameters()).device
@@ -384,7 +384,7 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
     sft_cfg.world_size = world_size
 
     if is_main():
-        print("Harold v0.6 — SFT con CFG (Flow Matching)")
+        print("Harold v0.6 - SFT con CFG (Flow Matching)")
         print(f"Modalità:       {'DDP (' + str(world_size) + ' GPU)' if use_ddp else 'Single-GPU'}")
         print(f"Device:         {device}")
         print(f"Dtype:          {sft_cfg.dtype}")
@@ -411,7 +411,7 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
     model_cfg = state["model_cfg"]
     model     = build_model(model_cfg).to(device)
 
-    # [OPT-S1] torch.compile — solo single-GPU (DDP non supportato)
+    # [OPT-S1] torch.compile - solo single-GPU (DDP non supportato)
     if not use_ddp:
         use_compile = (
             getattr(sft_cfg, "use_compile", True)
@@ -440,8 +440,8 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
 
     if is_main():
         n_params = sum(p.numel() for p in raw_model.parameters()) / 1e6
-        print(f"Harold v0.6 SFT — {n_params/1000:.2f}B parametri" if n_params >= 1000
-              else f"Harold v0.6 SFT — {n_params:.1f}M parametri")
+        print(f"Harold v0.6 SFT - {n_params/1000:.2f}B parametri" if n_params >= 1000
+              else f"Harold v0.6 SFT - {n_params:.1f}M parametri")
 
     cfg_params   = list(raw_model.cfg_proj.parameters())
     other_params = [p for n, p in raw_model.named_parameters()
@@ -493,7 +493,7 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
     # ── Strato 1 ──────────────────────────────────────────────────────────────
     if initial_stage <= 1:
         if is_main():
-            print(f"\nStrato 1: tulu3 + OpenOrca — {sft_cfg.max_iters} step\n")
+            print(f"\nStrato 1: tulu3 + OpenOrca - {sft_cfg.max_iters} step\n")
 
         train_loader, val_loader = build_sft_loaders(
             sft_cfg, tokenizer,
@@ -530,7 +530,7 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
 
     # ── Strato 2: OpenOrca 100% ───────────────────────────────────────────────
     if is_main():
-        print(f"\nStrato 2: OpenOrca — {sft_cfg.stage2_max_iters} step\n")
+        print(f"\nStrato 2: OpenOrca - {sft_cfg.stage2_max_iters} step\n")
 
     full_cfg  = load_dataset_config("datasets_config.yaml")
     s2_ds_cfg = [d for d in full_cfg["sft"] if d["name"] == "openorca"]
