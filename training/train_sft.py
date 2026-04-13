@@ -406,8 +406,11 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
                 initial_stage, initial_iter, ckpt_path = result
         else:
             ckpt_path = sft_cfg.preload
-
         if ckpt_path and os.path.isfile(ckpt_path):
+            print(f"DEBUG ckpt_path={ckpt_path!r}, exists={os.path.isfile(ckpt_path)}, cwd={os.getcwd()!r}")
+            if not os.path.isabs(ckpt_path):
+                ckpt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ckpt_path)
+                ckpt_path = os.path.normpath(ckpt_path)
             initial_stage, initial_iter, best_val, train_losses, val_losses = load_checkpoint(
                 ckpt_path, raw_model, optimizer, scaler, device, load_stage=True,
             )
