@@ -420,6 +420,8 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
     if use_ddp:
         broadcast_model(raw_model)
 
+    print(f"DEBUG initial_stage={initial_stage}, initial_iter={initial_iter}")
+
     # ── Strato 1 ──────────────────────────────────────────────────────────────
     if initial_stage <= 1:
         if is_main():
