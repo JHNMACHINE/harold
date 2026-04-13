@@ -135,7 +135,7 @@ def run_sft(args: argparse.Namespace, pretrain_ckpt: str | None = None) -> dict:
 
     if is_main():
         print("=" * 60)
-        print(f"  SFT — {sft_cfg.max_iters} iterazioni")
+        print(f"  SFT - {sft_cfg.max_iters} iterazioni")
         print(f"  Pretrain ckpt: {sft_cfg.pretrain_ckpt}")
         print(f"  Checkpoint:    {sft_cfg.checkpoint_dir}")
         print("=" * 60)
