@@ -29,15 +29,9 @@ from typing import Union
 import torch
 import torch.nn as nn
 from safetensors.torch import save_model
-from huggingface_hub import HfApi
+
 from core.config import HF_FILENAME, HF_REPO_ID
 
-import sys
-from core import config as _core_config
-from core import model as _core_model
-from utils.ddp import is_main
-sys.modules.setdefault("config", _core_config)
-sys.modules.setdefault("model", _core_model)
 
 def cleanup_old_checkpoints(
     checkpoint_dir:    str,
@@ -62,10 +56,10 @@ def cleanup_old_checkpoints(
         print(f"  Rimosso checkpoint vecchio: {os.path.basename(old)}")
 
 
-def _upload_pt(path: str, api: HfApi, hf_repo_id: str, hf_token: str) -> None:
+def _upload_pt(path: str, api: object, hf_repo_id: str, hf_token: str) -> None:
     """Upload del checkpoint .pt completo su HuggingFace."""
     try:
-        api.upload_file(                                     
+        api.upload_file(                                     # type: ignore[attr-defined]
             path_or_fileobj=path,
             path_in_repo=HF_FILENAME,
             repo_id=hf_repo_id, repo_type="model", token=hf_token,
@@ -76,14 +70,14 @@ def _upload_pt(path: str, api: HfApi, hf_repo_id: str, hf_token: str) -> None:
 
 
 def _upload_safetensors(
-    path: str, model: nn.Module, api: HfApi, hf_repo_id: str, hf_token: str,
+    path: str, model: nn.Module, api: object, hf_repo_id: str, hf_token: str,
 ) -> None:
     """Salva e carica i pesi in .safetensors su HuggingFace, poi rimuove il file locale."""
     try:
         sf_filename = HF_FILENAME.replace(".pt", ".safetensors")
         sf_path     = path.replace(".pt", ".safetensors")
         save_model(model, sf_path)
-        api.upload_file(                                     
+        api.upload_file(                                     # type: ignore[attr-defined]
             path_or_fileobj=sf_path,
             path_in_repo=sf_filename,
             repo_id=hf_repo_id, repo_type="model", token=hf_token,
@@ -101,6 +95,7 @@ def _push_to_hf(path: str, model: nn.Module, wait: bool) -> None:
     """
     def _push() -> None:
         try:
+            from huggingface_hub import HfApi
             hf_token = os.environ.get("HF_TOKEN")
             if not hf_token:
                 print("  WARNING HF_TOKEN non trovato -- skip push HuggingFace.")
@@ -189,7 +184,16 @@ def save_checkpoint(
     os.replace(tmp, path)
 
     if not full:
-        prefix = os.path.basename(path).rsplit("_", 1)[0]
+        # Usa il prefix senza il numero di iterazione
+        # es. "harold_v06_sft_s1_0001000.pt" -> prefix="harold_v06_sft", stage=1
+        # es. "harold_v06_0001000.pt"         -> prefix="harold_v06",     stage=None
+        basename = os.path.basename(path)
+        if stage is not None:
+            # Rimuovi "_s{stage}_{iter}.pt" dalla fine
+            prefix = basename.split(f"_s{stage}_")[0]
+        else:
+            # Rimuovi "_{iter}.pt" dalla fine
+            prefix = "_".join(basename.replace(".pt", "").split("_")[:-1])
         cleanup_old_checkpoints(
             os.path.dirname(path), prefix,
             stage=stage, keep_last=2,
@@ -254,18 +258,16 @@ def load_checkpoint(
         if not _load_from_hf(path):
             print("  Nessun checkpoint trovato — parto da zero.")
             return _default_result(load_stage)
-    if is_main():
-        print(f"Carico checkpoint: {path}")
+
+    print(f"Carico checkpoint: {path}")
     state = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(state["model_state"])
 
     if "optimizer_state" in state:
         optimizer.load_state_dict(state["optimizer_state"])
-        if is_main():
-            print("  optimizer state caricato")
+        print("  optimizer state caricato")
     else:
-        if is_main():
-            print("  optimizer state assente (checkpoint periodico) — riparte da zero")
+        print("  optimizer state assente (checkpoint periodico) — riparte da zero")
 
     if "scaler_state" in state:
         scaler.load_state_dict(state["scaler_state"])
