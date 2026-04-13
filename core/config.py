@@ -188,7 +188,7 @@ class SFTConfig:
     batch_size:    int   = 8
     grad_accum:    int   = 16
     max_iters:     int   = 10000
-    lr:            float = 2e-5
+    lr:            float = 5e-6
     warmup_iters:  int   = 200
     min_lr:        float = 2e-6
     max_grad_norm: float = 1.0
@@ -204,7 +204,7 @@ class SFTConfig:
     tokenizer_model: str   = "NousResearch/Llama-2-7b-hf"
     val_every:       int   = 200
     stage2_max_iters: int   = 5000
-    stage2_lr:        float = 1e-5
+    stage2_lr:        float = 2e-6
     checkpoint_dir:    str = "checkpoints_sft_v6"
     checkpoint_prefix: str = "harold_v06_sft"
     save_every:        int = 1000
