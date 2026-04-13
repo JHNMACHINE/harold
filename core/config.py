@@ -188,7 +188,7 @@ class SFTConfig:
     batch_size:    int   = 8
     grad_accum:    int   = 16
     max_iters:     int   = 10000
-    lr:            float = 5e-6
+    lr:            float = 1e-5
     warmup_iters:  int   = 200
     min_lr:        float = 2e-6
     max_grad_norm: float = 1.0
