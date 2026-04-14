@@ -398,22 +398,24 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
     train_losses: list = []
     val_losses:   list = []
 
-    if sft_cfg.preload:
-        ckpt_path = None
+    if sft_cfg.preload == "latest":
+        result = sft_cfg.read_latest()
+        if result:
+            initial_stage, initial_iter, ckpt_path = result
+            # Usa stage e iter dal JSON, non dal checkpoint
+            _stage_from_json = initial_stage
+            _iter_from_json  = initial_iter
+    else:
+        ckpt_path = sft_cfg.preload
+
+    if ckpt_path and os.path.isfile(ckpt_path):
+        _, _, best_val, train_losses, val_losses = load_checkpoint(
+            ckpt_path, raw_model, optimizer, scaler, device, load_stage=True,
+        )
+        # Ripristina stage e iter dal JSON
         if sft_cfg.preload == "latest":
-            result = sft_cfg.read_latest()
-            if result:
-                initial_stage, initial_iter, ckpt_path = result
-        else:
-            ckpt_path = sft_cfg.preload
-        if ckpt_path and os.path.isfile(ckpt_path):
-            print(f"DEBUG ckpt_path={ckpt_path!r}, exists={os.path.isfile(ckpt_path)}, cwd={os.getcwd()!r}")
-            if not os.path.isabs(ckpt_path):
-                ckpt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ckpt_path)
-                ckpt_path = os.path.normpath(ckpt_path)
-            initial_stage, initial_iter, best_val, train_losses, val_losses = load_checkpoint(
-                ckpt_path, raw_model, optimizer, scaler, device, load_stage=True,
-            )
+            initial_stage = _stage_from_json
+            initial_iter  = _iter_from_json
         elif is_main():
             print("Nessun SFT checkpoint trovato, parto dal pretraining.")
 
