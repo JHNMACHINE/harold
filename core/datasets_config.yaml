@@ -23,8 +23,8 @@
 #   - SlimPajama: diversità tematica e stilistica
 #   - arxiv: paper scientifici, coerenza long-form su seq_len=4096
 #   - pg19: libri Project Gutenberg, coerenza su sequenze lunghe
-#   - starcoderdata: sostituisce python_code (25k esempi → dataset enorme e vario)
-#                    bigcode/starcoderdata copre 80+ linguaggi, non si esaurisce
+#   - github-code: sostituisce python_code (25k esempi → dataset enorme e vario)
+#                    codeparrot/github-code copre 80+ linguaggi, non si esaurisce
 #   - open-web-math: sostituisce openmath — matematica da CommonCrawl,
 #                    molto più vario e meno ripetitivo di OpenMathInstruct
 #
@@ -74,8 +74,8 @@ pretraining:
     text_field: text
     weight: 0.12
 
-  - name: starcoderdata
-    path: bigcode/starcoderdata
+  - name: github-code
+    path: codeparrot/github-code
     config: python
     split: train
     text_field: content
