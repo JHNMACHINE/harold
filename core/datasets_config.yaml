@@ -21,12 +21,17 @@
 # Mix aggiornato per Harold v0.7 (3B):
 #   - FineWeb-Edu + Wikipedia + C4: base general-purpose di alta qualità
 #   - SlimPajama: diversità tematica e stilistica
-#   - peS2o: paper scientifici open-access, migliora coerenza long-form
+#   - arxiv: paper scientifici, coerenza long-form su seq_len=4096
 #   - pg19: libri Project Gutenberg, coerenza su sequenze lunghe
-#   - github-code: codice variegato (meglio di CodeContests per 1.5B)
-#   - OpenMathInstruct: ridotto al 3% per evitare overspecialization
+#   - github-code: sostituisce python_code — dataset pubblico, grande e vario
+#                  codeparrot/github-code copre 30+ linguaggi, non si esaurisce
+#                  config=Python per mantenere focus simile al precedente
+#   - open-web-math: sostituisce openmath — matematica da CommonCrawl,
+#                    molto più varia e meno ripetitiva di OpenMathInstruct
 #
-# Rimosso: CodeContests (troppo difficile per 1.5B, rumore > segnale)
+# Rimosso: python_code (flytech/python-codes-25k — 25k esempi, troppo piccolo)
+# Rimosso: openmath (nvidia/OpenMathInstruct-1 — troppo strutturato per pretrain)
+# Nota: bigcode/starcoderdata è gated — sostituito con codeparrot/github-code
 
 pretraining:
 
@@ -69,29 +74,24 @@ pretraining:
     text_field: text
     weight: 0.12
 
-  - name: python_code
-    path: flytech/python-codes-25k
+  - name: github_code
+    path: codeparrot/github-code
+    config: Python
     split: train
-    text_field: output
+    text_field: code
     weight: 0.03
 
-  - name: openmath
-    path: nvidia/OpenMathInstruct-1
+  - name: open_web_math
+    path: open-web-math/open-web-math
     split: train
-    text_field: generated_solution
-    weight: 0.03  # ridotto al 3% — evita overspecialization in pretraining
+    text_field: text
+    weight: 0.03
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SFT (Supervised Fine-Tuning)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Mix aggiornato per il 2026:
-#   - ultrafeedback: preferenze binarizzate di alta qualità (sostituisce oasst2)
-#   - tulu3: mix SFT curato da AllenAI, molto vario
-#   - magpie_ultra: conversazioni sintetiche di alta qualità
-#   - openorca: Q&A chain-of-thought, mantenuto
-#
-# Rimosso: oasst2 (dataset 2023, piccolo, qualità variabile)
+# Mix invariato da v0.6 — già ottimale per 2025-2026.
 
 sft:
 
