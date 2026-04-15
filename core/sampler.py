@@ -31,8 +31,8 @@ from transformers import AutoTokenizer
 # Aggiungi la root del progetto al path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from model import Harold, build_model
-from config import get_model_config
+from core.config import SFTConfig
+from core.model import Harold, build_model
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -80,8 +80,9 @@ def _download_from_hf(filename: str, local_path: str) -> bool:
 
 
 def load_model(
-    checkpoint_path: str = DEFAULT_CKPT_SF,
-    device:          str = "cuda",
+    checkpoint_path: str         = DEFAULT_CKPT_SF,
+    device:          str         = "cuda",
+    dtype:           torch.dtype = torch.bfloat16,
 ) -> Harold:
     """
     Carica il modello dal checkpoint.
@@ -92,25 +93,19 @@ def load_model(
       3. Download .safetensors da HuggingFace
       4. .pt locale (DEFAULT_CKPT_PT)
       5. Download .pt da HuggingFace
-
-    Ritorna (model, model_cfg).
     """
     from safetensors.torch import load_file as sf_load
+    from core.config import get_model_config
 
-    # Risolvi il path da usare
     path_to_use = checkpoint_path
 
     if not os.path.isfile(path_to_use):
-        # Prova safetensors locale
         if os.path.isfile(DEFAULT_CKPT_SF):
             path_to_use = DEFAULT_CKPT_SF
-        # Prova download safetensors da HF
         elif _download_from_hf(HF_SFT_SF, DEFAULT_CKPT_SF):
             path_to_use = DEFAULT_CKPT_SF
-        # Prova .pt locale
         elif os.path.isfile(DEFAULT_CKPT_PT):
             path_to_use = DEFAULT_CKPT_PT
-        # Prova download .pt da HF
         elif _download_from_hf(HF_SFT_PT, DEFAULT_CKPT_PT):
             path_to_use = DEFAULT_CKPT_PT
         else:
@@ -121,10 +116,7 @@ def load_model(
 
     print(f"Carico checkpoint: {path_to_use}")
 
-    is_safetensors = path_to_use.endswith(".safetensors")
-
-    if is_safetensors:
-        # .safetensors non contiene model_cfg — usa config di default
+    if path_to_use.endswith(".safetensors"):
         model_cfg = get_model_config()
         model     = build_model(model_cfg).to(device)
         weights   = sf_load(path_to_use, device="cpu")
@@ -135,6 +127,7 @@ def load_model(
         model     = build_model(model_cfg).to(device)
         model.load_state_dict(state["model_state"], strict=False)
 
+    model = model.to(dtype)
     model.eval()
 
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
@@ -352,8 +345,7 @@ def main() -> None:
     pad_token_id = int(tokenizer.pad_token_id)
 
     # Carica modello
-    model = load_model(args.checkpoint, device=device)
-    model = model.to(dtype)
+    model = load_model(args.checkpoint, device=device, dtype=dtype)
 
     print(f"\nPrompt: {args.prompt!r}")
     print("-" * 60)
