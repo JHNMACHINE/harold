@@ -488,7 +488,7 @@ class Mamba3Block(nn.Module):
             d_model        = config.d_model,
             d_state        = config.mamba_d_state,
             headdim        = config.d_model // config.n_heads,
-            is_mimo        = True,
+            is_mimo        = False,
             mimo_rank      = config.mamba_mimo_rank,
             chunk_size     = 64 // config.mamba_mimo_rank,  # ottimale per bfloat16
             is_outproj_norm = False,
