@@ -44,7 +44,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List, Dict, Callable, cast
-from config import ModelConfig
+from core.config import ModelConfig
 
 class Expert(nn.Module):
     def __init__(self, n_embd: int, hidden_dim: int, dropout: float = 0.0):
