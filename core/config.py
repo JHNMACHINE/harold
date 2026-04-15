@@ -102,7 +102,7 @@ class TrainConfig:
     stream_buffer_size: int   = 5000
     val_every:          int   = 200
 
-    checkpoint_dir:    str = "checkpoints_v7"
+    checkpoint_dir: str = "/workspace/checkpoints/v0.7"
     checkpoint_prefix: str = "harold_v07"
     preload:           str = "latest"
     save_every:        int = 2500   # 4 checkpoint totali nel run di test
