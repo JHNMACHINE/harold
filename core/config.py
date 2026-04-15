@@ -81,8 +81,8 @@ class TrainConfig:
     # batch_size=4 + grad_accum=16 -> 64 seq/step effettivo (4096 tok/seq)
     # = ~262k token/step. Sicuro; se no OOM: prova batch_size=6.
     # Per full run 100k iter: aumentare grad_accum=32 (128 seq/step).
-    batch_size:    int   = 2
-    grad_accum:    int   = 32
+    batch_size:    int   = 4
+    grad_accum:    int   = 16
     max_iters:     int   = 10_000
     seq_len:       int   = 4096
 
@@ -111,7 +111,7 @@ class TrainConfig:
     save_every:        int = 2500   # 4 checkpoint totali nel run di test
 
     # torch.compile
-    use_compile:  bool = False
+    use_compile:  bool = True
     compile_mode: str  = "max-autotune"
 
     # Optimizer — Muon invariato, parametri calibrati per 3B
