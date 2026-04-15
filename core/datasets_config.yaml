@@ -1,4 +1,4 @@
-# Harold v0.6 — Dataset Configuration
+# Harold v0.7 — Dataset Configuration
 # =====================================
 # Modifica questo file per cambiare dataset senza toccare il codice Python.
 #
@@ -18,15 +18,20 @@
 # Pretraining
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Mix progettato per Harold v0.6 (1.5B):
+# Mix aggiornato per Harold v0.7 (3B):
 #   - FineWeb-Edu + Wikipedia + C4: base general-purpose di alta qualità
 #   - SlimPajama: diversità tematica e stilistica
-#   - peS2o: paper scientifici open-access, migliora coerenza long-form
+#   - arxiv: paper scientifici, coerenza long-form su seq_len=4096
 #   - pg19: libri Project Gutenberg, coerenza su sequenze lunghe
-#   - github-code: codice variegato (meglio di CodeContests per 1.5B)
-#   - OpenMathInstruct: ridotto al 3% per evitare overspecialization
+#   - starcoderdata: sostituisce python_code (25k esempi → dataset enorme e vario)
+#                    bigcode/starcoderdata copre 80+ linguaggi, non si esaurisce
+#   - open-web-math: sostituisce openmath — matematica da CommonCrawl,
+#                    molto più vario e meno ripetitivo di OpenMathInstruct
 #
-# Rimosso: CodeContests (troppo difficile per 1.5B, rumore > segnale)
+# Rimosso: python_code (flytech/python-codes-25k — troppo piccolo per 3B,
+#          si esaurisce in poche iterazioni e viene ricampionato continuamente)
+# Rimosso: openmath (nvidia/OpenMathInstruct-1 — dataset di istruzioni,
+#          troppo strutturato per pretraining, rischio overspecialization)
 
 pretraining:
 
@@ -69,29 +74,30 @@ pretraining:
     text_field: text
     weight: 0.12
 
-  - name: python_code
-    path: flytech/python-codes-25k
+  - name: starcoderdata
+    path: bigcode/starcoderdata
+    config: python
     split: train
-    text_field: output
+    text_field: content
     weight: 0.03
 
-  - name: openmath
-    path: nvidia/OpenMathInstruct-1
+  - name: open-web-math
+    path: open-web-math/open-web-math
     split: train
-    text_field: generated_solution
-    weight: 0.03  # ridotto al 3% — evita overspecialization in pretraining
+    text_field: text
+    weight: 0.03
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SFT (Supervised Fine-Tuning)
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # Mix aggiornato per il 2026:
-#   - ultrafeedback: preferenze binarizzate di alta qualità (sostituisce oasst2)
+#   - ultrafeedback: preferenze binarizzate di alta qualità
 #   - tulu3: mix SFT curato da AllenAI, molto vario
 #   - magpie_ultra: conversazioni sintetiche di alta qualità
 #   - openorca: Q&A chain-of-thought, mantenuto
 #
-# Rimosso: oasst2 (dataset 2023, piccolo, qualità variabile)
+# Invariato da v0.6 — mix già ottimale per 2025-2026.
 
 sft:
 
