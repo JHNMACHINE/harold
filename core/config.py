@@ -30,7 +30,7 @@ class ModelConfig:
     # Specializzazione: top-2 su 16 = 12.5% pool attivo (vs 25% in v0.7)
     moe_n_routed_experts:    int = 16
     moe_top_k:               int = 2
-    ds_moe_n_shared_experts: int = 1
+    ds_moe_n_shared_experts: int = 2
     moe_routed_hidden:       int = d_ff // 8
     moe_shared_hidden:       int = d_ff // 4
 
