@@ -77,7 +77,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
         ctx.optimizer.zero_grad(set_to_none=True)
 
-        loss_sum, score_sum, ce_sum, valid_count, train_iter = run_grad_accum(
+        loss_sum, score_sum, ce_sum, valid_count, train_iter, extra_metrics = run_grad_accum(
             ctx.trainer, train_iter, ctx.train_loader, train_cfg, ctx.scaler, ctx.device,
         )
         if valid_count == 0:
@@ -107,15 +107,44 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         window_losses.append(avg_loss)
         ctx.train_losses.append(avg_loss)
 
+        # [v0.7-M2c] Grad norm separato Mamba vs Attention — primi 10k step
+        # Se norm_mamba > 10x norm_attn il modello usa solo memoria a breve termine
+        mamba_norm = attn_norm = 0.0
+        if iter_num < 10_000 and iter_num % 50 == 0:
+            mamba_params = [p for n, p in ctx.active_model.named_parameters()
+                            if 'mamba' in n and p.grad is not None]
+            attn_params  = [p for n, p in ctx.active_model.named_parameters()
+                            if any(x in n for x in ('q_proj', 'k_up', 'v_up', 'o_proj'))
+                            and p.grad is not None]
+            if mamba_params:
+                mamba_norm = float(torch.nn.utils.get_total_norm(mamba_params, 2.0))
+            if attn_params:
+                attn_norm  = float(torch.nn.utils.get_total_norm(attn_params, 2.0))
+            if mamba_norm > 0 and attn_norm > 0:
+                ratio = mamba_norm / attn_norm
+                if ratio > 10.0 and ctx.main:
+                    print(f"  WARNING: grad Mamba/Attn ratio={ratio:.1f}x > 10 "
+                          f"(mamba={mamba_norm:.3f}, attn={attn_norm:.3f})")
+
         if ctx.main:
             pbar.set_postfix({"loss": f"{avg_loss:.4f}", "score": f"{avg_score:.4f}",
                               "lr": f"{lr:.2e}", "grad": f"{grad_norm:.2f}"})
             if ctx.logger:
-                ctx.logger.log({"type": "train", "iter": iter_num,
-                                "loss": round(avg_loss, 6), "score": round(avg_score, 6),
-                                "ce": round(avg_ce, 6), "lr": lr,
-                                "grad_norm": round(float(grad_norm), 6),
-                                "elapsed_min": round((time.time() - start_time) / 60, 2)})
+                log_entry = {"type": "train", "iter": iter_num,
+                             "loss": round(avg_loss, 6), "score": round(avg_score, 6),
+                             "ce": round(avg_ce, 6), "lr": lr,
+                             "grad_norm": round(float(grad_norm), 6),
+                             "elapsed_min": round((time.time() - start_time) / 60, 2)}
+                if mamba_norm > 0 and attn_norm > 0:
+                    log_entry["grad_norm_mamba"] = round(mamba_norm, 4)
+                    log_entry["grad_norm_attn"]  = round(attn_norm, 4)
+                    log_entry["grad_ratio_mamba_attn"] = round(mamba_norm / attn_norm, 3)
+                # [v0.7-M4] x0_pred norm — rilevamento collapse (ogni 50 step)
+                if iter_num % 50 == 0 and extra_metrics:
+                    for k in ("x0_norm_mean", "x0_norm_std", "x0_var_tokens"):
+                        if k in extra_metrics:
+                            log_entry[k] = extra_metrics[k]
+                ctx.logger.log(log_entry)
 
         # ── Validation ────────────────────────────────────────────────────
         # [v0.7-T1] force_val a iter_num==0: baseline loss pre-training.
@@ -151,6 +180,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
                                         "path": best_path})
 
         # ── Checkpoint periodico ──────────────────────────────────────────
+        # [v0.7-P3] Ogni 10k iter: salva checkpoint + lancia eval qualitativa
         if iter_num > 0 and iter_num % train_cfg.save_every == 0 and ctx.main:
             p = train_cfg.ckpt_path(iter_num)
             save_checkpoint(p, ctx.model, ctx.optimizer, ctx.scaler,
@@ -160,6 +190,26 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
             print(f"  Checkpoint periodico -> {p}")
             if ctx.logger:
                 ctx.logger.log({"type": "periodic_checkpoint", "iter": iter_num, "path": p})
+
+            # [v0.7-P3] Eval qualitativa automatica sui 20 prompt fissi
+            # Girata in un subprocess per non bloccare il training loop
+            # e per liberare la VRAM prima di ricaricare il modello per l'eval.
+            try:
+                import subprocess
+                eval_script = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "eval", "eval_generation.py"
+                )
+                if os.path.exists(eval_script):
+                    subprocess.Popen([
+                        "python", eval_script,
+                        "--checkpoint", p,
+                        "--out_dir", os.path.join(train_cfg.checkpoint_dir, "eval_results"),
+                        "--max_steps", "16",
+                        "--cfg_scale", "3.0",
+                    ])
+                    print(f"  Eval qualitativa avviata in background -> eval_results/")
+            except Exception as e:
+                print(f"  WARNING: eval qualitativa fallita: {e}")
 
     # ── Finale ────────────────────────────────────────────────────────────
     elapsed    = (time.time() - start_time) / 60

@@ -26,6 +26,11 @@ Principali cambiamenti rispetto a v0.6:
   [v0.7-X5] self_cond_proj ora condiziona su x0_pred.mean(dim=1) invece di vel_prev.mean(dim=1)
              Semantica coerente con la predizione corrente.
 
+  [v0.7-T1] Logit-Normal timestep sampling (default: logit_normal, std=0.5)
+             Previene velocity collapse privilegiando t~0.5 dove il gradiente
+             e piu informativo. Configurabile via ModelConfig.t_sampling:
+             'logit_normal' (default), 'cosine', 'uniform' (baseline v0.6).
+
   [v0.7-M3] Mamba2Block → Mamba3Block
              Sostituzione del mixer SSM con Mamba3 (Lahoti et al., ICLR 2026).
              Tre miglioramenti chiave rispetto a Mamba2:
@@ -117,11 +122,11 @@ class DeepSeekMoELayer(nn.Module):
         self.top_k_min         = 1
 
         self.shared_experts = nn.ModuleList([
-            SharedExpert(config.d_model, config.moe_shared_hidden, dropout=config.dropout)
+            SharedExpert(config.d_model, config.d_ff // 2, dropout=config.dropout)
             for _ in range(config.ds_moe_n_shared_experts)
         ])
         self.routed_experts = nn.ModuleList([
-            Expert(config.d_model, config.moe_routed_hidden, dropout=config.dropout)
+            Expert(config.d_model, config.d_ff // 4, dropout=config.dropout)
             for _ in range(self.n_routed_experts)
         ])
 
@@ -488,7 +493,7 @@ class Mamba3Block(nn.Module):
             d_model        = config.d_model,
             d_state        = config.mamba_d_state,
             headdim        = config.d_model // config.n_heads,
-            is_mimo        = False,
+            is_mimo        = True,
             mimo_rank      = config.mamba_mimo_rank,
             chunk_size     = 64 // config.mamba_mimo_rank,  # ottimale per bfloat16
             is_outproj_norm = False,
@@ -578,8 +583,8 @@ class JambaBlock(nn.Module):
 
         Returns:
             tuple:
-                - **x** (*Tensor*) - output del blocco, shape :math:`(B, L, d\_model)`
-                - **present_kv** (*Tensor or None*) - KV state se ``use_cache=True``
+                - **x** (*Tensor*) – output del blocco, shape :math:`(B, L, d\_model)`
+                - **present_kv** (*Tensor or None*) – KV state se ``use_cache=True``
                   e layer attention, altrimenti ``None``
         """
         normed = self.ada_ln_1(x, t_emb)
@@ -631,9 +636,43 @@ class FlowMatchingSchedule(nn.Module):
         https://arxiv.org/abs/2210.02747
     """
 
-    def __init__(self, sigma_min: float = 1e-4):
+    def __init__(self, sigma_min: float = 1e-4, t_sampling: str = "logit_normal",
+                 t_logit_normal_std: float = 0.5):
         super().__init__()
-        self.sigma_min = sigma_min
+        self.sigma_min          = sigma_min
+        self.t_sampling         = t_sampling
+        self.t_logit_normal_std = t_logit_normal_std
+
+    def sample_t(self, B: int, device: torch.device) -> torch.Tensor:
+        r"""sample_t(B, device) -> Tensor
+
+        Campiona i timestep di training secondo la strategia configurata.
+
+        .. rubric:: Strategie disponibili
+
+        - ``"uniform"``: :math:`t \sim U[0, 1]` — baseline, campionamento flat
+        - ``"logit_normal"``: :math:`t = \sigma(z),\; z \sim \mathcal{N}(0, s^2)` —
+          concentra i campioni intorno a :math:`t=0.5` dove il gradiente è più
+          informativo. Usato in SD3 e altri modelli FM recenti. Previene il
+          velocity collapse privilegiando i timestep difficili.
+        - ``"cosine"``: densità proporzionale a :math:`\sin(\pi t)` — simile a
+          logit_normal ma con tails più pesanti verso :math:`t=0` e :math:`t=1`.
+
+        Args:
+            B (int): batch size
+            device (torch.device): device di output
+
+        Returns:
+            Tensor: timestep in :math:`[0, 1]`, shape :math:`(B,)`
+        """
+        if self.t_sampling == "logit_normal":
+            u = torch.randn(B, device=device) * self.t_logit_normal_std
+            return torch.sigmoid(u)
+        elif self.t_sampling == "cosine":
+            u = torch.rand(B, device=device)
+            return 0.5 * (1.0 - torch.cos(math.pi * u))
+        else:  # uniform
+            return torch.rand(B, device=device)
 
     def interpolate(
         self,
@@ -693,8 +732,8 @@ class FlowMatchingSchedule(nn.Module):
 
         Returns:
             tuple:
-                - **x_t** (*Tensor*) - embedding rumoroso, shape :math:`(B, L, d\_model)`
-                - **noise** (*Tensor*) - rumore campionato :math:`\varepsilon`,
+                - **x_t** (*Tensor*) – embedding rumoroso, shape :math:`(B, L, d\_model)`
+                - **noise** (*Tensor*) – rumore campionato :math:`\varepsilon`,
                   shape :math:`(B, L, d\_model)`
         """
         noise = torch.empty_like(x0).normal_()
@@ -706,7 +745,7 @@ class Harold(nn.Module):
     r"""Harold v0.7 — diffusion language model ibrido Jamba con x0-prediction e Mamba3.
 
     Architettura:
-        - 36 layer Jamba [Mamba3 x 3, Attention] x 9
+        - 36 layer Jamba [Mamba3 × 3, Attention] × 9
         - MoE DeepSeek (1 shared + 8 routed top-2) su ogni layer
         - Flow Matching con traiettoria lineare
         - **[v0.7-X1]** x0-prediction: predice direttamente :math:`\hat{x}_0`
@@ -772,7 +811,11 @@ class Harold(nn.Module):
         self.ce_head        = nn.Linear(config.d_model, emb_vocab, bias=False)
         self.ce_head.weight = self.token_emb.weight
 
-        self.schedule = FlowMatchingSchedule(sigma_min=config.flow_sigma_min)
+        self.schedule = FlowMatchingSchedule(
+            sigma_min           = config.flow_sigma_min,
+            t_sampling          = config.t_sampling,
+            t_logit_normal_std  = config.t_logit_normal_std,
+        )
 
         self._init_weights()
 
@@ -843,11 +886,11 @@ class Harold(nn.Module):
 
         Returns:
             tuple:
-                - **x0_pred** (*Tensor*) - predizione di :math:`\hat{x}_0`,
+                - **x0_pred** (*Tensor*) – predizione di :math:`\hat{x}_0`,
                   shape :math:`(B, L, d\_model)`
-                - **ce_logits** (*Tensor*) - logits sul vocabolario,
+                - **ce_logits** (*Tensor*) – logits sul vocabolario,
                   shape :math:`(B, L, V+1)`
-                - **present_kvs** (*list or None*) - KV cache se ``use_cache=True``,
+                - **present_kvs** (*list or None*) – KV cache se ``use_cache=True``,
                   altrimenti ``None``
 
         Examples::
@@ -944,8 +987,8 @@ class Harold(nn.Module):
 
         Returns:
             tuple:
-                - **loss** (*Tensor*) - loss scalare totale
-                - **metrics** (*dict*) - chiavi: ``"score"``, ``"ce"``, ``"total"``.
+                - **loss** (*Tensor*) – loss scalare totale
+                - **metrics** (*dict*) – chiavi: ``"score"``, ``"ce"``, ``"total"``.
                   Se ``fixed_t`` è impostato, include anche ``"total_per_sample"``,
                   ``"score_per_sample"``, ``"ce_per_sample"``.
 
@@ -963,7 +1006,7 @@ class Harold(nn.Module):
             return zero, {"score": 0.0, "ce": 0.0, "total": 0.0}
 
         B = x0.shape[0]
-        t = fixed_t if fixed_t is not None else torch.rand(B, device=device)
+        t = fixed_t if fixed_t is not None else self.schedule.sample_t(B, device)
 
         with torch.no_grad():
             x0_emb = self.token_emb(x0)

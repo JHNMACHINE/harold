@@ -6,9 +6,15 @@ Ritorna un dataclass con model, optimizer, loaders, logger, ecc.
 
 Cambiamenti rispetto a v0.6:
   [v0.7-S1] Stringa versione aggiornata a Harold v0.7.
-  [v0.7-S2] os.makedirs per checkpoint_dir al setup,
-             garantisce che /workspace/checkpoints/v0.7 esista
-             prima del primo salvataggio.
+  [v0.7-S2] os.makedirs per checkpoint_dir al setup.
+  [v0.7-S3] Supporto FSDP via TrainConfig.use_fsdp (default False).
+             Quando use_fsdp=True e world_size > 1:
+             - Usa FSDPContext invece di DDPContext
+             - Wrappa il modello con wrap_model_fsdp (JambaBlock policy)
+             - torch.compile abilitato con use_orig_params=True
+             - active_model e il modello FSDP, raw_model e lo stesso oggetto
+               (FSDP non ha .module come DDP)
+             Retrocompatibile: use_fsdp=False usa DDP come prima.
 """
 
 import os
@@ -37,28 +43,40 @@ def build_training_context(
     """
     Inizializza e ritorna tutto il necessario per il training loop.
 
-    Gestisce: DDP, tokenizer, modello, torch.compile, optimizer,
+    Gestisce: DDP/FSDP, tokenizer, modello, torch.compile, optimizer,
     dataset, checkpoint resume, logger.
     """
-    # ── DDP / device ──────────────────────────────────────────────────────
-    use_ddp    = is_ddp()
+    # ── Parallelismo / device ─────────────────────────────────────────────
+    use_fsdp   = getattr(train_cfg, "use_fsdp", False)
+    use_ddp    = is_ddp() and not use_fsdp
     rank       = 0
     local_rank = 0
     world_size = 1
-    ddp_ctx: Optional[DDPContext] = None
+    ddp_ctx:  Optional[DDPContext] = None
+    fsdp_ctx                       = None
 
-    if use_ddp:
-        ddp_ctx = DDPContext().setup()
+    if use_fsdp and is_ddp():
+        from utils.fsdp import FSDPContext
+        fsdp_ctx   = FSDPContext().setup()
+        rank, local_rank, world_size = fsdp_ctx.rank, fsdp_ctx.local_rank, fsdp_ctx.world_size
+        device     = f"cuda:{local_rank}"
+    elif use_ddp:
+        ddp_ctx    = DDPContext().setup()
         rank, local_rank, world_size = ddp_ctx.rank, ddp_ctx.local_rank, ddp_ctx.world_size
-        device = f"cuda:{local_rank}"
+        device     = f"cuda:{local_rank}"
     else:
-        device = train_cfg.device
+        device     = train_cfg.device
 
     main = is_main()
 
     if main:
+        mode_str = (
+            f"FSDP ({world_size} GPU)" if use_fsdp and world_size > 1
+            else f"DDP ({world_size} GPU)" if use_ddp
+            else "Single-GPU"
+        )
         print("Harold v0.7 — Jamba (Mamba3 + Attention + MoE) + Flow Matching + x0-prediction")
-        print(f"Modalita:       {'DDP (' + str(world_size) + ' GPU)' if use_ddp else 'Single-GPU'}")
+        print(f"Modalita:       {mode_str}")
         print(f"Device:         {device}")
         print(f"Dtype:          {train_cfg.dtype}  (scaler={'ON' if train_cfg.use_scaler else 'OFF'})")
         eff = train_cfg.batch_size * train_cfg.grad_accum * world_size
@@ -83,9 +101,37 @@ def build_training_context(
     )
 
     # ── Modello ───────────────────────────────────────────────────────────
-    model = build_model(model_cfg).to(device)
+    if use_fsdp and is_ddp():
+        model = build_model(model_cfg)           # CPU — FSDP sposta su GPU
+    else:
+        model = build_model(model_cfg).to(device)
 
-    if not use_ddp:
+    # ── Wrapping: FSDP / DDP / single-GPU ────────────────────────────────
+    if use_fsdp and is_ddp():
+        from utils.fsdp import wrap_model_fsdp
+        active_model = wrap_model_fsdp(model, local_rank, mixed_precision=True)
+        raw_model    = cast(Harold, active_model)
+
+        use_compile = (
+            getattr(train_cfg, "use_compile", True)
+            and hasattr(torch, "compile")
+            and torch.cuda.get_device_capability()[0] >= 7
+        )
+        if use_compile:
+            compile_mode = getattr(train_cfg, "compile_mode", "reduce-overhead")
+            if main:
+                print(f"torch.compile() abilitato (mode='{compile_mode}', FSDP)")
+            active_model = cast(Harold, torch.compile(active_model, mode=compile_mode))
+        elif main:
+            print("torch.compile() disabilitato")
+
+    elif use_ddp:
+        active_model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        raw_model    = cast(Harold, active_model.module)
+        if main:
+            print("torch.compile() disabilitato (DDP)")
+
+    else:
         use_compile = (
             getattr(train_cfg, "use_compile", True)
             and hasattr(torch, "compile")
@@ -99,29 +145,20 @@ def build_training_context(
             model = cast(Harold, torch.compile(model, mode=compile_mode))
         elif main:
             print("torch.compile() disabilitato")
-    elif main:
-        print("torch.compile() disabilitato (DDP)")
+        active_model = model
+        raw_model    = cast(Harold, model)
 
     if main:
-        n_params = sum(p.numel() for p in model.parameters()) / 1e6
+        n_params = sum(p.numel() for p in raw_model.parameters()) / 1e6
         label    = f"{n_params/1000:.2f}B" if n_params >= 1000 else f"{n_params:.1f}M"
         print(f"Harold v0.7 — {label} parametri totali")
-
-    active_model: Union[Harold, DDP] = (
-        DDP(model, device_ids=[local_rank], output_device=local_rank)
-        if use_ddp else model
-    )
-    raw_model: Harold = cast(
-        Harold,
-        active_model.module if isinstance(active_model, DDP) else active_model,
-    )
 
     # ── Optimizer + scaler ────────────────────────────────────────────────
     optimizer = build_optimizer(active_model, train_cfg)
     scaler    = torch.GradScaler("cuda", enabled=train_cfg.use_scaler)
 
     # ── Dataset ───────────────────────────────────────────────────────────
-    if use_ddp:
+    if use_ddp or (use_fsdp and is_ddp()):
         train_loader, val_loader = build_loaders_ddp(train_cfg, tokenizer, rank)
     else:
         train_loader, val_loader = build_loaders(train_cfg, tokenizer)
@@ -130,7 +167,6 @@ def build_training_context(
 
     # ── Checkpoint resume ─────────────────────────────────────────────────
     if main:
-        # [v0.7-S2] Crea la directory checkpoint sul volume persistente (/workspace)
         os.makedirs(train_cfg.checkpoint_dir, exist_ok=True)
 
     initial_iter  = 0
@@ -139,19 +175,23 @@ def build_training_context(
     val_losses:   list  = []
 
     if train_cfg.preload:
-        # Cerca il checkpoint nell'ordine: latest.json -> path esplicito -> HuggingFace
         if train_cfg.preload == "latest":
             ckpt_path = (train_cfg.read_latest() or (None, None))[1]
         else:
             ckpt_path = train_cfg.preload
 
-        # Se non trovato localmente, usa il path HF come fallback
         if not ckpt_path:
             ckpt_path = os.path.join(train_cfg.checkpoint_dir, HF_FILENAME)
 
-        initial_iter, best_val_loss, _tl, val_losses = load_checkpoint(
-            ckpt_path, raw_model, optimizer, scaler, device
-        )
+        if use_fsdp and is_ddp():
+            from utils.fsdp import load_fsdp_checkpoint
+            initial_iter, best_val_loss, _tl, val_losses = load_fsdp_checkpoint(
+                ckpt_path, active_model, optimizer, device
+            )
+        else:
+            initial_iter, best_val_loss, _tl, val_losses = load_checkpoint(
+                ckpt_path, raw_model, optimizer, scaler, device
+            )
         train_losses.extend(_tl)
 
     if use_ddp:
@@ -179,9 +219,9 @@ def build_training_context(
         train_losses = train_losses,
         val_losses   = val_losses,
         device       = device,
-        use_ddp      = use_ddp,
+        use_ddp      = use_ddp or (use_fsdp and is_ddp()),
         world_size   = world_size,
         main         = main,
         logger       = logger,
-        ddp_ctx      = ddp_ctx,
+        ddp_ctx      = ddp_ctx or fsdp_ctx,
     )

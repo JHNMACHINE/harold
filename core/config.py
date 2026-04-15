@@ -25,14 +25,16 @@ class ModelConfig:
     n_kv_heads: int = 7
     d_ff:       int = 4864
 
-    # MoE — 1 shared + 16 routed top-2
-    # Compute attivo per token: 1+2=3 expert fwd
-    # Specializzazione: top-2 su 16 = 12.5% pool attivo (vs 25% in v0.7)
+    # MoE — 2 shared + 16 routed top-2
+    # Compute attivo per token: 2+2=4 expert fwd
+    # Specializzazione: top-2 su 16 = 12.5% pool attivo
     moe_n_routed_experts:    int = 16
     moe_top_k:               int = 2
-    ds_moe_n_shared_experts: int = 1
-    moe_routed_hidden:       int = d_ff // 8
-    moe_shared_hidden:       int = d_ff // 4
+    ds_moe_n_shared_experts: int = 2
+    # [v0.7] Hidden dim espliciti — calibrati per ~3.2B totali
+    # d_ff=4864: routed=4864//8=608, shared=4864//4=1216
+    moe_routed_hidden:       int = 608
+    moe_shared_hidden:       int = 1216
 
     # MLA — latent_dim scala proporzionalmente a d_model (ratio ~0.125 invariato)
     mla_latent_dim: int = 224
@@ -46,7 +48,12 @@ class ModelConfig:
     block_size:  int = 4096
 
     # Flow Matching
-    flow_sigma_min: float = 1e-4
+    flow_sigma_min:      float = 1e-4
+    # [v0.7-T1] Timestep sampling: 'logit_normal' (default), 'cosine', 'uniform'
+    # logit_normal con std=0.5 concentra i campioni intorno a t=0.5,
+    # prevenendo velocity collapse e migliorando la qualita del training.
+    t_sampling:          str   = "logit_normal"
+    t_logit_normal_std:  float = 0.5
 
     # Training
     dropout: float = 0.0
@@ -76,11 +83,10 @@ def get_model_config() -> ModelConfig:
 
 @dataclass
 class TrainConfig:
-    # ── Run di test: 10k iter su A100 SXM4 (80GB) ────────────────────────────
-    # Modello 3B bf16: ~24GB overhead fisso (pesi+opt+grad) -> ~56GB liberi
+    # ── Run di test: 10k iter su H200 NVL (140GB) ────────────────────────────
+    # Modello 3.2B bf16: ~38GB overhead fisso (pesi+opt+grad)
     # batch_size=4 + grad_accum=16 -> 64 seq/step effettivo (4096 tok/seq)
-    # = ~262k token/step. Sicuro; se no OOM: prova batch_size=6.
-    # Per full run 100k iter: aumentare grad_accum=32 (128 seq/step).
+    # Per full run 100k iter: max_iters=100_000, rivalutare lr a 1e-4
     batch_size:    int   = 4
     grad_accum:    int   = 16
     max_iters:     int   = 10_000
@@ -91,7 +97,7 @@ class TrainConfig:
     lr:            float = 8e-5
     min_lr:        float = 8e-6   # ratio min_lr/lr invariato (0.1x)
 
-    # warmup: 10% del run (era 10% anche in v0.6: 2000/20000)
+    # warmup: 10% del run
     warmup_iters:  int   = 1000
 
     eval_interval: int   = 200
@@ -104,19 +110,20 @@ class TrainConfig:
     stream_buffer_size: int   = 5000
     val_every:          int   = 200
 
-    # Tutti i checkpoint sul volume persistente (/workspace)
     checkpoint_dir:    str = "/workspace/checkpoints/v0.7"
     checkpoint_prefix: str = "harold_v07"
     preload:           str = "latest"
-    save_every:        int = 2500   # 4 checkpoint totali nel run di test
+    save_every:        int = 10_000  # [v0.7-P3] un checkpoint ogni 10k iter
 
     # torch.compile
     use_compile:  bool = True
     compile_mode: str  = "max-autotune"
 
+    # [v0.7-S3] FSDP per multi-GPU (default False — usa DDP o single-GPU)
+    # Attivare con: use_fsdp=True + torchrun --nproc_per_node=N
+    use_fsdp: bool = False
+
     # Optimizer — Muon invariato, parametri calibrati per 3B
-    # Muon gestisce matrici 2D (attention, MoE, Mamba3 projections)
-    # AdamW gestisce embedding, LayerNorm, bias, scalari SSM
     use_muon:      bool  = True
     muon_momentum: float = 0.95
     muon_beta2:    float = 0.95
@@ -126,7 +133,6 @@ class TrainConfig:
     adamw_eps:     float = 1e-8
     adamw_wd:      float = 0.1
 
-    # Storico loss — ridotto proporzionalmente al run piu corto
     loss_history_size: int = 50_000
 
     device: str = field(init=False)

@@ -1,10 +1,20 @@
 """
-Harold v0.6 — validation.py
+Harold v0.7 — validation.py
 ============================
 ValidationScheduler:  frequenza adattiva basata su stabilità della training loss.
-estimate_loss:        validation completa su t = [0.3, 0.5, 0.7].
+estimate_loss:        validation completa su t = [0.1, 0.3, 0.5, 0.7, 0.9].
 estimate_loss_single_t: validation rapida a singolo timestep.
+compute_moe_load_stats: bilanciamento carico MoE — rileva expert dominanti.
 run_validation_step:  orchestrazione completa di un singolo step di validation.
+
+Cambiamenti rispetto a v0.6:
+  [v0.7-M2a] t_values esteso a [0.1, 0.3, 0.5, 0.7, 0.9]
+              t=0.1 e t=0.9 rilevano velocity collapse agli estremi:
+              se score a t=0.1 diverge mentre t=0.9 scende, il modello
+              sta collassando sul denoising facile.
+  [v0.7-M2b] compute_moe_load_stats: max/mean ratio per layer MoE.
+              Ratio > 4x → WARNING expert dominante.
+  [v0.7-M2c] Metriche MoE loggiate in ogni full validation.
 """
 
 from collections import deque
@@ -96,11 +106,9 @@ class ValidationScheduler:
             recent = list(self._train_losses)[-10:]
             n      = len(recent)
             mean   = sum(recent) / n
-            # std pura Python — evita allocazione torch.tensor ad ogni step
             var    = sum((x - mean) ** 2 for x in recent) / n
             std    = var ** 0.5
             cv     = std / mean if mean > 0 else 0.0
-            # slope lineare pura Python
             sx   = n * (n - 1) / 2
             sxx  = n * (n - 1) * (2 * n - 1) / 6
             sxy  = sum(i * v for i, v in enumerate(recent))
@@ -204,6 +212,63 @@ def estimate_loss_single_t(
 
 
 @torch.no_grad()
+def compute_moe_load_stats(model: Harold) -> Dict[str, float]:
+    r"""compute_moe_load_stats(model) -> dict
+
+    Calcola statistiche di bilanciamento del carico MoE su tutti i layer.
+
+    Legge ``router_indices`` accumulati nell'ultimo forward pass e calcola
+    per ogni layer il ratio ``max_load / mean_load``. Un ratio > 3-4x indica
+    squilibrio — un singolo expert riceve troppi token.
+
+    .. rubric:: [v0.7-M2b] Interpretazione
+
+    - ratio ``<= 2x``: bilanciamento sano
+    - ratio ``2-4x``: squilibrio moderato, monitorare
+    - ratio ``> 4x``: WARNING — expert dominante, considerare aumento
+      di ``bias_update_gamma`` in :class:`~core.model.DeepSeekMoELayer`
+
+    Args:
+        model: istanza di :class:`~core.model.Harold` dopo almeno un forward pass
+
+    Returns:
+        dict con chiavi:
+
+        - **moe_imbalance_max** (*float*) — massimo ratio tra tutti i layer
+        - **moe_imbalance_mean** (*float*) — ratio medio tra tutti i layer
+        - **moe_dominant_layer** (*int*) — indice del layer più squilibrato,
+          ``-1`` se nessun dato disponibile
+    """
+    from core.model import DeepSeekMoELayer
+    ratios = []
+    for i, block in enumerate(model.blocks):
+        moe = block.moe
+        if not isinstance(moe, DeepSeekMoELayer):
+            continue
+        if moe.router_indices is None:
+            continue
+        valid = moe.router_indices[moe.router_indices >= 0]
+        if valid.numel() == 0:
+            continue
+        counts = torch.bincount(valid.view(-1), minlength=moe.n_routed_experts).float()
+        mean_c = counts.mean().item()
+        max_c  = counts.max().item()
+        ratio  = max_c / mean_c if mean_c > 0 else 1.0
+        ratios.append((i, ratio))
+
+    if not ratios:
+        return {"moe_imbalance_max": 1.0, "moe_imbalance_mean": 1.0, "moe_dominant_layer": -1}
+
+    dominant_layer, max_ratio = max(ratios, key=lambda x: x[1])
+    mean_ratio = sum(r for _, r in ratios) / len(ratios)
+    return {
+        "moe_imbalance_max":  round(max_ratio,  3),
+        "moe_imbalance_mean": round(mean_ratio, 3),
+        "moe_dominant_layer": dominant_layer,
+    }
+
+
+@torch.no_grad()
 def estimate_loss(
     model:        Harold,
     train_cfg:    ValCfg,
@@ -214,19 +279,21 @@ def estimate_loss(
     encode_fn:    Optional[Callable] = None,
 ) -> float:
     """
-    Validation completa su t = [0.3, 0.5, 0.7].
+    Validation completa su t = [0.1, 0.3, 0.5, 0.7, 0.9].
 
-    Rispetto alla versione originale:
-    - t_values ridotti da 5 a 3 (0.1 e 0.9 poco informativi per Flow Matching)
-    - Cache ``fixed_t`` per evitare allocazioni GPU ripetute
+    Rispetto a v0.6:
+    - [v0.7-M2a] t_values esteso da [0.3, 0.5, 0.7] a [0.1, 0.3, 0.5, 0.7, 0.9]
+      t=0.1 e t=0.9 rilevano velocity/x0 collapse agli estremi del processo
+    - [v0.7-M2b] compute_moe_load_stats loggato ad ogni full validation
+    - Cache fixed_t per evitare allocazioni GPU ripetute
     - Accumulatori su GPU invece di liste CPU
     - encode_fn opzionale (batch, device) -> ctx_emb per SFT CFG.
-      Se None, ctx_emb non viene passato (pretraining).
     """
     device  = next(model.parameters()).device
     model.eval()
 
-    t_values = [0.3, 0.5, 0.7]
+    # [v0.7-M2a] Esteso a 5 timestep — 0.1 e 0.9 rilevano collapse agli estremi
+    t_values = [0.1, 0.3, 0.5, 0.7, 0.9]
     n_t      = len(t_values)
 
     sum_total = torch.zeros(n_t, device=device)
@@ -281,6 +348,16 @@ def estimate_loss(
     print("  val score: " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_score.items()))
     print("  val CE:    " + "  ".join(f"t={t}:{v:.4f}" for t, v in per_t_ce.items()))
 
+    # [v0.7-M2b] MoE load balancing — rileva expert dominanti
+    moe_stats = compute_moe_load_stats(model)
+    print(f"  MoE imbalance: max={moe_stats['moe_imbalance_max']:.2f}x  "
+          f"mean={moe_stats['moe_imbalance_mean']:.2f}x  "
+          f"dominant_layer={moe_stats['moe_dominant_layer']}")
+    if moe_stats["moe_imbalance_max"] > 4.0:
+        print(f"  WARNING: MoE squilibrato "
+              f"(ratio={moe_stats['moe_imbalance_max']:.1f}x > 4.0) — "
+              f"considera aumentare bias_update_gamma in DeepSeekMoELayer")
+
     if logger is not None:
         logger.log({
             "type":        "val_detail",
@@ -288,6 +365,7 @@ def estimate_loss(
             "total_per_t": {str(t): round(v, 6) for t, v in per_t_total.items()},
             "score_per_t": {str(t): round(v, 6) for t, v in per_t_score.items()},
             "ce_per_t":    {str(t): round(v, 6) for t, v in per_t_ce.items()},
+            **{f"moe_{k}": v for k, v in moe_stats.items()},
         })
 
     valid = [v for v in per_t_total.values() if v != float("inf")]
@@ -324,21 +402,6 @@ def run_validation_step(
 
     Decide se validare, esegue la validation (full o quick),
     sincronizza in DDP, logga, salva il checkpoint best se migliorato.
-
-    Args:
-        ctx:          TrainingContext con model, loaders, optimizer, ecc.
-        model_cfg:    configurazione modello (per save_checkpoint)
-        train_cfg:    configurazione training
-        val_scheduler: scheduler adattivo
-        iter_num:     iterazione corrente
-        accum_loss:      loss accumulata dall'ultimo full val (per avg_train)
-        steps_since_val: numero di step validi dall'ultima val (denominatore avg_train)
-        start_time:   timestamp avvio training (per elapsed)
-        lr:           learning rate corrente (per logging)
-        force_val:    forza validation indipendentemente dallo scheduler
-
-    Returns:
-        ``ValidationResult`` se la validation è stata eseguita, ``None`` altrimenti.
     """
     current_train_loss = accum_loss / max(steps_since_val, 1)
     should_val, reason = val_scheduler.should_validate(
@@ -394,7 +457,7 @@ def run_validation_step(
                 save_checkpoint(best_path, ctx.model, ctx.optimizer, ctx.scaler,
                                 iter_num, val_loss, model_cfg, train_cfg,
                                 ctx.train_losses, ctx.val_losses, push_hf=True)
-                print(f"  ★ Best val loss: {val_loss:.4f} → {best_path}")
+                print(f"  Best val loss: {val_loss:.4f} -> {best_path}")
                 train_cfg.write_latest(iter_num, best_path)
                 if ctx.logger:
                     ctx.logger.log({"type": "best_checkpoint", "iter": iter_num,
