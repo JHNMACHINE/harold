@@ -25,6 +25,13 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Compatibilità con import legacy in model.py
+import sys as _sys
+from core import config as _core_config
+from core import model as _core_model
+_sys.modules.setdefault("config", _core_config)
+_sys.modules.setdefault("model", _core_model)
+
 from core.config import ModelConfig, get_model_config
 from core.model import Harold, build_model
 
