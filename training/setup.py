@@ -52,7 +52,7 @@ def build_training_context(
     main = is_main()
 
     if main:
-        print("Harold v0.6 — Jamba (Mamba2 + Attention + MoE) + Flow Matching")
+        print("Harold v0.6 — Jamba (Mamba3 + Attention + MoE) + Flow Matching")
         print(f"Modalità:       {'DDP (' + str(world_size) + ' GPU)' if use_ddp else 'Single-GPU'}")
         print(f"Device:         {device}")
         print(f"Dtype:          {train_cfg.dtype}  (scaler={'ON' if train_cfg.use_scaler else 'OFF'})")
