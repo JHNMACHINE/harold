@@ -139,7 +139,16 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
             steps_since_val = 0
             if val_result.is_best:
                 ctx.best_val_loss = val_result.val_loss
-                ctx.best_val_loss = val_result.val_loss
+                if ctx.main:
+                    best_path = train_cfg.best_ckpt_path()
+                    save_checkpoint(best_path, ctx.model, ctx.optimizer, ctx.scaler,
+                                    iter_num, ctx.best_val_loss, model_cfg, train_cfg,
+                                    ctx.train_losses, ctx.val_losses, full=True)
+                    print(f"  Best checkpoint -> {best_path}")
+                    if ctx.logger:
+                        ctx.logger.log({"type": "best_checkpoint", "iter": iter_num,
+                                        "val_loss": round(ctx.best_val_loss, 6),
+                                        "path": best_path})
 
         # ── Checkpoint periodico ──────────────────────────────────────────
         if iter_num > 0 and iter_num % train_cfg.save_every == 0 and ctx.main:
@@ -154,9 +163,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
     # ── Finale ────────────────────────────────────────────────────────────
     elapsed    = (time.time() - start_time) / 60
-    os.makedirs(train_cfg.best_ckpt_dir, exist_ok=True)
-    final_path = os.path.join(train_cfg.checkpoint_dir,
-                              f"{train_cfg.checkpoint_prefix}_final.pt")
+    final_path = train_cfg.final_ckpt_path()
 
     if ctx.main:
         save_checkpoint(final_path, ctx.model, ctx.optimizer, ctx.scaler,

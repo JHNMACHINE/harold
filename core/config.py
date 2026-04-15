@@ -6,8 +6,8 @@ import json
 import torch
 from typing import Optional
 
-HF_FILENAME:  str = "harold-3B.pt"
-HF_REPO_ID:   str = "JHN-MACHINE/harold"
+HF_FILENAME:  str = "harold-v0.7-3B.pt"
+HF_REPO_ID:   str = "JHN-MACHINE/harold-v0.7"
 MAX_SKIP_RATIO = 10
 
 @dataclass
@@ -31,8 +31,6 @@ class ModelConfig:
     moe_n_routed_experts:    int = 16
     moe_top_k:               int = 2
     ds_moe_n_shared_experts: int = 2
-    moe_routed_hidden:       int = 608   # d_ff // 8 — calibrato per ~3.2B totali
-    moe_shared_hidden:       int = 1216 
 
     # MLA — latent_dim scala proporzionalmente a d_model (ratio ~0.125 invariato)
     mla_latent_dim: int = 224
@@ -104,15 +102,11 @@ class TrainConfig:
     stream_buffer_size: int   = 5000
     val_every:          int   = 200
 
-    # Checkpoint periodici sul disco locale dell'istanza (overlay, 100GB, temporaneo)
-    # Spariscono quando l'istanza viene distrutta — vanno bene per i periodici.
-    checkpoint_dir: str = "/workspace/checkpoints/v0.7"
+    # Tutti i checkpoint sul volume persistente (/workspace)
+    checkpoint_dir:    str = "/workspace/checkpoints/v0.7"
     checkpoint_prefix: str = "harold_v07"
     preload:           str = "latest"
     save_every:        int = 2500   # 4 checkpoint totali nel run di test
-
-    # Best e final sul volume persistente (/workspace, 50GB, sopravvive tra istanze)
-    best_ckpt_dir:     str = "/workspace/checkpoints/v0.7" 
 
     # torch.compile
     use_compile:  bool = True
@@ -164,6 +158,12 @@ class TrainConfig:
 
     def ckpt_path(self, iter_num: int) -> str:
         return str(Path(self.checkpoint_dir) / f"{self.checkpoint_prefix}_{iter_num:07d}.pt")
+
+    def best_ckpt_path(self) -> str:
+        return str(Path(self.checkpoint_dir) / f"{self.checkpoint_prefix}_best.pt")
+
+    def final_ckpt_path(self) -> str:
+        return str(Path(self.checkpoint_dir) / f"{self.checkpoint_prefix}_final.pt")
 
     def latest_json_path(self) -> str:
         return str(Path(self.checkpoint_dir) / "latest.json")

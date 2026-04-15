@@ -6,9 +6,9 @@ Ritorna un dataclass con model, optimizer, loaders, logger, ecc.
 
 Cambiamenti rispetto a v0.6:
   [v0.7-S1] Stringa versione aggiornata a Harold v0.7.
-  [v0.7-S2] os.makedirs anche per best_ckpt_dir al resume,
-             cosi il volume /workspace/checkpoints/v0.7 esiste
-             prima che train.py provi a salvare best e final.
+  [v0.7-S2] os.makedirs per checkpoint_dir al setup,
+             garantisce che /workspace/checkpoints/v0.7 esista
+             prima del primo salvataggio.
 """
 
 import os
@@ -130,11 +130,8 @@ def build_training_context(
 
     # ── Checkpoint resume ─────────────────────────────────────────────────
     if main:
-        # [v0.7-S2] Crea entrambe le directory al momento del setup:
-        # - checkpoint_dir: periodici sul disco locale (overlay)
-        # - best_ckpt_dir:  best e final sul volume persistente (/workspace)
+        # [v0.7-S2] Crea la directory checkpoint sul volume persistente (/workspace)
         os.makedirs(train_cfg.checkpoint_dir, exist_ok=True)
-        os.makedirs(train_cfg.best_ckpt_dir,  exist_ok=True)
 
     initial_iter  = 0
     best_val_loss = float("inf")
