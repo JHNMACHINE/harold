@@ -31,7 +31,7 @@ from transformers import AutoTokenizer
 # Aggiungi la root del progetto al path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from core.config import SFTConfig
+from core.config import ModelConfig, SFTConfig
 from core.model import Harold, build_model
 
 
@@ -50,26 +50,99 @@ VAR_THRESHOLD_HI = 0.15    # sopra → complesso → 20 step
 # Caricamento modello
 # ─────────────────────────────────────────────────────────────────────────────
 
+HF_REPO_ID       = "JHN-MACHINE/harold-v0.6"
+HF_SFT_PT        = "harold-v0.6-1B-sft.pt"
+HF_SFT_SF        = "harold-v0.6-1B-sft.safetensors"
+DEFAULT_CKPT_SF  = "harold-v0.6-1B-sft.safetensors"
+DEFAULT_CKPT_PT  = "harold-v0.6-1B-sft.pt"
+
+
+def _download_from_hf(filename: str, local_path: str) -> bool:
+    """Scarica un file da HuggingFace. Ritorna True se riuscito."""
+    try:
+        from huggingface_hub import hf_hub_download
+        hf_token = os.environ.get("HF_TOKEN")
+        print(f"  Scarico {filename} da {HF_REPO_ID}...")
+        downloaded = hf_hub_download(
+            repo_id=HF_REPO_ID,
+            filename=filename,
+            token=hf_token,
+            local_dir=os.path.dirname(local_path) or ".",
+        )
+        if downloaded != local_path:
+            import shutil
+            shutil.move(downloaded, local_path)
+        print(f"  Scaricato → {local_path}")
+        return True
+    except Exception as e:
+        print(f"  Download fallito: {e}")
+        return False
+
+
 def load_model(
-    checkpoint_path: str,
+    checkpoint_path: str = DEFAULT_CKPT_SF,
     device:          str = "cuda",
-) -> tuple[Harold, dict]:
+) -> Harold:
     """
-    Carica il modello dal checkpoint (pretraining o SFT).
+    Carica il modello dal checkpoint.
+
+    Ordine di ricerca:
+      1. Path locale fornito (se esiste)
+      2. .safetensors locale (DEFAULT_CKPT_SF)
+      3. Download .safetensors da HuggingFace
+      4. .pt locale (DEFAULT_CKPT_PT)
+      5. Download .pt da HuggingFace
+
     Ritorna (model, model_cfg).
     """
-    print(f"Carico checkpoint: {checkpoint_path}")
-    state     = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    model_cfg = state["model_cfg"]
-    model     = build_model(model_cfg).to(device)
-    model.load_state_dict(state["model_state"], strict=False)
+    from safetensors.torch import load_file as sf_load
+
+    # Risolvi il path da usare
+    path_to_use = checkpoint_path
+
+    if not os.path.isfile(path_to_use):
+        # Prova safetensors locale
+        if os.path.isfile(DEFAULT_CKPT_SF):
+            path_to_use = DEFAULT_CKPT_SF
+        # Prova download safetensors da HF
+        elif _download_from_hf(HF_SFT_SF, DEFAULT_CKPT_SF):
+            path_to_use = DEFAULT_CKPT_SF
+        # Prova .pt locale
+        elif os.path.isfile(DEFAULT_CKPT_PT):
+            path_to_use = DEFAULT_CKPT_PT
+        # Prova download .pt da HF
+        elif _download_from_hf(HF_SFT_PT, DEFAULT_CKPT_PT):
+            path_to_use = DEFAULT_CKPT_PT
+        else:
+            raise FileNotFoundError(
+                f"Checkpoint non trovato: {checkpoint_path}\n"
+                f"Imposta HF_TOKEN per scaricare automaticamente da HuggingFace."
+            )
+
+    print(f"Carico checkpoint: {path_to_use}")
+
+    is_safetensors = path_to_use.endswith(".safetensors")
+
+    if is_safetensors:
+        # .safetensors non contiene model_cfg — usa config di default
+        from core.config import get_model_config
+        model_cfg = get_model_config()
+        model     = build_model(model_cfg).to(device)
+        weights   = sf_load(path_to_use, device="cpu")
+        model.load_state_dict(weights, strict=False)
+    else:
+        state     = torch.load(path_to_use, map_location="cpu", weights_only=False)
+        model_cfg = state["model_cfg"]
+        model     = build_model(model_cfg).to(device)
+        model.load_state_dict(state["model_state"], strict=False)
+
     model.eval()
 
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Harold v0.6 — {n_params/1000:.2f}B parametri" if n_params >= 1000
           else f"Harold v0.6 — {n_params:.1f}M parametri")
     print(f"Device: {device}  |  dtype: {next(model.parameters()).dtype}")
-    return model, model_cfg
+    return model
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -254,8 +327,8 @@ Esempi:
     )
     parser.add_argument("--prompt",     type=str, required=True,  help="Prompt di input")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints_sft_v6/harold_v06_sft_s1_best.pt",
-                        help="Path del checkpoint")
+                        default=DEFAULT_CKPT_SF,
+                        help="Path del checkpoint (default: scarica da HuggingFace)")
     parser.add_argument("--max_len",    type=int,   default=128,  help="Lunghezza max risposta in token")
     parser.add_argument("--cfg_scale",  type=float, default=3.0,  help="Scala CFG")
     parser.add_argument("--min_steps",  type=int,   default=MIN_STEPS, help="Step minimi denoising")
@@ -280,8 +353,8 @@ def main() -> None:
     pad_token_id = int(tokenizer.pad_token_id)
 
     # Carica modello
-    model, _ = load_model(args.checkpoint, device=device)
-    model     = model.to(dtype)
+    model = load_model(args.checkpoint, device=device)
+    model = model.to(dtype)
 
     print(f"\nPrompt: {args.prompt!r}")
     print("-" * 60)
