@@ -111,7 +111,7 @@ class TrainConfig:
     save_every:        int = 2500   # 4 checkpoint totali nel run di test
 
     # torch.compile
-    use_compile:  bool = True
+    use_compile:  bool = False
     compile_mode: str  = "max-autotune"
 
     # Optimizer — Muon invariato, parametri calibrati per 3B
