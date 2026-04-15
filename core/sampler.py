@@ -124,7 +124,7 @@ def load_model(
 
     if is_safetensors:
         # .safetensors non contiene model_cfg — usa config di default
-        from core.config import get_model_config
+        from config import get_model_config
         model_cfg = get_model_config()
         model     = build_model(model_cfg).to(device)
         weights   = sf_load(path_to_use, device="cpu")
