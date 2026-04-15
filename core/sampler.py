@@ -31,8 +31,7 @@ from transformers import AutoTokenizer
 # Aggiungi la root del progetto al path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from core.config import ModelConfig, SFTConfig
-from core.model import Harold, build_model
+from model import Harold, build_model
 
 
 # ─────────────────────────────────────────────────────────────────────────────
