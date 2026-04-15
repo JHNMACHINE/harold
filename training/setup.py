@@ -1,8 +1,14 @@
 """
-Harold v0.6 — setup.py
+Harold v0.7 — setup.py
 ========================
 build_training_context: inizializza tutto il necessario per il training loop.
 Ritorna un dataclass con model, optimizer, loaders, logger, ecc.
+
+Cambiamenti rispetto a v0.6:
+  [v0.7-S1] Stringa versione aggiornata a Harold v0.7.
+  [v0.7-S2] os.makedirs anche per best_ckpt_dir al resume,
+             cosi il volume /workspace/checkpoints/v0.7 esiste
+             prima che train.py provi a salvare best e final.
 """
 
 import os
@@ -22,7 +28,6 @@ from utils.logger import AsyncLogger
 from utils.checkpoint import load_checkpoint
 from utils.ddp import DDPContext, is_ddp, is_main, broadcast_model
 from core.context import TrainingContext
-
 
 
 def build_training_context(
@@ -52,12 +57,12 @@ def build_training_context(
     main = is_main()
 
     if main:
-        print("Harold v0.6 — Jamba (Mamba3 + Attention + MoE) + Flow Matching")
-        print(f"Modalità:       {'DDP (' + str(world_size) + ' GPU)' if use_ddp else 'Single-GPU'}")
+        print("Harold v0.7 — Jamba (Mamba3 + Attention + MoE) + Flow Matching + x0-prediction")
+        print(f"Modalita:       {'DDP (' + str(world_size) + ' GPU)' if use_ddp else 'Single-GPU'}")
         print(f"Device:         {device}")
         print(f"Dtype:          {train_cfg.dtype}  (scaler={'ON' if train_cfg.use_scaler else 'OFF'})")
         eff = train_cfg.batch_size * train_cfg.grad_accum * world_size
-        print(f"Batch effettivo:{eff}  ({train_cfg.batch_size} × {train_cfg.grad_accum} × {world_size} GPU)")
+        print(f"Batch effettivo:{eff}  ({train_cfg.batch_size} x {train_cfg.grad_accum} x {world_size} GPU)")
 
     if device.startswith("cuda"):
         torch.backends.cudnn.benchmark = True
@@ -99,7 +104,8 @@ def build_training_context(
 
     if main:
         n_params = sum(p.numel() for p in model.parameters()) / 1e6
-        print(f"Harold v0.6 — {n_params:.1f}M parametri totali")
+        label    = f"{n_params/1000:.2f}B" if n_params >= 1000 else f"{n_params:.1f}M"
+        print(f"Harold v0.7 — {label} parametri totali")
 
     active_model: Union[Harold, DDP] = (
         DDP(model, device_ids=[local_rank], output_device=local_rank)
@@ -124,7 +130,11 @@ def build_training_context(
 
     # ── Checkpoint resume ─────────────────────────────────────────────────
     if main:
+        # [v0.7-S2] Crea entrambe le directory al momento del setup:
+        # - checkpoint_dir: periodici sul disco locale (overlay)
+        # - best_ckpt_dir:  best e final sul volume persistente (/workspace)
         os.makedirs(train_cfg.checkpoint_dir, exist_ok=True)
+        os.makedirs(train_cfg.best_ckpt_dir,  exist_ok=True)
 
     initial_iter  = 0
     best_val_loss = float("inf")
@@ -132,14 +142,13 @@ def build_training_context(
     val_losses:   list  = []
 
     if train_cfg.preload:
-        # Cerca il checkpoint nell'ordine: latest.json → path esplicito → HuggingFace
+        # Cerca il checkpoint nell'ordine: latest.json -> path esplicito -> HuggingFace
         if train_cfg.preload == "latest":
             ckpt_path = (train_cfg.read_latest() or (None, None))[1]
         else:
             ckpt_path = train_cfg.preload
 
         # Se non trovato localmente, usa il path HF come fallback
-        # load_checkpoint scaricherà da HF se il file non esiste
         if not ckpt_path:
             ckpt_path = os.path.join(train_cfg.checkpoint_dir, HF_FILENAME)
 
