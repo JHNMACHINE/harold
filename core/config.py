@@ -102,10 +102,15 @@ class TrainConfig:
     stream_buffer_size: int   = 5000
     val_every:          int   = 200
 
-    checkpoint_dir: str = "/workspace/checkpoints/v0.7"
+    # Checkpoint periodici sul disco locale dell'istanza (overlay, 100GB, temporaneo)
+    # Spariscono quando l'istanza viene distrutta — vanno bene per i periodici.
+    checkpoint_dir:    str = "/checkpoints_v7"
     checkpoint_prefix: str = "harold_v07"
     preload:           str = "latest"
     save_every:        int = 2500   # 4 checkpoint totali nel run di test
+
+    # Best e final sul volume persistente (/workspace, 50GB, sopravvive tra istanze)
+    best_ckpt_dir:     str = "/workspace/checkpoints/v0.7" 
 
     # torch.compile
     use_compile:  bool = True
@@ -157,6 +162,12 @@ class TrainConfig:
 
     def ckpt_path(self, iter_num: int) -> str:
         return str(Path(self.checkpoint_dir) / f"{self.checkpoint_prefix}_{iter_num:07d}.pt")
+
+    def best_ckpt_path(self) -> str:
+        return str(Path(self.best_ckpt_dir) / f"{self.checkpoint_prefix}_best.pt")
+
+    def final_ckpt_path(self) -> str:
+        return str(Path(self.best_ckpt_dir) / f"{self.checkpoint_prefix}_final.pt")
 
     def latest_json_path(self) -> str:
         return str(Path(self.checkpoint_dir) / "latest.json")
