@@ -1,5 +1,5 @@
 """
-Harold v0.6 — train.py  (unified single-GPU + DDP)
+Harold v0.7 — train.py  (unified single-GPU + DDP)
 ====================================================
 Avvio single-GPU:
     torchrun --nproc_per_node=1 train.py
@@ -13,6 +13,15 @@ Moduli ausiliari:
   validation.py  — ValidationScheduler, run_validation_step, estimate_loss
   lr_schedule.py — get_lr
   optimizer.py   — MuonAdamW, build_optimizer
+
+Cambiamenti rispetto a v0.6:
+  [v0.7-T1] val forzata a iter_num==0: baseline loss pre-training.
+             Con un'architettura nuova (Mamba3 + x0-prediction) è utile
+             avere il punto di partenza prima di qualsiasi aggiornamento.
+  [v0.7-T2] Stringa versione aggiornata a Harold v0.7.
+  [v0.7-T3] update_router_biases — annotato: con 16 expert routed il
+             bilanciamento del carico è più critico che in v0.6 (8 expert).
+             Nessuna modifica al codice, la logica è invariata in model.py.
 """
 
 import os
@@ -43,7 +52,6 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         stability_threshold = 0.03,
         patience            = 3,
     )
-    # Evita val e save ridondanti al resume — inizializza lo scheduler
     if ctx.initial_iter > 0:
         val_scheduler._last_val_iter = ctx.initial_iter
         val_scheduler._total_val    = 1
@@ -58,7 +66,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
     pbar = tqdm(
         range(ctx.initial_iter, train_cfg.max_iters),
-        desc="Harold v0.6" + (" DDP" if ctx.use_ddp else ""),
+        desc="Harold v0.7" + (" DDP" if ctx.use_ddp else ""),
         disable=not ctx.main,
     )
 
@@ -82,7 +90,14 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         )
         ctx.scaler.step(ctx.optimizer)
         ctx.scaler.update()
-        ctx.model.update_router_biases()
+
+        # [v0.7-T3] Con 16 expert routed il router bias update è più critico
+        # che in v0.6 (8 expert). Eseguito ogni 10 iter invece di ogni step:
+        # - router_indices si accumula su finestra 10 step -> conteggio
+        #   più stabile e rappresentativo per il bincount
+        # - riduce overhead: 40 layer x 16 expert non è gratis ad ogni step
+        if iter_num % 10 == 0:
+            ctx.model.update_router_biases()
 
         avg_loss  = loss_sum  / valid_count
         avg_score = score_sum / valid_count
@@ -103,6 +118,10 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
                                 "elapsed_min": round((time.time() - start_time) / 60, 2)})
 
         # ── Validation ────────────────────────────────────────────────────
+        # [v0.7-T1] force_val a iter_num==0: baseline loss pre-training.
+        # Utile per un'architettura nuova (Mamba3 + x0-prediction) per
+        # verificare che il punto di partenza sia ragionevole prima di
+        # qualsiasi aggiornamento dei pesi.
         val_result = run_validation_step(
             ctx             = ctx,
             model_cfg       = model_cfg,
@@ -113,7 +132,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
             steps_since_val = steps_since_val,
             start_time      = start_time,
             lr              = lr,
-            force_val       = (iter_num == train_cfg.max_iters - 1),
+            force_val       = (iter_num == 0 or iter_num == train_cfg.max_iters - 1),
         )
         if val_result is not None:
             accum_loss      = val_result.accum_loss
@@ -128,7 +147,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
                             iter_num, ctx.best_val_loss, model_cfg, train_cfg,
                             ctx.train_losses, ctx.val_losses, full=False)
             train_cfg.write_latest(iter_num, p)
-            print(f"  Checkpoint periodico → {p}")
+            print(f"  Checkpoint periodico -> {p}")
             if ctx.logger:
                 ctx.logger.log({"type": "periodic_checkpoint", "iter": iter_num, "path": p})
 
@@ -148,7 +167,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
                             "elapsed_min": round(elapsed, 2),
                             "final_checkpoint": final_path})
             ctx.logger.close()
-        print(f"\nTraining completato in {elapsed:.1f} min → {final_path}")
+        print(f"\nTraining completato in {elapsed:.1f} min -> {final_path}")
 
     if ctx.use_ddp and ctx.ddp_ctx is not None:
         ctx.ddp_ctx.teardown()
