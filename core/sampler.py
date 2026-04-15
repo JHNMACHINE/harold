@@ -18,22 +18,20 @@ Avvio:
 """
 
 import argparse
-import math
 import os
 import sys
 import time
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 # Aggiungi la root del progetto al path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from core.config import SFTConfig
-from core.model import Harold, build_model
-
+from model import Harold, build_model
+from config import get_model_config
+from safetensors.torch import load_file as sf_load
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Costanti
@@ -94,9 +92,6 @@ def load_model(
       4. .pt locale (DEFAULT_CKPT_PT)
       5. Download .pt da HuggingFace
     """
-    from safetensors.torch import load_file as sf_load
-    from core.config import get_model_config
-
     path_to_use = checkpoint_path
 
     if not os.path.isfile(path_to_use):
