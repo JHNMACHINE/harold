@@ -74,11 +74,10 @@ pretraining:
     text_field: text
     weight: 0.12
 
-  - name: github_code
-    path: bigcode/the-stack-dedup
-    config: data/python
+  - name: macrocosm-os
+    path: macrocosm-os/code-parrot-github-code
     split: train
-    text_field: content   # o 'text'? controlla
+    text_field: content
     weight: 0.03
 
   - name: open_web_math
