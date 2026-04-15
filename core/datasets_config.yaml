@@ -75,10 +75,10 @@ pretraining:
     weight: 0.12
 
   - name: github_code
-    path: codeparrot/github-code
-    config: Python
+    path: bigcode/the-stack-dedup
+    config: data/python
     split: train
-    text_field: code
+    text_field: content   # o 'text'? controlla
     weight: 0.03
 
   - name: open_web_math
