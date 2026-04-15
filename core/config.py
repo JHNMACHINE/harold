@@ -31,6 +31,8 @@ class ModelConfig:
     moe_n_routed_experts:    int = 16
     moe_top_k:               int = 2
     ds_moe_n_shared_experts: int = 2
+    moe_routed_hidden:       int = 608   # d_ff // 8 — calibrato per ~3.2B totali
+    moe_shared_hidden:       int = 1216 
 
     # MLA — latent_dim scala proporzionalmente a d_model (ratio ~0.125 invariato)
     mla_latent_dim: int = 224

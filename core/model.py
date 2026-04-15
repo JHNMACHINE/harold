@@ -117,11 +117,11 @@ class DeepSeekMoELayer(nn.Module):
         self.top_k_min         = 1
 
         self.shared_experts = nn.ModuleList([
-            SharedExpert(config.d_model, config.d_ff // 2, dropout=config.dropout)
+            SharedExpert(config.d_model, config.moe_shared_hidden, dropout=config.dropout)
             for _ in range(config.ds_moe_n_shared_experts)
         ])
         self.routed_experts = nn.ModuleList([
-            Expert(config.d_model, config.d_ff // 4, dropout=config.dropout)
+            Expert(config.d_model, config.moe_routed_hidden, dropout=config.dropout)
             for _ in range(self.n_routed_experts)
         ])
 
