@@ -32,6 +32,7 @@ from transformers import AutoTokenizer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from model import Harold, build_model
+from config import get_model_config
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -124,7 +125,6 @@ def load_model(
 
     if is_safetensors:
         # .safetensors non contiene model_cfg — usa config di default
-        from config import get_model_config
         model_cfg = get_model_config()
         model     = build_model(model_cfg).to(device)
         weights   = sf_load(path_to_use, device="cpu")
