@@ -1,5 +1,5 @@
 """
-Harold v0.6 - train_sft.py
+Harold v0.6 — train_sft.py
 ===========================
 Supervised Fine-Tuning con Classifier-Free Guidance (CFG).
 
@@ -14,10 +14,10 @@ CFG (Flow Matching):
   - In inferenza: vel_guided = vel_uncond + cfg_scale*(vel_cond - vel_uncond)
 
 Ottimizzazioni rispetto alla versione precedente:
-  [OPT-S1] torch.compile - stesso compile mode del pretraining
-  [OPT-S2] ValidationScheduler adattivo - frequenza variabile in base alla stabilità
-  [OPT-S3] Quick validation - alterna full (5 t) e quick (t=0.5) per risparmiare tempo
-  [OPT-S4] Fix allocazioni CPU - sum/mean puri Python invece di torch.tensor(v).mean()
+  [OPT-S1] torch.compile — stesso compile mode del pretraining
+  [OPT-S2] ValidationScheduler adattivo — frequenza variabile in base alla stabilità
+  [OPT-S3] Quick validation — alterna full (5 t) e quick (t=0.5) per risparmiare tempo
+  [OPT-S4] Fix allocazioni CPU — sum/mean puri Python invece di torch.tensor(v).mean()
   [OPT-S5] non_blocking=True in estimate_loss (validation.py)
   [OPT-S6] _optimal_num_workers per stage 2
 
@@ -73,7 +73,7 @@ def get_lr(it: int, cfg: SFTConfig, max_iters: int, base_lr: float) -> float:
 
 
 def _make_sft_encode_fn(model: Harold, pad_token_id: int):
-    """Crea l'encode_fn per la SFT validation - passa ctx_emb a compute_loss."""
+    """Crea l'encode_fn per la SFT validation — passa ctx_emb a compute_loss."""
     def _encode(batch: dict, device: str) -> torch.Tensor:
         prompt_ids = batch["prompt_ids"].to(device, non_blocking=True)
         return encode_context(model, prompt_ids, pad_token_id)
@@ -114,6 +114,10 @@ def run_stage(
         stability_threshold = 0.03,
         patience            = 3,
     )
+    # Evita val e save ridondanti al resume — inizializza lo scheduler
+    if initial_iter > 0:
+        val_scheduler._last_val_iter = initial_iter
+        val_scheduler._total_val    = 1
 
     pbar = tqdm(
         range(initial_iter, max_iters),
@@ -361,7 +365,6 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
         if use_ddp else model
     )
     raw_model: Harold = cast(Harold, active_model.module if isinstance(active_model, DDP) else active_model)
-
     raw_model.load_state_dict(state["model_state"], strict=False)
     del state
 
@@ -398,36 +401,29 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
     train_losses: list = []
     val_losses:   list = []
 
-    if sft_cfg.preload == "latest":
-        result = sft_cfg.read_latest()
-        if result:
-            initial_stage, initial_iter, ckpt_path = result
-            # Usa stage e iter dal JSON, non dal checkpoint
-            _stage_from_json = initial_stage
-            _iter_from_json  = initial_iter
-    else:
-        ckpt_path = sft_cfg.preload
-
-    if ckpt_path and os.path.isfile(ckpt_path):
-        _, _, best_val, train_losses, val_losses = load_checkpoint(
-            ckpt_path, raw_model, optimizer, scaler, device, load_stage=True,
-        )
-        # Ripristina stage e iter dal JSON
+    if sft_cfg.preload:
+        ckpt_path = None
         if sft_cfg.preload == "latest":
-            initial_stage = _stage_from_json
-            initial_iter  = _iter_from_json
+            result = sft_cfg.read_latest()
+            if result:
+                initial_stage, initial_iter, ckpt_path = result
+        else:
+            ckpt_path = sft_cfg.preload
+
+        if ckpt_path and os.path.isfile(ckpt_path):
+            initial_stage, initial_iter, best_val, train_losses, val_losses = load_checkpoint(
+                ckpt_path, raw_model, optimizer, scaler, device, load_stage=True,
+            )
         elif is_main():
             print("Nessun SFT checkpoint trovato, parto dal pretraining.")
 
     if use_ddp:
         broadcast_model(raw_model)
 
-    print(f"DEBUG initial_stage={initial_stage}, initial_iter={initial_iter}")
-
     # ── Strato 1 ──────────────────────────────────────────────────────────────
     if initial_stage <= 1:
         if is_main():
-            print(f"\nStrato 1: tulu3 + OpenOrca - {sft_cfg.max_iters} step\n")
+            print(f"\nStrato 1: tulu3 + OpenOrca — {sft_cfg.max_iters} step\n")
 
         train_loader, val_loader = build_sft_loaders(
             sft_cfg, tokenizer,
@@ -464,7 +460,7 @@ def run_sft(sft_cfg: SFTConfig) -> dict:
 
     # ── Strato 2: OpenOrca 100% ───────────────────────────────────────────────
     if is_main():
-        print(f"\nStrato 2: OpenOrca - {sft_cfg.stage2_max_iters} step\n")
+        print(f"\nStrato 2: OpenOrca — {sft_cfg.stage2_max_iters} step\n")
 
     full_cfg  = load_dataset_config("datasets_config.yaml")
     s2_ds_cfg = [d for d in full_cfg["sft"] if d["name"] == "openorca"]

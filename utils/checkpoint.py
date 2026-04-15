@@ -32,6 +32,45 @@ from safetensors.torch import save_model
 
 from core.config import HF_FILENAME, HF_REPO_ID
 
+def ensure_disk_space(
+    required_gb:    float = 20.0,
+    checkpoint_dir: str   = ".",
+    stage:          "int | None" = None,
+    prefix:         str   = "",
+) -> None:
+    """
+    Verifica spazio disco prima di salvare. Se insufficiente,
+    cancella checkpoint periodici vecchi e file .tmp corrotti.
+    """
+    import shutil
+ 
+    def free_gb() -> float:
+        return shutil.disk_usage(checkpoint_dir).free / (1024 ** 3)
+ 
+    if free_gb() >= required_gb:
+        return
+ 
+    print(f"  WARNING: spazio disco insufficiente ({free_gb():.1f}GB liberi, richiesti {required_gb:.1f}GB)")
+ 
+    pat = (os.path.join(checkpoint_dir, f"{prefix}_s{stage}_[0-9]*.pt")
+           if stage is not None else
+           os.path.join(checkpoint_dir, f"{prefix}_[0-9]*.pt"))
+ 
+    for ckpt in sorted(glob.glob(pat)):
+        if free_gb() >= required_gb:
+            break
+        sz = os.path.getsize(ckpt) / (1024 ** 3)
+        os.remove(ckpt)
+        print(f"  Liberato {sz:.1f}GB — rimosso {os.path.basename(ckpt)}")
+ 
+    for tmp in glob.glob(os.path.join(checkpoint_dir, "*.tmp")):
+        if free_gb() >= required_gb:
+            break
+        sz = os.path.getsize(tmp) / (1024 ** 3)
+        os.remove(tmp)
+        print(f"  Liberato {sz:.1f}GB — rimosso {os.path.basename(tmp)}")
+ 
+    print(f"  Spazio disponibile dopo cleanup: {free_gb():.1f}GB")
 
 def cleanup_old_checkpoints(
     checkpoint_dir:    str,
@@ -178,6 +217,11 @@ def save_checkpoint(
     if full:
         ckpt["optimizer_state"] = optimizer.state_dict()
         ckpt["scaler_state"]    = scaler.state_dict()
+
+    _dir = os.path.dirname(path) or "."
+    _pfx = (os.path.basename(path).split(f"_s{stage}_")[0] if stage is not None
+            else "_".join(os.path.basename(path).replace(".pt", "").split("_")[:-1]))
+    ensure_disk_space(required_gb=20.0, checkpoint_dir=_dir, stage=stage, prefix=_pfx)
 
     tmp = path + ".tmp"
     torch.save(ckpt, tmp)

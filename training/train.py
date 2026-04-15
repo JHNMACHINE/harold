@@ -43,6 +43,10 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         stability_threshold = 0.03,
         patience            = 3,
     )
+    # Evita val e save ridondanti al resume — inizializza lo scheduler
+    if ctx.initial_iter > 0:
+        val_scheduler._last_val_iter = ctx.initial_iter
+        val_scheduler._total_val    = 1
     window_losses: deque = deque(maxlen=train_cfg.eval_interval)
 
     # ── Loop ──────────────────────────────────────────────────────────────
