@@ -1,5 +1,5 @@
 """
-Harold v0.6 — main.py
+Harold v0.7 — main.py
 ======================
 Entry point unificato per pretraining e SFT.
 
@@ -8,11 +8,14 @@ Avvio single-GPU:
     torchrun --nproc_per_node=1 main.py --mode sft
     torchrun --nproc_per_node=1 main.py --mode full
 
-Avvio multi-GPU (es. 4 GPU):
+Avvio multi-GPU DDP (es. 4 GPU):
     torchrun --nproc_per_node=4 main.py --mode full
 
-Modalità:
-  pretrain — solo pretraining (20k iter default)
+Avvio multi-GPU FSDP (es. 8 GPU, full run):
+    torchrun --nproc_per_node=8 main.py --mode pretrain --use_fsdp
+
+Modalita:
+  pretrain — solo pretraining (10k iter default, 100k per full run)
   sft      — solo SFT, riprende dal best checkpoint pretraining
   full     — pretrain → sft in sequenza automatica
 """
@@ -26,23 +29,34 @@ os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/.torch_cache")
 os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "10.0")
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Harold v0.6 — Training",
+        description="Harold v0.7 — Training",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Esempi:
+  # Test run single-GPU
   torchrun --nproc_per_node=1 main.py --mode pretrain
+
+  # Full run single-GPU
+  torchrun --nproc_per_node=1 main.py --mode pretrain --max_iters 100000
+
+  # Full run multi-GPU con FSDP (sharda pesi/grads/optimizer tra GPU)
+  torchrun --nproc_per_node=8 main.py --mode pretrain --use_fsdp --max_iters 100000
+
+  # SFT dopo pretraining
   torchrun --nproc_per_node=1 main.py --mode sft
-  torchrun --nproc_per_node=1 main.py --mode full
-  torchrun --nproc_per_node=4 main.py --mode full --compile_mode reduce-overhead
+
+  # Pipeline completa
+  torchrun --nproc_per_node=1 main.py --mode full --max_iters 100000
         """,
     )
     parser.add_argument(
         "--mode",
         choices=["pretrain", "sft", "full"],
         default="full",
-        help="Modalità di training (default: full)",
+        help="Modalita di training (default: full)",
     )
     parser.add_argument(
         "--max_iters",
@@ -79,6 +93,14 @@ Esempi:
         default=None,
         help="Override directory checkpoint SFT",
     )
+    # [v0.7-S3] FSDP — sharda parametri/gradienti/optimizer tra GPU
+    # Richiede torchrun con nproc_per_node > 1
+    # Incompatibile con cpu_offload (disabilita torch.compile se usato)
+    parser.add_argument(
+        "--use_fsdp",
+        action="store_true",
+        help="Abilita FSDP (Fully Sharded Data Parallel) per training multi-GPU",
+    )
     return parser.parse_args()
 
 
@@ -99,11 +121,16 @@ def run_pretrain(args: argparse.Namespace) -> dict:
         train_cfg.use_compile = False
     if args.checkpoint_dir is not None:
         train_cfg.checkpoint_dir = args.checkpoint_dir
+    # [v0.7-S3] FSDP override
+    if args.use_fsdp:
+        train_cfg.use_fsdp = True
 
     if is_main():
         print("=" * 60)
         print(f"  PRETRAINING — {train_cfg.max_iters} iterazioni")
         print(f"  Checkpoint: {train_cfg.checkpoint_dir}")
+        if train_cfg.use_fsdp:
+            print(f"  Parallelismo: FSDP")
         print("=" * 60)
 
     results = run_training(model_cfg, train_cfg)
@@ -123,11 +150,9 @@ def run_sft(args: argparse.Namespace, pretrain_ckpt: str | None = None) -> dict:
 
     sft_cfg = SFTConfig()
 
-    # Se viene da una run full, usa il checkpoint del pretraining
     if pretrain_ckpt is not None:
         sft_cfg.pretrain_ckpt = pretrain_ckpt
 
-    # Override da argomenti CLI
     if args.sft_max_iters is not None:
         sft_cfg.max_iters = args.sft_max_iters
     if args.sft_checkpoint_dir is not None:
@@ -135,7 +160,7 @@ def run_sft(args: argparse.Namespace, pretrain_ckpt: str | None = None) -> dict:
 
     if is_main():
         print("=" * 60)
-        print(f"  SFT - {sft_cfg.max_iters} iterazioni")
+        print(f"  SFT — {sft_cfg.max_iters} iterazioni")
         print(f"  Pretrain ckpt: {sft_cfg.pretrain_ckpt}")
         print(f"  Checkpoint:    {sft_cfg.checkpoint_dir}")
         print("=" * 60)
@@ -163,11 +188,8 @@ def main() -> None:
     elif args.mode == "full":
         from utils.ddp import is_main
 
-        # 1. Pretraining
         pretrain_results = run_pretrain(args)
-
-        # 2. SFT — usa il best checkpoint del pretraining
-        pretrain_ckpt = pretrain_results.get("checkpoint_path")
+        pretrain_ckpt    = pretrain_results.get("checkpoint_path")
 
         if is_main():
             print("\n" + "=" * 60)
@@ -177,7 +199,7 @@ def main() -> None:
         run_sft(args, pretrain_ckpt=pretrain_ckpt)
 
     else:
-        print(f"Modalità non riconosciuta: {args.mode}", file=sys.stderr)
+        print(f"Modalita non riconosciuta: {args.mode}", file=sys.stderr)
         sys.exit(1)
 
 
