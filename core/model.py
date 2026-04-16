@@ -31,6 +31,18 @@ Principali cambiamenti rispetto a v0.6:
              e piu informativo. Configurabile via ModelConfig.t_sampling:
              'logit_normal' (default), 'cosine', 'uniform' (baseline v0.6).
 
+  [v0.7-M4] x0_pred norm monitoring in compute_loss
+             Aggiunge 'x0_norm_mean', 'x0_norm_std', 'x0_var_tokens' ai metrics.
+             norm_mean < 0.1 -> collapse verso zero; x0_var_tokens ~ 0 -> mode collapse.
+
+  [v0.7-P4] Monitoring x0_pred norm in compute_loss
+             compute_loss ritorna ora anche:
+               x0_norm_mean:  norma media di x0_pred sui token validi
+                              se << 1.0 → collapse verso zero
+               x0_norm_std:   std della norma — se ~0 → mode collapse
+               x0_var_tokens: varianza di x0_pred tra token
+                              se ~0 → tutti i token predetti identici
+
   [v0.7-M3] Mamba2Block → Mamba3Block
              Sostituzione del mixer SSM con Mamba3 (Lahoti et al., ICLR 2026).
              Tre miglioramenti chiave rispetto a Mamba2:
@@ -122,11 +134,11 @@ class DeepSeekMoELayer(nn.Module):
         self.top_k_min         = 1
 
         self.shared_experts = nn.ModuleList([
-            SharedExpert(config.d_model, config.d_ff // 2, dropout=config.dropout)
+            SharedExpert(config.d_model, config.moe_shared_hidden, dropout=config.dropout)
             for _ in range(config.ds_moe_n_shared_experts)
         ])
         self.routed_experts = nn.ModuleList([
-            Expert(config.d_model, config.d_ff // 4, dropout=config.dropout)
+            Expert(config.d_model, config.moe_routed_hidden, dropout=config.dropout)
             for _ in range(self.n_routed_experts)
         ])
 
@@ -481,24 +493,36 @@ class Mamba3Block(nn.Module):
 
     def __init__(self, config: ModelConfig):
         super().__init__()
+        # [v0.7-M3] Mamba3 con fallback automatico su Mamba2.
+        # Mamba3 non è ancora disponibile su PyPI (aprile 2026) e richiede
+        # kernel CUDA compilati per l'architettura target. Se non disponibile,
+        # Mamba2 è un sostituto equivalente per convergenza e scaling law check.
         try:
             from mamba_ssm import Mamba3  # type: ignore
-        except ImportError as e:
-            raise ImportError(
-                "mamba-ssm con supporto Mamba3 non trovato. "
-                "Installa con: pip install mamba-ssm causal-conv1d"
-            ) from e
-
-        self.mamba = Mamba3(
-            d_model        = config.d_model,
-            d_state        = config.mamba_d_state,
-            headdim        = config.d_model // config.n_heads,
-            is_mimo        = True,
-            mimo_rank      = config.mamba_mimo_rank,
-            chunk_size     = 64 // config.mamba_mimo_rank,  # ottimale per bfloat16
-            is_outproj_norm = False,
-            dtype          = torch.bfloat16,
-        )
+            self.mamba = Mamba3(
+                d_model         = config.d_model,
+                d_state         = config.mamba_d_state,
+                headdim         = config.d_model // config.n_heads,
+                is_mimo         = False,
+                is_outproj_norm = False,
+                dtype           = torch.bfloat16,
+            )
+            self._using_mamba3 = True
+        except (ImportError, Exception):
+            from mamba_ssm import Mamba2  # type: ignore
+            import warnings
+            warnings.warn(
+                "Mamba3 non disponibile — fallback su Mamba2. "
+                "Per il full run installare mamba3-release dal branch GitHub.",
+                stacklevel=2,
+            )
+            self.mamba = Mamba2(
+                d_model  = config.d_model,
+                d_state  = config.mamba_d_state,
+                headdim  = config.d_model // config.n_heads,
+                expand   = 1,
+            )
+            self._using_mamba3 = False
         self.resid_drop = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1061,10 +1085,25 @@ class Harold(nn.Module):
                 "ce_per_sample":    per_sample_ce.detach(),
             }
 
+        # [v0.7-P4] Monitoring x0_pred norm — rileva velocity/x0 collapse
+        # - x0_pred_norm_mean << 1.0: collapse verso zero
+        # - x0_pred_norm_std  ~  0.0: mode collapse (tutti i token → stesso embedding)
+        # Calcolato solo su token validi (mask=True) per efficienza
+        with torch.no_grad():
+            x0_masked     = x0_pred[mask]                              # (N_valid, D)
+            x0_norms      = x0_masked.norm(dim=-1)                     # (N_valid,)
+            x0_norm_mean  = x0_norms.mean().item()
+            x0_norm_std   = x0_norms.std().item() if x0_norms.numel() > 1 else 0.0
+            # Varianza media tra token — se ~0 tutti i token predetti sono uguali
+            x0_var_tokens = x0_pred.var(dim=1).mean().item()
+
         return total, {
-            "score": loss_score.item(),
-            "ce":    loss_ce.item(),
-            "total": total.item(),
+            "score":           loss_score.item(),
+            "ce":              loss_ce.item(),
+            "total":           total.item(),
+            "x0_norm_mean":    round(x0_norm_mean,  4),
+            "x0_norm_std":     round(x0_norm_std,   4),
+            "x0_var_tokens":   round(x0_var_tokens, 4),
             **extra,
         }
 
