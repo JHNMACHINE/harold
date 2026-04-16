@@ -1,162 +1,195 @@
-# Harold v0.6 — Jamba Flow Matching Mixture-of-Experts Diffusion Language Model
+# Harold v0.7 — Jamba Flow Matching Mixture-of-Experts Diffusion Language Model
 
 [![arXiv](https://img.shields.io/badge/arXiv-2026.xxxxx-b31b1b.svg)](https://arxiv.org/abs/2026.xxxxx)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Training](https://img.shields.io/badge/Status-Training%20in%20progress-orange.svg)]()
 
-Harold v0.6 is a **1B-parameter continuous diffusion language model** that combines:
+Harold v0.7 is a **3.2B-parameter continuous diffusion language model** that combines:
 
-- **Jamba architecture** — hybrid SSM-Transformer backbone alternating Mamba2 and Attention layers (3:1 ratio)
-- **Flow Matching** — linear trajectory interpolation with velocity prediction
+- **Jamba architecture** — hybrid SSM-Transformer backbone alternating Mamba3 and Attention layers (3:1 ratio)
+- **Flow Matching** — linear trajectory with **x0-prediction** and logit-normal timestep sampling
 - **DeepSeek MoE** — timestep-conditioned routing via `[token_repr; timestep_emb]`, on every block
-- **MLA** (Multi-head Latent Attention) with compressed KV caching, on attention layers
-- **DSA** (Diagonal Sparse Attention) with local window + global tokens, on attention layers
-- **YaRN RoPE** scaling for context extension without fine-tuning
+- **Iterative decoding** — high-confidence tokens are frozen progressively during denoising
+- **MLA** (Multi-head Latent Attention) with compressed KV caching
+- **DSA** (Diagonal Sparse Attention) with local window + global tokens
+- **YaRN RoPE** scaling for context extension
 - **Flash Attention 2** with automatic fallback to SDPA
 - **AdaLN** for timestep conditioning on every block
-- **Self-conditioning** for iterative refinement
-- **CFG** (Classifier-Free Guidance) for conditional generation
+- **Self-conditioning** and **CFG** for conditional generation
 
 ## Model Details
 
 | Property | Value |
 |----------|-------|
-| Architecture | Jamba (Mamba2 + Attention) + DeepSeek MoE + Flow Matching |
-| Parameters | ~1.24B total |
-| d_model | 1280 |
-| Layers | 36 (27 Mamba2 + 9 Attention, ratio 3:1) |
-| Attention heads | 20 (GQA 4:1, 5 KV heads) |
-| MLA latent dim | 160 |
-| Mamba2 d_state | 128 |
-| Mamba2 d_conv | 4 |
-| Mamba2 expand | 2 |
-| MoE experts | 1 shared SwiGLU + 8 routed GELU (top-2) |
+| Architecture | Jamba (Mamba3 + Attention) + DeepSeek MoE + Flow Matching |
+| Parameters | ~3.20B total |
+| d_model | 1792 |
+| Layers | 40 (30 Mamba3 + 10 Attention, ratio 3:1) |
+| Attention heads | 28 (GQA 4:1, 7 KV heads) |
+| MLA latent dim | 224 |
+| Mamba3 d_state | 128 |
+| MoE experts | 2 shared SwiGLU + 16 routed GELU (top-2) |
+| MoE routed hidden | 608 (d_ff // 8) |
+| MoE shared hidden | 1216 (d_ff // 4) |
 | DSA window size | 256 |
 | DSA global every | 64 |
-| Max seq len | 1024 |
-| Tokenizer | LLaMA-3 BPE (32,000 vocab) |
+| Max seq len | 4096 |
+| Tokenizer | LLaMA-2 BPE (32,000 vocab) |
 | Flow sigma_min | 1e-4 |
+| t_sampling | logit_normal (std=0.5) |
 
-## Changes from v0.5
+## Changes from v0.6
 
-| Component | v0.5 | v0.6 |
+| Component | v0.6 | v0.7 |
 |-----------|------|------|
-| Backbone | Full Attention (36 layers) | Jamba: 27 Mamba2 + 9 Attention |
-| SSM | — | Mamba2 (d_state=128, expand=2) |
-| Mixer ratio | — | 3 Mamba2 : 1 Attention |
-| Gradient checkpointing | Optional | Removed |
-| Diffusion | Flow Matching (v-prediction) | Flow Matching (v-prediction, unchanged) |
-| MoE | DeepSeek MoE (2 shared + 4 routed) | DeepSeek MoE (1 shared + 8 routed) |
+| Parameters | ~1.24B | ~3.20B |
+| SSM | Mamba2 | Mamba3 (complex-valued, exponential-trapezoidal) |
+| Layers | 36 (27M2 + 9A) | 40 (30M3 + 10A) |
+| d_model | 1280 | 1792 |
+| MoE experts | 1 shared + 8 routed | 2 shared + 16 routed |
+| Diffusion target | v-prediction | **x0-prediction** |
+| Timestep sampling | Uniform U[0,1] | **Logit-Normal (std=0.5)** |
+| Decoding | Euler ODE | **Iterative decoding** (freeze high-confidence tokens) |
+| Parallelism | DDP | DDP + **FSDP** (multi-GPU) |
+| License | MIT | **Apache 2.0** |
 
-## Architecture: Jamba
+## Architecture
 
-Harold v0.6 adopts the **Jamba** hybrid SSM-Transformer design (AI21 Labs, 2024). Each of the 36 blocks follows the pattern:
+### Jamba with Mamba3
+
+Harold v0.7 uses **Mamba3** (Lahoti et al., ICLR 2026) as the SSM mixer. Each of the 40 blocks follows:
 
 ```
-[Mamba2, Mamba2, Mamba2, Attention] × 9
+[Mamba3, Mamba3, Mamba3, Attention] × 10
 ```
 
-Attention layers sit at indices 3, 7, 11, 15, 19, 23, 27, 31, 35. Every block — whether Mamba2 or Attention — is followed by a DeepSeek MoE FFN and uses AdaLN for diffusion timestep conditioning.
+Mamba3 improves on Mamba2 with three changes: exponential-trapezoidal discretization (more expressive than Euler), complex-valued state updates (enables richer state tracking), and a MIMO formulation for better expressivity at equal inference latency.
 
-**Why Jamba for diffusion?** Each denoising step requires a full forward pass. Replacing 3/4 of the attention layers with linear-complexity Mamba2 reduces the per-step cost significantly, which multiplies with the reduction in steps already provided by Flow Matching over VP-SDE.
+### x0-Prediction
 
-## How Flow Matching Works
+Harold v0.7 switches from velocity prediction to direct x0-prediction:
 
-Harold v0.6 generates text through **ODE integration** along a linear trajectory:
+```
+v0.6: model predicts v = noise - x0  (varies along trajectory)
+v0.7: model predicts x0              (constant along trajectory, more stable)
+```
 
-1. Start from pure Gaussian noise `x_1 ~ N(0, I)` in embedding space
-2. For each step `t` from 1 to 0 (20 steps default):
-   - Predict velocity `v = model(x_t, t)` — the direction from noise to data
-   - Integrate: `x_{t-dt} = x_t - dt * v`
-3. Decode final embeddings via the auxiliary CE head
+The velocity needed by the ODE solver is recovered as `v = (x_t - x0_pred) / t`.
 
-The training target is `v = noise - x0` — constant along the trajectory and uniform across all timesteps, making training stable without Min-SNR weighting.
+### Iterative Decoding
 
-The DeepSeek MoE router conditions on both the token representation and the timestep embedding, enabling experts to specialize implicitly across the diffusion trajectory.
+At each denoising step, tokens with CE confidence above a threshold are **frozen** — replaced with their discrete embedding and excluded from further denoising. Only uncertain tokens continue to receive noise and are refined. This is inspired by MDLM and PLAID.
+
+### Logit-Normal Timestep Sampling
+
+Instead of uniform `t ~ U[0,1]`, training uses:
+
+```python
+u = torch.randn(B) * 0.5
+t = torch.sigmoid(u)  # concentrated around t=0.5
+```
+
+Timesteps near 0.5 carry the most gradient signal for learning linguistic structure. This prevents x0-collapse at the extremes and is used in Stable Diffusion 3.
 
 ## Training
 
-**Pretraining** — target: 100k steps on a multi-source corpus:
+**Pretraining** — 100k steps on a multi-source corpus:
 
 | Dataset | Weight |
 |---------|--------|
 | FineWeb-Edu | 25% |
-| SlimPajama | 25% |
-| Wikipedia EN | 20% |
-| C4 | 15% |
-| OpenMathInstruct | 10% |
-| CodeContests | 5% |
+| Wikipedia EN | 15% |
+| SlimPajama | 20% |
+| C4 | 13% |
+| arXiv | 9% |
+| PG-19 | 12% |
+| GitHub Code (Python) | 3% |
+| Open-Web-Math | 3% |
 
-**Hardware:** NVIDIA RTX PRO 6000 (96GB) via Vast.ai  
+**Hardware:** 1× H200 NVL (140GB) via Vast.ai  
 **Precision:** bfloat16  
-**Optimizer:** AdamW, lr=1e-4 → 1e-5 cosine decay  
-**Batch:** 8 × 16 grad accum = 128 effective  
+**Optimizer:** MuonAdamW (Muon for 2D matrices, AdamW for embeddings/norms)  
+**lr:** 8e-5 → 8e-6 cosine decay, 1000 warmup steps  
+**Batch:** 4 × 16 grad accum = 64 effective (4096 tokens/seq)  
 **Self-cond prob:** 0.5  
 **CE loss weight:** 0.1  
-
-**Additional dependencies vs v0.5:**
-```bash
-pip install mamba-ssm causal-conv1d
-```
 
 ## Usage
 
 ```python
 import torch
-from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
-from model import build_model
-from sampler import HaroldSampler
-
-# Download model from Hugging Face
-ckpt_path = hf_hub_download(
-    repo_id="JHN-MACHINE/harold-v0.6",
-    filename="harold-v0.6-1B.pt",
-)
+from core.config import get_model_config
+from core.model import Harold, build_model
+from sampler import build_sampler
 
 # Load model
-state     = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-model_cfg = state["model_cfg"]
-model     = build_model(model_cfg).cuda()
+state     = torch.load("harold-v0.7-3B.pt", map_location="cpu", weights_only=False)
+model_cfg = state.get("model_cfg", get_model_config())
+model     = build_model(model_cfg).cuda().bfloat16()
 model.load_state_dict(state["model_state"])
 model.eval()
 
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+tokenizer = AutoTokenizer.from_pretrained("NousResearch/Llama-2-7b-hf")
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-sampler = HaroldSampler(model, tokenizer, device="cuda")
+# Generate with iterative decoding
+sampler = build_sampler(model, n_steps=32, freeze_threshold=0.9, cfg_scale=3.0)
+tokens  = sampler.generate(batch_size=1, seq_len=256)
+text    = tokenizer.decode(tokens[0].tolist(), skip_special_tokens=True)
+print(text)
+```
 
-# Unconditional generation
-out = sampler.generate(prompt="Once upon a time", gen_len=128, steps=20)
-print(out)
+Or via the CLI:
 
-# Conditional generation with CFG
-out = sampler.generate_conditioned(
-    context="What is the capital of France?",
-    gen_len=128, steps=20, cfg_scale=3.0,
-)
-print(out)
+```bash
+python sampler.py --prompt "Explain how neural networks work" --max_steps 32
+python sampler.py --prompt "Write a Python function to sort a list" --cfg_scale 2.0
+python sampler.py --prompt "..." --no_iterative  # uniform denoising (v0.6 style)
+```
+
+## Installation
+
+```bash
+git clone https://github.com/JHN-MACHINE/harold
+cd harold
+pip install -r requirements.txt
+
+# Mamba3 requires build from source (not yet on PyPI as of April 2026)
+pip install git+https://github.com/state-spaces/mamba.git --no-build-isolation --no-deps
+pip install einops
 ```
 
 ## Limitations
 
-- **Training in progress:** The current release covers pretraining only. Generation quality metrics will be reported once the full run completes.
-- **Mamba2 in bidirectional context:** Mamba2 was originally designed for causal autoregressive generation. Harold uses it in a non-causal diffusion setting — this is an active area of research and behavior may differ from causal use cases.
-- **No SFT yet:** Supervised fine-tuning with CFG for conditional generation is planned after pretraining.
-- **CE comparability:** The auxiliary CE loss is computed at various noise levels, not at t=0, and is not directly comparable to autoregressive perplexity.
+- **Training in progress:** v0.7 pretraining is currently running. Generation quality metrics will be reported once the full 100k-step run completes.
+- **Mamba3 not on PyPI:** Requires building from source. MIMO mode disabled (requires TileLang).
+- **Diffusion latency:** Unlike autoregressive models, generation requires N forward passes. With iterative decoding and 32 steps, latency is ~1s on H200 for 256 tokens.
+- **No SFT yet:** Supervised fine-tuning planned after pretraining completes.
+- **CE comparability:** The auxiliary CE loss is computed at various noise levels and is not directly comparable to autoregressive perplexity.
+
+## Training Diary
+
+Development decisions, bugs encountered, and lessons learned are documented in [`diary/`](diary/):
+
+- [`diary/v0.7/00_architecture.md`](diary/v0.7/00_architecture.md) — architectural decisions
+- [`diary/v0.7/01_setup.md`](diary/v0.7/01_setup.md) — setup problems and solutions
+- [`diary/v0.7/02_training_log.md`](diary/v0.7/02_training_log.md) — training metrics
+- [`diary/v0.7/changes/`](diary/v0.7/changes/) — per-patch change log
 
 ## Citation
 
 ```bibtex
-@article{vecchione2026haroldv06,
-  title   = {Harold v0.6: Jamba Flow Matching with Mixture-of-Experts for Continuous Diffusion Language Modeling},
+@article{vecchione2026haroldv07,
+  title   = {Harold v0.7: Jamba Flow Matching with Mamba3, x0-Prediction and Iterative Decoding},
   author  = {Vecchione, Jonathan},
   journal = {arXiv preprint},
   year    = {2026},
-  url     = {https://huggingface.co/JHN-MACHINE/harold-v0.6}
+  url     = {https://huggingface.co/JHN-MACHINE/harold-v0.7}
 }
 ```
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+Apache License 2.0. See [LICENSE](LICENSE) for details.
