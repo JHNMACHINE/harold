@@ -12,7 +12,7 @@ Cambiamenti rispetto a v0.6:
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional, Union
+from typing import Optional, Protocol, Union
 
 import torch
 import torch.nn as nn
@@ -23,7 +23,11 @@ from transformers import PreTrainedTokenizerBase
 from core.model import Harold
 from training.trainer import DiffusionTrainer
 from utils.logger import AsyncLogger
-from utils.ddp import DDPContext
+
+
+class _ParallelCtx(Protocol):
+    """Protocol minimo condiviso da DDPContext e FSDPContext."""
+    def teardown(self) -> None: ...
 
 
 @dataclass
@@ -55,5 +59,5 @@ class TrainingContext:
     logger:     Optional[AsyncLogger]
 
     # DDP/FSDP context (per teardown finale)
-    # FSDPContext ha la stessa interfaccia di DDPContext (setup/teardown)
-    ddp_ctx: Optional[object] = field(default=None)
+    # Soddisfatto da DDPContext e FSDPContext via _ParallelCtx Protocol
+    ddp_ctx: Optional[_ParallelCtx] = field(default=None)
