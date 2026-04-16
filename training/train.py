@@ -180,7 +180,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
                                         "path": best_path})
 
         # ── Checkpoint periodico ──────────────────────────────────────────
-        # [v0.7-P3] Ogni 10k iter: salva checkpoint + lancia eval qualitativa
+        # [v0.7-P3] Ogni 10k iter: salva checkpoint + eval qualitativa inline
         if iter_num > 0 and iter_num % train_cfg.save_every == 0 and ctx.main:
             p = train_cfg.ckpt_path(iter_num)
             save_checkpoint(p, ctx.model, ctx.optimizer, ctx.scaler,
@@ -191,23 +191,23 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
             if ctx.logger:
                 ctx.logger.log({"type": "periodic_checkpoint", "iter": iter_num, "path": p})
 
-            # [v0.7-P3] Eval qualitativa automatica sui 20 prompt fissi
-            # Girata in un subprocess per non bloccare il training loop
-            # e per liberare la VRAM prima di ricaricare il modello per l'eval.
+            # [v0.7-P3] Eval qualitativa inline — usa il modello già in VRAM.
+            # run_eval_on_model bypassa load_model(), evitando il doppio carico
+            # che causerebbe OOM. Il modello viene messo in eval() e poi
+            # riportato in train() automaticamente dalla funzione.
             try:
-                import subprocess
-                eval_script = os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)), "eval", "eval_generation.py"
+                from eval.eval_generation import run_eval_on_model
+                out_dir = os.path.join(train_cfg.checkpoint_dir, "eval_results")
+                run_eval_on_model(
+                    model        = ctx.model,
+                    tokenizer    = ctx.tokenizer,
+                    pad_token_id = ctx.pad_token_id,
+                    step         = iter_num,
+                    out_dir      = out_dir,
+                    max_steps    = 16,
+                    cfg_scale    = 3.0,
+                    device       = ctx.device,
                 )
-                if os.path.exists(eval_script):
-                    subprocess.Popen([
-                        "python", eval_script,
-                        "--checkpoint", p,
-                        "--out_dir", os.path.join(train_cfg.checkpoint_dir, "eval_results"),
-                        "--max_steps", "16",
-                        "--cfg_scale", "3.0",
-                    ])
-                    print(f"  Eval qualitativa avviata in background -> eval_results/")
             except Exception as e:
                 print(f"  WARNING: eval qualitativa fallita: {e}")
 
@@ -230,6 +230,25 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
     if ctx.use_ddp and ctx.ddp_ctx is not None:
         ctx.ddp_ctx.teardown()
+
+    # [v0.7-P3] Eval qualitativa finale — sul checkpoint final, modello già in memoria
+    if ctx.main:
+        try:
+            from eval.eval_generation import run_eval_on_model
+            out_dir = os.path.join(train_cfg.checkpoint_dir, "eval_results")
+            print(f"\nEval qualitativa finale -> {out_dir}")
+            run_eval_on_model(
+                model        = ctx.model,
+                tokenizer    = ctx.tokenizer,
+                pad_token_id = ctx.pad_token_id,
+                step         = train_cfg.max_iters,
+                out_dir      = out_dir,
+                max_steps    = 16,
+                cfg_scale    = 3.0,
+                device       = ctx.device,
+            )
+        except Exception as e:
+            print(f"  WARNING: eval qualitativa finale fallita: {e}")
 
     return {"train_losses": list(ctx.train_losses), "val_losses": ctx.val_losses,
             "best_val_loss": ctx.best_val_loss, "train_time_minutes": elapsed,

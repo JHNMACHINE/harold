@@ -175,14 +175,20 @@ def results_to_markdown(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate_checkpoint(
-    checkpoint:  str,
+    checkpoint:   str,
     tokenizer,
     pad_token_id: int,
-    args:        argparse.Namespace,
-    step:        int = 0,
+    args:         argparse.Namespace,
+    step:         int = 0,
+    model=None,
 ) -> dict:
     """
-    Carica un checkpoint, genera risposte ai 20 prompt fissi, ritorna i risultati.
+    Genera risposte ai 20 prompt fissi e ritorna i risultati.
+
+    Args:
+        model: se fornito, usa il modello già in memoria invece di
+               ricaricare da checkpoint. Utile per eval durante il training
+               senza doppio load in VRAM.
     """
     device = args.device
     dtype  = torch.bfloat16 if device.startswith("cuda") else torch.float32
@@ -192,7 +198,9 @@ def evaluate_checkpoint(
     print(f"Checkpoint: {checkpoint}")
     print(f"{'='*70}")
 
-    model = load_model(checkpoint, device=device, dtype=dtype)
+    _model_provided = model is not None
+    if model is None:
+        model = load_model(checkpoint, device=device, dtype=dtype)
 
     cfg = SamplerConfig(
         min_steps        = args.min_steps,
@@ -298,12 +306,74 @@ def evaluate_checkpoint(
         f.write(md_content)
     print(f"Markdown salvato: {md_path}")
 
-    # Dealloca modello
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    # Dealloca solo se il modello è stato caricato qui (non se passato dall'esterno)
+    if not _model_provided:
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return {"step": step, "summary": summary, "json_path": json_path, "md_path": md_path}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API per chiamata diretta da train.py (senza reload del modello)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_eval_on_model(
+    model,
+    tokenizer,
+    pad_token_id: int,
+    step:         int,
+    out_dir:      str,
+    max_steps:    int = 16,
+    cfg_scale:    float = 3.0,
+    device:       str = "cuda",
+) -> dict:
+    """
+    Lancia l'eval qualitativa usando il modello già in memoria.
+
+    Chiamata da train.py dopo ogni checkpoint periodico — evita il doppio
+    load in VRAM che causerebbe OOM durante il training.
+
+    Args:
+        model:        Harold già caricato in VRAM
+        tokenizer:    tokenizer HuggingFace
+        pad_token_id: id del padding token
+        step:         step corrente (usato per nominare i file di output)
+        out_dir:      directory di output per JSON e Markdown
+        max_steps:    step di denoising per il sampler
+        cfg_scale:    scala CFG
+        device:       device string
+
+    Returns:
+        dict con summary e path dei file generati
+    """
+    import argparse
+    # Costruisce un Namespace minimale compatibile con evaluate_checkpoint
+    args = argparse.Namespace(
+        device      = device,
+        min_steps   = max(8, max_steps // 2),
+        max_steps   = max_steps,
+        cfg_scale   = cfg_scale,
+        max_len     = 200,
+        out_dir     = out_dir,
+    )
+    # Mette il modello in eval — train.py lo riporterà in train dopo
+    was_training = model.training
+    model.eval()
+    try:
+        result = evaluate_checkpoint(
+            checkpoint   = f"step_{step:07d}",  # usato solo per il log
+            tokenizer    = tokenizer,
+            pad_token_id = pad_token_id,
+            args         = args,
+            step         = step,
+            model        = model,               # bypass del load
+        )
+    finally:
+        if was_training:
+            model.train()
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
