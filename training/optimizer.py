@@ -58,7 +58,7 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq,
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-@torch.compile(dynamic=True)
+
 def muon_step_fused(stacked_grads, stacked_params,
                     momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
