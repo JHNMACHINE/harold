@@ -1,28 +1,37 @@
 """
-dataset.py — Harold v0.6  (ottimizzato)
-=========================================
-Ottimizzazioni rispetto alla versione originale:
+dataset.py — Harold v0.7
+=========================
+Cambiamenti rispetto a v0.6:
 
-  [OPT-D1] DataLoader: aggiunto prefetch_factor=2 — i worker prelevano
-           il prossimo batch mentre la GPU elabora quello corrente.
+  [v0.7-D1] num_workers=0 FISSO e permanente.
+             HuggingFace streaming datasets causano SIGABRT con qualsiasi
+             valore > 0 perché i processi worker tentano di fare fork
+             di oggetti non-picklable (connessioni HTTP, generatori).
+             Confermato su v0.5, v0.6, v0.7. Non cambiare.
 
-  [OPT-D2] MixedStreamingDataset.__iter__: rimossa la lista carry con
-           slicing O(n) — sostituita con deque + popleft O(1).
+  [v0.7-D2] Prefetch threading per compensare num_workers=0.
+             Un thread background legge e tokenizza i prossimi N batch
+             mentre la GPU elabora quello corrente.
+             Evita che il main thread blocchi il training loop.
 
-  [OPT-D3] worker_init_fn: aggiunto anche al val_loader.
+  [v0.7-D3] Val/train split PRIMA della tokenizzazione.
+             In v0.6 ogni documento veniva tokenizzato anche se doveva
+             andare nel val set — spreco CPU nel train loader e viceversa.
+             Ora: controlla doc_idx % val_every PRIMA di tokenizzare.
 
-  [OPT-D4] num_workers auto-selezionato in base ai core disponibili.
+  [v0.7-D4] persistent_workers rimosso (sempre False con num_workers=0).
 
-  [OPT-D5] Fix Python 3.14: worker_init_fn DDP spostata a livello di
-           modulo con functools.partial — evita PicklingError su closure.
+Invariato da v0.6:
+  [OPT-D2] deque + popleft O(1) invece di list slicing
+  [OPT-D5] worker_init_fn a livello modulo per Python 3.14
 """
 
 from __future__ import annotations
 from collections import deque
 from pathlib import Path
-from typing import Iterator, Optional
-import os
-import functools
+from queue import Queue
+from threading import Thread
+from typing import Iterator
 import yaml
 import torch
 from transformers import BatchEncoding, PreTrainedTokenizer
@@ -61,20 +70,6 @@ def _first_token_id(val) -> int | None:
     if isinstance(val, list):
         return int(val[0]) if val else None
     return int(val)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# [OPT-D4] Numero worker ottimale
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _optimal_num_workers(max_workers: int = 4) -> int:
-    try:
-        n_cpu = os.cpu_count() or 1
-    except Exception:
-        n_cpu = 1
-    if n_cpu <= 2:
-        return 0
-    return min(max_workers, n_cpu // 2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -125,6 +120,40 @@ def _tokenize_doc(text: str, tokenizer: PreTrainedTokenizer, sep_id: int) -> lis
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# [v0.7-D2] Prefetch thread — compensa num_workers=0
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SENTINEL = object()
+
+
+class _PrefetchIter:
+    """
+    Wrappa un iteratore e preleva i prossimi ``n`` elementi in un thread
+    background, tenendoli in una Queue. Il main thread consuma dalla Queue
+    senza bloccarsi sulla tokenizzazione.
+    """
+
+    def __init__(self, source_iter: Iterator, n: int = 32):
+        self._q: Queue = Queue(maxsize=n)
+        self._t = Thread(target=self._fill, args=(source_iter,), daemon=True)
+        self._t.start()
+
+    def _fill(self, it: Iterator) -> None:
+        try:
+            for item in it:
+                self._q.put(item)
+        finally:
+            self._q.put(_SENTINEL)
+
+    def __iter__(self):
+        while True:
+            item = self._q.get()
+            if item is _SENTINEL:
+                return
+            yield item
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Iteratore pretraining
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -149,13 +178,16 @@ def _iter_pretraining_dataset(
     ds = load_dataset(**load_kwargs, streaming=True)
     ds = ds.shuffle(buffer_size=buffer_size, seed=seed)
 
+    # [v0.7-D3] Controlla split PRIMA di tokenizzare — evita tokenizzazione
+    # di documenti che verranno scartati (in v0.6 tokenizzava tutto)
     doc_idx = 0
     for example in ds:
-        text = _extract_text(example, text_field, fmt)
-        if not text:
-            continue
         is_val = (doc_idx % val_every == 0)
         if (split == "val") != is_val:
+            doc_idx += 1
+            continue
+        text = _extract_text(example, text_field, fmt)
+        if not text:
             doc_idx += 1
             continue
         ids = _tokenize_doc(text, tokenizer, sep_id)
@@ -300,13 +332,14 @@ class MixedStreamingDataset(IterableDataset):
 
     def __init__(
         self,
-        tokenizer:   PreTrainedTokenizer,
-        seq_len:     int,
-        dataset_cfg: list[dict],
-        split:       str = "train",
-        val_every:   int = 200,
-        seed:        int = 42,
-        buffer_size: int = 1000,
+        tokenizer:    PreTrainedTokenizer,
+        seq_len:      int,
+        dataset_cfg:  list[dict],
+        split:        str = "train",
+        val_every:    int = 200,
+        seed:         int = 42,
+        buffer_size:  int = 1000,
+        prefetch_n:   int = 32,
     ):
         super().__init__()
         self.tokenizer   = tokenizer
@@ -316,6 +349,7 @@ class MixedStreamingDataset(IterableDataset):
         self.val_every   = val_every
         self.seed        = seed
         self.buffer_size = buffer_size
+        self.prefetch_n  = prefetch_n
         self.weights     = {d["name"]: d["weight"] for d in dataset_cfg}
         sep_token = _first_token_id(tokenizer.sep_token_id)
         eos_token = _first_token_id(tokenizer.eos_token_id)
@@ -334,7 +368,14 @@ class MixedStreamingDataset(IterableDataset):
         }
 
     def __iter__(self) -> Iterator[dict]:
-        iters    = self._make_iterators()
+        raw_iters = self._make_iterators()
+
+        # [v0.7-D2] Wrappa ogni iteratore con prefetch thread
+        iters = {
+            name: _PrefetchIter(it, n=self.prefetch_n)
+            for name, it in raw_iters.items()
+        }
+
         names    = list(iters.keys())
         carry: deque[int] = deque()
         counters = {n: 0.0 for n in names}
@@ -347,7 +388,7 @@ class MixedStreamingDataset(IterableDataset):
                 break
             _, chosen = min(active)
             try:
-                ids = next(iters[chosen])
+                ids = next(iter(iters[chosen]))
                 counters[chosen] += incs[chosen]
             except StopIteration:
                 exhausted.add(chosen)
@@ -377,6 +418,7 @@ class SFTDataset(IterableDataset):
         max_ctx_turns: int = 3,
         val_every:     int = 200,
         seed:          int = 42,
+        prefetch_n:    int = 16,
     ):
         super().__init__()
         self.tokenizer     = tokenizer
@@ -387,6 +429,7 @@ class SFTDataset(IterableDataset):
         self.max_ctx_turns = max_ctx_turns
         self.val_every     = val_every
         self.seed          = seed
+        self.prefetch_n    = prefetch_n
         self.weights       = {d["name"]: d["weight"] for d in dataset_cfg}
         pad = _first_token_id(tokenizer.pad_token_id)
         eos = _first_token_id(tokenizer.eos_token_id)
@@ -418,7 +461,12 @@ class SFTDataset(IterableDataset):
         return t, mask
 
     def __iter__(self) -> Iterator[dict]:
-        iters     = self._make_iterators()
+        raw_iters = self._make_iterators()
+        iters = {
+            name: _PrefetchIter(it, n=self.prefetch_n)
+            for name, it in raw_iters.items()
+        }
+
         names     = list(iters.keys())
         counters  = {n: 0.0 for n in names}
         incs      = {n: 1.0 / self.weights[n] for n in names}
@@ -430,7 +478,7 @@ class SFTDataset(IterableDataset):
                 break
             _, chosen = min(active)
             try:
-                item = next(iters[chosen])
+                item = next(iter(iters[chosen]))
                 counters[chosen] += incs[chosen]
             except StopIteration:
                 exhausted.add(chosen)
@@ -454,7 +502,7 @@ def worker_init_fn(worker_id: int) -> None:
 
 
 def _worker_init_fn_ddp(worker_id: int, rank_seed: int = 42) -> None:
-    """[OPT-D5] worker_init_fn serializzabile per DDP — usa functools.partial per il seed."""
+    """[OPT-D5] worker_init_fn serializzabile per DDP."""
     wi = torch.utils.data.get_worker_info()
     if wi is not None:
         ds = wi.dataset
@@ -467,8 +515,8 @@ def _worker_init_fn_ddp(worker_id: int, rank_seed: int = 42) -> None:
 
 def build_loaders(
     train_cfg,
-    tokenizer: PreTrainedTokenizer,
-    yaml_path: str = "datasets_config.yaml",
+    tokenizer:  PreTrainedTokenizer,
+    yaml_path:  str = "datasets_config.yaml",
 ) -> tuple[DataLoader, DataLoader]:
     cfg         = load_dataset_config(yaml_path)
     dataset_cfg = cfg["pretraining"]
@@ -479,32 +527,27 @@ def build_loaders(
         tokenizer=tokenizer, seq_len=train_cfg.seq_len, dataset_cfg=dataset_cfg,
         split="train", val_every=train_cfg.val_every,
         seed=42, buffer_size=train_cfg.stream_buffer_size,
+        prefetch_n=32,
     )
     val_ds = MixedStreamingDataset(
         tokenizer=tokenizer, seq_len=train_cfg.seq_len, dataset_cfg=dataset_cfg,
         split="val", val_every=train_cfg.val_every,
         seed=42, buffer_size=train_cfg.stream_buffer_size,
+        prefetch_n=8,
     )
 
-    num_workers = _optimal_num_workers(max_workers=4)
-    prefetch    = 2 if num_workers > 0 else None
+    # [v0.7-D1] num_workers=0 FISSO — HF streaming causa SIGABRT con fork
     train_loader = DataLoader(
         train_ds,
         batch_size=train_cfg.batch_size,
+        num_workers=0,
         pin_memory=True,
-        num_workers=num_workers,
-        prefetch_factor=prefetch,
-        persistent_workers=num_workers > 0,
-        worker_init_fn=worker_init_fn,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=train_cfg.batch_size,
+        num_workers=0,
         pin_memory=True,
-        num_workers=num_workers,
-        prefetch_factor=prefetch,
-        persistent_workers=num_workers > 0,
-        worker_init_fn=worker_init_fn,
     )
     return train_loader, val_loader
 
@@ -525,50 +568,42 @@ def build_sft_loaders(
     train_ds = SFTDataset(
         tokenizer=tokenizer, dataset_cfg=dataset_cfg, split="train",
         max_ctx_len=max_ctx_len, max_resp_len=max_resp_len,
-        max_ctx_turns=max_ctx_turns, val_every=train_cfg.val_every, seed=42,
+        max_ctx_turns=max_ctx_turns, val_every=train_cfg.val_every,
+        seed=42, prefetch_n=16,
     )
     val_ds = SFTDataset(
         tokenizer=tokenizer, dataset_cfg=dataset_cfg, split="val",
         max_ctx_len=max_ctx_len, max_resp_len=max_resp_len,
-        max_ctx_turns=max_ctx_turns, val_every=train_cfg.val_every, seed=42,
+        max_ctx_turns=max_ctx_turns, val_every=train_cfg.val_every,
+        seed=42, prefetch_n=4,
     )
 
-    num_workers = _optimal_num_workers(max_workers=2)
-    prefetch    = 2 if num_workers > 0 else None
-
+    # [v0.7-D1] num_workers=0 FISSO
     train_loader = DataLoader(
-        train_ds,
-        batch_size=train_cfg.batch_size,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=prefetch,
+        train_ds, batch_size=train_cfg.batch_size,
+        num_workers=0, pin_memory=True,
     )
     val_loader = DataLoader(
-        val_ds,
-        batch_size=train_cfg.batch_size,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=prefetch,
+        val_ds, batch_size=train_cfg.batch_size,
+        num_workers=0, pin_memory=True,
     )
     return train_loader, val_loader
 
 
 def build_loaders_ddp(
     train_cfg,
-    tokenizer:  "PreTrainedTokenizer",
+    tokenizer:  PreTrainedTokenizer,
     rank:       int,
     yaml_path:  str = "datasets_config.yaml",
-) -> "tuple[DataLoader, DataLoader]":
+) -> tuple[DataLoader, DataLoader]:
     """
-    Costruisce i DataLoader partizionati per rank DDP.
+    Costruisce i DataLoader partizionati per rank DDP/FSDP.
 
-    Con IterableDataset in streaming non esiste DistributedSampler —
-    il partizionamento avviene tramite seed offset per rank:
+    Con IterableDataset streaming il partizionamento avviene tramite seed
+    offset per rank — non esiste DistributedSampler per dataset infiniti.
       rank 0: seed=42
       rank 1: seed=1042
-      rank 2: seed=2042
+      ...
     """
     cfg         = load_dataset_config(yaml_path)
     dataset_cfg = cfg["pretraining"]
@@ -579,30 +614,22 @@ def build_loaders_ddp(
         tokenizer=tokenizer, seq_len=train_cfg.seq_len, dataset_cfg=dataset_cfg,
         split="train", val_every=train_cfg.val_every,
         seed=rank_seed, buffer_size=train_cfg.stream_buffer_size,
+        prefetch_n=32,
     )
     val_ds = MixedStreamingDataset(
         tokenizer=tokenizer, seq_len=train_cfg.seq_len, dataset_cfg=dataset_cfg,
         split="val", val_every=train_cfg.val_every,
         seed=rank_seed, buffer_size=train_cfg.stream_buffer_size,
+        prefetch_n=8,
     )
 
-    # [OPT-D5] functools.partial invece di closure — serializzabile in Python 3.14
-    ddp_init_fn = functools.partial(_worker_init_fn_ddp, rank_seed=rank_seed)
-
-    num_workers = _optimal_num_workers(max_workers=4)
-    prefetch    = 2 if num_workers > 0 else None
+    # [v0.7-D1] num_workers=0 FISSO anche in DDP/FSDP
     train_loader = DataLoader(
         train_ds, batch_size=train_cfg.batch_size,
-        pin_memory=True, worker_init_fn=ddp_init_fn,
-        num_workers=num_workers,
-        prefetch_factor=prefetch,
-        persistent_workers=num_workers > 0,
+        num_workers=0, pin_memory=True,
     )
     val_loader = DataLoader(
         val_ds, batch_size=train_cfg.batch_size,
-        pin_memory=True, worker_init_fn=ddp_init_fn,
-        num_workers=num_workers,
-        prefetch_factor=prefetch,
-        persistent_workers=num_workers > 0,
+        num_workers=0, pin_memory=True,
     )
     return train_loader, val_loader
