@@ -1,5 +1,5 @@
 """
-Harold v0.6 — optimizer.py
+Harold v0.7 — optimizer.py
 ===========================
 MuonAdamW: Muon per i pesi 2D (matrici), AdamW per tutto il resto.
 
@@ -8,7 +8,21 @@ delle matrici di peso sulla varietà delle matrici ortogonali, con NorMuon
 variance reduction e cautious weight decay.
 
 Basato su: Karpathy / Kostrikov MuonAdamW
-Adattato per Harold v0.6 (Jamba + MoE + Flow Matching).
+Adattato per Harold v0.7 (Jamba + MoE + Flow Matching).
+
+Cambiamenti rispetto a v0.6:
+  [v0.7-O1] muon_step_fused: rimosso @torch.compile(dynamic=True).
+             Con gruppi piccoli (nano run, pochi layer per shape) il dynamic
+             shape tracking di dynamo fallisce su lerp_ quando n_params=1.
+             Il Muon è dominato dall'orthogonalizzazione — compile non dà
+             vantaggi reali qui.
+
+  [v0.7-O2] _step_muon: momentum_buffer riallocato se n cambia.
+             Con grad_accum e self_cond_prob, il numero di parametri con
+             grad valido per una data shape può variare tra step.
+             Il buffer veniva allocato a n fisso al primo step — mismatch
+             fatale se n cambiava successivamente.
+             Fix: controlla shape[0] != n prima di usare il buffer esistente.
 
 Utilizzo in train.py:
     from optimizer import build_optimizer
@@ -59,6 +73,7 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq,
     p.add_(exp_avg / denom, alpha=-step_size)
 
 
+# [v0.7-O1] @torch.compile rimosso — dynamic shape fallisce con n_params=1
 def muon_step_fused(stacked_grads, stacked_params,
                     momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
@@ -83,16 +98,16 @@ def muon_step_fused(stacked_grads, stacked_params,
     g = X
 
     # NorMuon variance reduction
-    beta2       = beta2_t.to(g.dtype)
-    v_mean      = g.float().square().mean(dim=red_dim, keepdim=True)
+    beta2        = beta2_t.to(g.dtype)
+    v_mean       = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
-    v_norm_sq   = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
-    v_norm      = v_norm_sq.sqrt()
+    v_norm_sq    = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
+    v_norm       = v_norm_sq.sqrt()
     second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
-    step_size   = second_momentum_buffer.clamp_min(1e-10).rsqrt()
+    step_size     = second_momentum_buffer.clamp_min(1e-10).rsqrt()
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
-    v_norm_new  = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
-    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+    v_norm_new    = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+    final_scale   = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
     g = g * final_scale.to(g.dtype)
 
     # Cautious weight decay + parameter update
@@ -108,10 +123,10 @@ def muon_step_fused(stacked_grads, stacked_params,
 
 class MuonAdamW(torch.optim.Optimizer):
     """
-    Optimizer combinato per Harold v0.6.
+    Optimizer combinato per Harold v0.7.
 
     - **Muon** (con Polar Express + NorMuon): per tutti i parametri 2D
-      (matrici di proiezione attention, expert weights, router, Mamba2 proiezioni).
+      (matrici di proiezione attention, expert weights, router, Mamba proiezioni).
     - **AdamW**: per tutto il resto (embedding, LayerNorm, bias, vettori 1D).
 
     I param_groups devono avere il campo ``kind``:
@@ -140,9 +155,9 @@ class MuonAdamW(torch.optim.Optimizer):
             grad  = p.grad
             state = self.state[p]
             if not state:
-                state["step"]        = 0
-                state["exp_avg"]     = torch.zeros_like(p)
-                state["exp_avg_sq"]  = torch.zeros_like(p)
+                state["step"]       = 0
+                state["exp_avg"]    = torch.zeros_like(p)
+                state["exp_avg_sq"] = torch.zeros_like(p)
             state["step"] += 1
             self._adamw_step_t.fill_(state["step"])
             self._adamw_lr_t.fill_(group["lr"])
@@ -162,7 +177,6 @@ class MuonAdamW(torch.optim.Optimizer):
         if not params:
             return
 
-        # Raggruppa per shape — ogni shape vuole il suo buffer e step fused
         from collections import defaultdict
         by_shape: dict = defaultdict(list)
         for p in params:
@@ -174,15 +188,18 @@ class MuonAdamW(torch.optim.Optimizer):
             state = self.state[p0]
             n     = len(ps)
 
-            if "momentum_buffer" not in state:
+            # [v0.7-O2] Riallocca se n cambia — può succedere se il numero di
+            # parametri con grad valido varia tra step (grad_accum, self_cond,
+            # skip batch vuoti). Con il buffer di dimensione sbagliata lerp_ crasha.
+            if "momentum_buffer" not in state or state["momentum_buffer"].shape[0] != n:
                 state["momentum_buffer"] = torch.zeros(
                     n, *shape, dtype=p0.dtype, device=p0.device)
-            if "second_momentum_buffer" not in state:
-                sb_shape = (n, shape[-2], 1) if shape[-2] >= shape[-1] else (n, 1, shape[-1])
+            sb_shape = (n, shape[-2], 1) if shape[-2] >= shape[-1] else (n, 1, shape[-1])
+            if "second_momentum_buffer" not in state or state["second_momentum_buffer"].shape[0] != n:
                 state["second_momentum_buffer"] = torch.zeros(
                     sb_shape, dtype=p0.dtype, device=p0.device)
 
-            red_dim       = -1 if shape[-2] >= shape[-1] else -2
+            red_dim        = -1 if shape[-2] >= shape[-1] else -2
             stacked_grads  = torch.stack([p.grad for p in ps])
             stacked_params = torch.stack(ps)
 
@@ -230,7 +247,6 @@ def _is_muon_eligible(name: str, param: torch.Tensor) -> bool:
         return False
     if param.shape[0] < 2 or param.shape[1] < 2:
         return False
-    # Escludi embedding e output head (tied weights)
     excluded = ("token_emb", "pos_emb", "ce_head")
     if any(e in name for e in excluded):
         return False
@@ -251,7 +267,6 @@ def build_optimizer(
     Returns:
         MuonAdamW se ``train_cfg.use_muon=True``, altrimenti AdamW.
     """
-    # Unwrap DDP se necessario
     if isinstance(model, torch.nn.parallel.DistributedDataParallel):
         raw: nn.Module = model.module
     else:
@@ -267,7 +282,7 @@ def build_optimizer(
             fused=True,
         )
 
-    muon_params: List[torch.nn.Parameter] = []
+    muon_params:  List[torch.nn.Parameter] = []
     adamw_params: List[torch.nn.Parameter] = []
 
     for name, param in raw.named_parameters():
