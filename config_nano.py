@@ -98,9 +98,9 @@ class NanoTrainConfig(TrainConfig):
 
     # LR scalato con sqrt(d_model/d_model_ref)
     # 1e-4 * sqrt(512/1280) ~ 6.3e-5
-    lr:            float = 6e-5
+    lr:            float = 3e-4
     min_lr:        float = 6e-6
-    warmup_iters:  int   = 500
+    warmup_iters:  int   = 200
 
     stream_buffer_size: int = 1000
 
@@ -111,4 +111,6 @@ class NanoTrainConfig(TrainConfig):
 
     compile_mode: str = "reduce-overhead"  # più veloce da compilare di max-autotune
 
+    self_cond_prob: float = 0.0
+                                  
     loss_history_size: int = 20_000
