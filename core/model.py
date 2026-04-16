@@ -536,8 +536,7 @@ class Mamba3Block(nn.Module):
             import warnings
             warnings.warn(
                 "Mamba3 non disponibile — fallback su Mamba2. "
-                "Per il full run installare mamba3-release dal branch GitHub.",
-                stacklevel=2,
+                "Per il full run installare mamba3-release dal branch GitHub."
             )
             self.mamba = Mamba2(
                 d_model  = config.d_model,
