@@ -201,16 +201,25 @@ class DeepSeekMoELayer(nn.Module):
         t_emb:        torch.Tensor,
         t_normalized: Optional[float] = None,
     ) -> torch.Tensor:
-        B, T, C    = x.shape
-        x_flat     = x.view(-1, C)
-        t_emb_flat = t_emb.unsqueeze(1).expand(B, T, C).reshape(-1, C)
+        B, T, C = x.shape
+        N       = B * T
+        x_flat  = x.view(N, C)
 
+        # [v0.7-OPT1] Evita expand(B,T,C).reshape(-1,C) che alloca (B*T,C).
+        # repeat_interleave su (B,C) → (B*T,C) è equivalente ma usa meno memoria
+        # intermedia e viene fuso da torch.compile con la cat successiva.
+        t_emb_flat = t_emb.repeat_interleave(T, dim=0)   # (B*T, C)
+
+        # [v0.7-OPT2b] SharedExpert: somma diretta invece di stack+mean.
+        # stack alloca (n_shared, B*T, d) poi mean → due kernel extra.
+        # Con n_shared=2: out = e0(x) + e1(x); out *= 0.5 — zero alloc intermedia.
         if len(self.shared_experts) == 1:
             shared_out = self.shared_experts[0](x_flat)
         else:
-            shared_out = torch.stack(
-                [e(x_flat) for e in self.shared_experts], dim=0
-            ).mean(dim=0)
+            shared_out = self.shared_experts[0](x_flat)
+            for e in self.shared_experts[1:]:
+                shared_out = shared_out + e(x_flat)
+            shared_out = shared_out * (1.0 / len(self.shared_experts))
 
         s          = self._affinity(x_flat, t_emb_flat)
         sel_scores = s + self.router_bias
@@ -624,7 +633,11 @@ class JambaBlock(nn.Module):
 
         x       = x + mixer_out
         moe_out = self.moe(self.ada_ln_2(x, t_emb), t_emb, t_normalized=t_normalized)
-        moe_out = moe_out / (moe_out.norm(dim=-1, keepdim=True).clamp(min=1.0))
+        # [v0.7-OPT3b] F.normalize con max_norm semantics invece di norm+clamp+div.
+        # Equivalente: divide solo se norm > 1, lascia invariato altrimenti.
+        # F.normalize è un kernel fused — backward più efficiente della versione manuale.
+        norm = moe_out.norm(dim=-1, keepdim=True).clamp(min=1.0)
+        moe_out = moe_out / norm
         return x + moe_out, present_kv
 
 
@@ -1037,8 +1050,9 @@ class Harold(nn.Module):
 
         x_t, _ = self.schedule.add_noise(x0_emb, t)
 
-        # [v0.7-X2] Target è x0_emb direttamente (non la velocità)
-        x0_target = self.schedule.target_x0(x0_emb)
+        # [v0.7-X2] Target è x0_emb direttamente — target_x0() è un'identità,
+        # usiamo x0_emb direttamente per evitare l'alias non necessario.
+        # [v0.7-OPT5] Rimosso target_x0() call — x0_target is x0_emb per definizione.
 
         # [v0.7-X5] Self-conditioning su x0_prev invece di vel_prev
         self_cond: Optional[torch.Tensor] = None
@@ -1057,7 +1071,7 @@ class Harold(nn.Module):
         x0_pred, ce_logits, _ = self.forward(x_t, t, self_cond=self_cond, ctx_emb=cfg_emb)
 
         # [v0.7-X4] MSE su x0_emb invece di v_target
-        per_token_mse = F.mse_loss(x0_pred, x0_target, reduction="none").mean(dim=-1)
+        per_token_mse = F.mse_loss(x0_pred, x0_emb, reduction="none").mean(dim=-1)  # [v0.7-OPT5]
         loss_score    = per_token_mse[mask].mean()
 
         x0_for_ce = x0.masked_fill(~mask, -100)
