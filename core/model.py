@@ -142,14 +142,29 @@ class DeepSeekMoELayer(nn.Module):
             for _ in range(self.n_routed_experts)
         ])
 
-        self.router = nn.Linear(config.d_model * 2, self.n_routed_experts, bias=False)
-        nn.init.normal_(self.router.weight, std=0.01)
+        # [v0.7-OPT7] Router FiLM: separa condizionamento x e t_emb.
+        # Invece di cat([x, t_emb]) → Linear(2d, E), usa:
+        #   logit = W_x @ x + (W_t @ t_emb)  broadcast su T
+        # Vantaggi:
+        #   - Elimina repeat_interleave di t_emb (era (B*T, C) per concat)
+        #   - W_t @ t_emb calcolato una volta per batch (B, E) → broadcast su T
+        #   - Stessi parametri totali: 2*d*E = d*E + d*E
+        # Breaking change rispetto a v0.6: shape router cambia — checkpoint incompatibili.
+        self.router   = nn.Linear(config.d_model, self.n_routed_experts, bias=False)
+        self.router_t = nn.Linear(config.d_model, self.n_routed_experts, bias=False)
+        nn.init.normal_(self.router.weight,   std=0.01)
+        nn.init.normal_(self.router_t.weight, std=0.01)
 
         self.register_buffer("router_bias", torch.zeros(self.n_routed_experts))
         self.router_indices: Optional[torch.Tensor] = None
 
-    def _affinity(self, x_flat: torch.Tensor, t_emb_flat: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.router(torch.cat([x_flat, t_emb_flat], dim=-1)).float())
+    def _affinity(self, x_flat: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        # [v0.7-OPT7] FiLM: logit_x (N, E) + logit_t (B, E) broadcast su T
+        # t_emb è (B, C) — non espanso, il broadcast avviene implicitamente
+        # dopo repeat_interleave o reshape nella forward
+        return torch.sigmoid(
+            (self.router(x_flat) + t_emb).float()
+        )
 
     def _compute_threshold(self, t_normalized: float) -> float:
         return self.threshold_base - (self.threshold_base - self.threshold_min) * t_normalized
@@ -171,7 +186,7 @@ class DeepSeekMoELayer(nn.Module):
 
         flat_indices = topk_indices.view(-1)
         flat_gates   = gates.view(-1)
-        token_ids    = torch.arange(N, device=x_flat.device).unsqueeze(1).expand(N, k).reshape(-1)
+        token_ids    = torch.arange(N, device=x_flat.device)                            .unsqueeze(1).expand(N, k).reshape(-1)
 
         valid_mask = flat_indices >= 0
         if not valid_mask.any():
@@ -205,14 +220,13 @@ class DeepSeekMoELayer(nn.Module):
         N       = B * T
         x_flat  = x.view(N, C)
 
-        # [v0.7-OPT1] Evita expand(B,T,C).reshape(-1,C) che alloca (B*T,C).
-        # repeat_interleave su (B,C) → (B*T,C) è equivalente ma usa meno memoria
-        # intermedia e viene fuso da torch.compile con la cat successiva.
-        t_emb_flat = t_emb.repeat_interleave(T, dim=0)   # (B*T, C)
+        # [v0.7-OPT7] Router FiLM: calcola t_bias (B, E) una volta,
+        # poi viene broadcastato su N=B*T dentro _affinity senza allocazione.
+        # Elimina il repeat_interleave di t_emb (era (B*T, C) per concat).
+        t_bias = self.router_t(t_emb)                   # (B, E) — una volta per batch
+        t_bias_flat = t_bias.repeat_interleave(T, dim=0) # (B*T, E) — scalare, non C
 
         # [v0.7-OPT2b] SharedExpert: somma diretta invece di stack+mean.
-        # stack alloca (n_shared, B*T, d) poi mean → due kernel extra.
-        # Con n_shared=2: out = e0(x) + e1(x); out *= 0.5 — zero alloc intermedia.
         if len(self.shared_experts) == 1:
             shared_out = self.shared_experts[0](x_flat)
         else:
@@ -221,7 +235,7 @@ class DeepSeekMoELayer(nn.Module):
                 shared_out = shared_out + e(x_flat)
             shared_out = shared_out * (1.0 / len(self.shared_experts))
 
-        s          = self._affinity(x_flat, t_emb_flat)
+        s          = self._affinity(x_flat, t_bias_flat)
         sel_scores = s + self.router_bias
 
         if self.training or t_normalized is None:
@@ -873,14 +887,19 @@ class Harold(nn.Module):
 
         Embedding sinusoidale del timestep di diffusione.
 
+        [v0.7-OPT6] Usa stack+view invece di cat([cos, sin]) per evitare
+        una delle due allocazioni intermedie. stack produce (B, half, 2),
+        view lo riorganizza a (B, d_model) senza copia — zero-copy reshape.
+
         Args:
             t (Tensor): timestep in :math:`[0, 1]`, shape :math:`(B,)`
 
         Returns:
             Tensor: embedding shape :math:`(B, d\_model)`
         """
-        args = (t.float() * 1000.0)[:, None] * self.t_freqs[None]
-        emb  = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        args = (t.float() * 1000.0)[:, None] * self.t_freqs[None]  # (B, half)
+        emb  = torch.stack([torch.cos(args), torch.sin(args)], dim=-1)  # (B, half, 2)
+        emb  = emb.view(t.shape[0], -1)                                  # (B, d_model)
         if self.d_model % 2:
             emb = F.pad(emb, (0, 1))
         return emb
