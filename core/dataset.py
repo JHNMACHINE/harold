@@ -29,9 +29,11 @@ Invariato da v0.6:
 from __future__ import annotations
 from collections import deque
 from pathlib import Path
-from queue import Queue
+from queue import Queue, Empty
 from threading import Thread
-from typing import Iterator
+from typing import Iterator, Optional
+import os
+import functools
 import yaml
 import torch
 from transformers import BatchEncoding, PreTrainedTokenizer
@@ -175,25 +177,32 @@ def _iter_pretraining_dataset(
     text_field = ds_cfg.get("text_field", "text")
     fmt        = ds_cfg.get("format", "standard")
 
-    ds = load_dataset(**load_kwargs, streaming=True)
-    ds = ds.shuffle(buffer_size=buffer_size, seed=seed)
+    # [v0.7-D5] Loop infinito — evita che StopIteration risalga a MixedStreamingDataset
+    # e causi la ricreazione dell'iteratore con relativa chiamata HTTP HuggingFace
+    # (risoluzione file shard) che blocca la GPU per secondi.
+    # Il dataset viene ricaricato con seed incrementato per variare l'ordine.
+    epoch = 0
+    while True:
+        ds = load_dataset(**load_kwargs, streaming=True)
+        ds = ds.shuffle(buffer_size=buffer_size, seed=seed + epoch * 31337)
 
-    # [v0.7-D3] Controlla split PRIMA di tokenizzare — evita tokenizzazione
-    # di documenti che verranno scartati (in v0.6 tokenizzava tutto)
-    doc_idx = 0
-    for example in ds:
-        is_val = (doc_idx % val_every == 0)
-        if (split == "val") != is_val:
+        # [v0.7-D3] Controlla split PRIMA di tokenizzare
+        doc_idx = 0
+        for example in ds:
+            is_val = (doc_idx % val_every == 0)
+            if (split == "val") != is_val:
+                doc_idx += 1
+                continue
+            text = _extract_text(example, text_field, fmt)
+            if not text:
+                doc_idx += 1
+                continue
+            ids = _tokenize_doc(text, tokenizer, sep_id)
+            if ids:
+                yield ids
             doc_idx += 1
-            continue
-        text = _extract_text(example, text_field, fmt)
-        if not text:
-            doc_idx += 1
-            continue
-        ids = _tokenize_doc(text, tokenizer, sep_id)
-        if ids:
-            yield ids
-        doc_idx += 1
+
+        epoch += 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
