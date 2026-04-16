@@ -160,8 +160,13 @@ class DeepSeekMoELayer(nn.Module):
         topk_indices: torch.Tensor,
         gates:        torch.Tensor,
     ) -> torch.Tensor:
-        N, k = topk_indices.shape
-        d    = x_flat.shape[-1]
+        # [v0.7-OPT2] Dispatch senza Python loop con .item() — nessuna CPU-GPU sync.
+        # Vecchia versione: loop su boundaries con .item() ad ogni expert
+        #   → n_active_experts sync CPU per forward pass.
+        # Nuova versione: loop su n_routed_experts con maschera booleana CUDA
+        #   → 0 sync CPU, torch.compile fonde le op elementwise per expert.
+        N, k   = topk_indices.shape
+        d      = x_flat.shape[-1]
         output = torch.zeros(N, d, dtype=x_flat.dtype, device=x_flat.device)
 
         flat_indices = topk_indices.view(-1)
@@ -177,27 +182,16 @@ class DeepSeekMoELayer(nn.Module):
         token_ids_v    = token_ids[valid_mask]
         x_selected     = x_flat[token_ids_v]
 
-        sort_idx   = flat_indices_v.argsort(stable=True)
-        sorted_exp = flat_indices_v[sort_idx]
-        sorted_tok = token_ids_v[sort_idx]
-        sorted_x   = x_selected[sort_idx]
-        sorted_g   = flat_gates_v[sort_idx]
-
-        boundaries = torch.cat([
-            torch.tensor([-1], device=x_flat.device),
-            (sorted_exp[1:] != sorted_exp[:-1]).nonzero(as_tuple=False).view(-1),
-            torch.tensor([sorted_exp.numel() - 1], device=x_flat.device),
-        ])
-
-        for b in range(len(boundaries) - 1):
-            start   = int((boundaries[b] + 1).item())
-            end     = int((boundaries[b + 1] + 1).item())
-            exp_id  = int(sorted_exp[start].item())
-            chunk_x = sorted_x[start:end]
-            chunk_g = sorted_g[start:end].unsqueeze(1).to(x_flat.dtype)
-            chunk_t = sorted_tok[start:end]
-            exp_out = self.routed_experts[exp_id](chunk_x)
-            output.index_add_(0, chunk_t, (exp_out * chunk_g).to(output.dtype))
+        # Loop su n_experts (costante=16) — nessun .item() dentro
+        for exp_id in range(self.n_routed_experts):
+            exp_mask = (flat_indices_v == exp_id)
+            if not exp_mask.any():
+                continue
+            tok_ids = token_ids_v[exp_mask]
+            x_in    = x_selected[exp_mask]
+            g       = flat_gates_v[exp_mask].unsqueeze(1).to(x_flat.dtype)
+            exp_out = self.routed_experts[exp_id](x_in)
+            output.index_add_(0, tok_ids, (exp_out * g).to(output.dtype))
 
         return output
 
@@ -440,6 +434,9 @@ class BlockCausalAttention(nn.Module):
 
 
 class AdaLN(nn.Module):
+    # [v0.7-OPT3] Forward fused: split manuale invece di chunk(),
+    # poi mul_ e add_ in-place fusi da torch.compile.
+    # Elimina 1 kernel chunk + 2 unsqueeze separati rispetto alla versione v0.6.
     def __init__(self, d_model: int):
         super().__init__()
         self.norm = nn.LayerNorm(d_model, elementwise_affine=False)
@@ -448,8 +445,11 @@ class AdaLN(nn.Module):
         nn.init.zeros_(self.proj.bias)
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
-        scale, shift = self.proj(t_emb).chunk(2, dim=-1)
-        return self.norm(x) * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        proj  = self.proj(t_emb)                    # (B, 2*d)
+        d     = proj.shape[-1] // 2
+        scale = proj[..., :d].unsqueeze(1)          # (B, 1, d)
+        shift = proj[..., d:].unsqueeze(1)          # (B, 1, d)
+        return self.norm(x).mul_(1.0 + scale).add_(shift)
 
 
 class Mamba3Block(nn.Module):
