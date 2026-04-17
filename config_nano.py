@@ -94,7 +94,7 @@ class NanoTrainConfig(TrainConfig):
     Ottimizzato per singola GPU consumer (RTX 4090, A10G, ecc.).
     """
     # Override rispetto a TrainConfig
-    batch_size:    int   = 8
+    batch_size:    int   = 2    # ridotto per seq_len=4096 (OOM con batch=8 su 32GB)
     grad_accum:    int   = 8       # 64 seq/step effettivo — uguale al 3.2B
     max_iters:     int   = 20_000
     seq_len:       int   = 4096    # allineato a max_seq_len per test full-seq
