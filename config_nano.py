@@ -66,15 +66,15 @@ def get_nano_model_config(train_cfg: 'NanoTrainConfig | None' = None) -> ModelCo
         # Invariati
         dsa_window_size  = 256,
         dsa_global_every = 64,
-        max_seq_len      = 1024,   # ridotto per velocità
-        block_size       = 1024,
+        max_seq_len      = 4096,   # deve matchare seq_len del training
+        block_size       = 4096,
         flow_sigma_min   = 1e-4,
         t_sampling       = "logit_normal",
         t_logit_normal_std = 0.5,
         dropout          = 0.0,
         rope_theta       = 500000.0,
         rope_original_max_seq_len = 1024,
-        rope_scale_factor = 1.0,   # no YaRN a questa seq_len
+        rope_scale_factor = 4.0,   # YaRN richiesto per seq > original_max_seq_len
         use_flash_attention = True,
         jamba_attn_every = 4,
         mamba_d_state    = 64,     # ridotto da 128
@@ -97,7 +97,7 @@ class NanoTrainConfig(TrainConfig):
     batch_size:    int   = 8
     grad_accum:    int   = 8       # 64 seq/step effettivo — uguale al 3.2B
     max_iters:     int   = 20_000
-    seq_len:       int   = 4096    # ridotto per fitting su GPU consumer
+    seq_len:       int   = 4096    # allineato a max_seq_len per test full-seq
 
     # LR scalato con sqrt(d_model/d_model_ref)
     # 1e-4 * sqrt(512/1280) ~ 6.3e-5
