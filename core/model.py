@@ -817,6 +817,13 @@ class JambaBlock(nn.Module):
         else:
             self.moe = DeepSeekMoELayer(config)
 
+        # [v0.7-OPT-GC] t_normalized e kv_offset salvati come stato temporaneo
+        # per i metodi _mixer_forward e _moe_forward usati dal gradient checkpointing.
+        # Evita la creazione di closure Python ad ogni forward (16+ layer × 2 = 32+ oggetti/step).
+        self._fwd_t_normalized: Optional[float] = None
+        self._fwd_use_cache:    bool = False
+        self._fwd_kv_offset:    int  = 0
+
     def forward(
         self,
         x:            torch.Tensor,
@@ -848,20 +855,20 @@ class JambaBlock(nn.Module):
         """
         normed = self.ada_ln_1(x, t_emb)
 
-        # [v0.7-OPT-GC] Gradient checkpointing su mixer e MoE.
-        # Le attivazioni intermedie non vengono salvate nel forward —
-        # vengono ricalcolate nel backward. Costo: ~33% compute extra.
-        # Beneficio: ~50% meno VRAM per attivazioni → batch più grande.
-        # Disabilitato in inferenza (use_cache) e con past_kv presente.
+        # [v0.7-OPT-GC] Gradient checkpointing via metodi di istanza —
+        # nessuna closure creata ad ogni forward (era 32+ oggetti/step con 16 layer).
         _gc = self.use_gc and self.training and not use_cache
 
+        # Salva stato temporaneo per i metodi _mixer_forward / _moe_forward
+        self._fwd_t_normalized = t_normalized
+        self._fwd_use_cache    = use_cache
+        self._fwd_kv_offset    = kv_offset
+
         if self.is_attn_layer:
-            def _attn(n, pkv):
-                return self.mixer(n, past_kv=pkv, use_cache=use_cache, kv_offset=kv_offset)
             if _gc and past_kv is None:
                 mixer_out, present_kv = cast(
                     Tuple[torch.Tensor, Optional[torch.Tensor]],
-                    ckpt_fn(_attn, normed, past_kv, use_reentrant=False),
+                    ckpt_fn(self._attn_forward, normed, past_kv, use_reentrant=False),
                 )
             else:
                 mixer_out, present_kv = cast(
@@ -878,15 +885,47 @@ class JambaBlock(nn.Module):
 
         x = x + mixer_out
 
-        def _moe(xi, te):
-            return self.moe(self.ada_ln_2(xi, te), te, t_normalized=t_normalized)
-
-        moe_out = cast(torch.Tensor,
-            ckpt_fn(_moe, x, t_emb, use_reentrant=False) if _gc else _moe(x, t_emb))
+        if _gc:
+            moe_out = cast(torch.Tensor,
+                ckpt_fn(self._moe_forward, x, t_emb, use_reentrant=False))
+        else:
+            moe_out = self.moe(self.ada_ln_2(x, t_emb), t_emb, t_normalized=t_normalized)
 
         norm = moe_out.norm(dim=-1, keepdim=True).clamp(min=1.0)
         moe_out = moe_out / norm
         return x + moe_out, present_kv
+
+    def _attn_forward(
+        self,
+        normed:  torch.Tensor,
+        past_kv: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Metodo di istanza per attention — usato da gradient checkpointing.
+        Evita closure inline nel forward principale.
+        """
+        return cast(
+            Tuple[torch.Tensor, Optional[torch.Tensor]],
+            self.mixer(
+                normed,
+                past_kv   = past_kv,
+                use_cache = self._fwd_use_cache,
+                kv_offset = self._fwd_kv_offset,
+            ),
+        )
+
+    def _moe_forward(
+        self,
+        x:     torch.Tensor,
+        t_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Metodo di istanza per MoE — usato da gradient checkpointing.
+        Evita closure inline nel forward principale.
+        """
+        return self.moe(
+            self.ada_ln_2(x, t_emb),
+            t_emb,
+            t_normalized = self._fwd_t_normalized,
+        )
 
 
 class FlowMatchingSchedule(nn.Module):
