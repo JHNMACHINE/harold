@@ -66,7 +66,7 @@ def get_nano_model_config(train_cfg: 'NanoTrainConfig | None' = None) -> ModelCo
         # Invariati
         dsa_window_size  = 256,
         dsa_global_every = 64,
-        max_seq_len      = 1024,   # ridotto per velocità
+        max_seq_len      = 4096,   # ridotto per velocità
         block_size       = 1024,
         flow_sigma_min   = 1e-4,
         t_sampling       = "logit_normal",
