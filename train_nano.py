@@ -53,8 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_iters",  type=int,   default=None)
     parser.add_argument("--batch_size", type=int,   default=None)
     parser.add_argument("--lr",         type=float, default=None)
-    parser.add_argument("--no_compile", action="store_true")
-    parser.add_argument("--device",     type=str,   default=None)
+    parser.add_argument("--no_compile",    action="store_true")
+    parser.add_argument("--device",        type=str,   default=None)
+    parser.add_argument("--use_fp8",       action="store_true",
+                        help="Abilita FP8 per i linear layers degli expert")
+    parser.add_argument("--use_hash_moe",  action="store_true",
+                        help="Abilita Hash MoE deterministico invece del routing learnable")
     return parser.parse_args()
 
 
@@ -135,20 +139,26 @@ def run_validation(
 
 def run_nano_training(args: argparse.Namespace) -> dict:
     train_cfg  = NanoTrainConfig()
-    model_cfg  = get_nano_model_config(train_cfg)
 
-    # Override da CLI
-    if args.max_iters  is not None: train_cfg.max_iters  = args.max_iters
-    if args.batch_size is not None: train_cfg.batch_size = args.batch_size
-    if args.lr         is not None: train_cfg.lr         = args.lr
+    # Override da CLI — FP8 e Hash MoE prima di get_nano_model_config
+    # perché vengono letti per costruire ModelConfig
+    if args.max_iters  is not None: train_cfg.max_iters   = args.max_iters
+    if args.batch_size is not None: train_cfg.batch_size  = args.batch_size
+    if args.lr         is not None: train_cfg.lr          = args.lr
     if args.no_compile:             train_cfg.use_compile = False
-    if args.device     is not None: train_cfg.device     = args.device
+    if args.device     is not None: train_cfg.device      = args.device
+    if args.use_fp8:                train_cfg.use_fp8      = True
+    if args.use_hash_moe:           train_cfg.use_hash_moe = True
+
+    model_cfg  = get_nano_model_config(train_cfg)
 
     device = train_cfg.device
     os.makedirs(train_cfg.checkpoint_dir, exist_ok=True)
 
+    fp8_str  = "+FP8"  if train_cfg.use_fp8      else ""
+    hash_str = "+Hash" if train_cfg.use_hash_moe else ""
     print("=" * 60)
-    print("  Harold-Nano — Scaling Law Check")
+    print(f"  Harold-Nano{fp8_str}{hash_str} — Scaling Law Check")
     print("=" * 60)
 
     # Tokenizer
