@@ -158,13 +158,12 @@ class DeepSeekMoELayer(nn.Module):
         self.register_buffer("router_bias", torch.zeros(self.n_routed_experts))
         self.router_indices: Optional[torch.Tensor] = None
 
-    def _affinity(self, x_flat: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
-        # [v0.7-OPT7] FiLM: logit_x (N, E) + logit_t (B, E) broadcast su T
-        # t_emb è (B, C) — non espanso, il broadcast avviene implicitamente
-        # dopo repeat_interleave o reshape nella forward
-        return torch.sigmoid(
-            (self.router(x_flat) + t_emb).float()
-        )
+    def _affinity(self, x_flat: torch.Tensor, t_bias_flat: torch.Tensor) -> torch.Tensor:
+        # [v0.7-OPT7b] FiLM con broadcast puro — nessun repeat_interleave.
+        # router(x_flat): (B*T, E)
+        # t_bias_flat:    (B*T, E) — pre-calcolato in forward con repeat_interleave(T)
+        # Su E=16 (invece di C=1792) il repeat è 112x più piccolo.
+        return torch.sigmoid((self.router(x_flat) + t_bias_flat).float())
 
     def _compute_threshold(self, t_normalized: float) -> float:
         return self.threshold_base - (self.threshold_base - self.threshold_min) * t_normalized
@@ -197,14 +196,30 @@ class DeepSeekMoELayer(nn.Module):
         token_ids_v    = token_ids[valid_mask]
         x_selected     = x_flat[token_ids_v]
 
-        # Loop su n_experts (costante=16) — nessun .item() dentro
+        # [v0.7-OPT8] Expert dispatch con sort — una sola comparazione per expert.
+        # Invece di (flat_indices_v == exp_id) per ogni exp_id — O(M*E) comparazioni —
+        # ordiniamo per expert_id una volta (già fatto) e usiamo searchsorted O(log M).
+        # Con M=B*T*k=32768 e E=16: da 524k a 16*log2(32768)≈240 operazioni.
+        sort_idx       = flat_indices_v.argsort(stable=True)
+        sorted_exp     = flat_indices_v[sort_idx]
+        sorted_tok     = token_ids_v[sort_idx]
+        sorted_x       = x_selected[sort_idx]
+        sorted_g       = flat_gates_v[sort_idx]
+
+        # Boundaries tra gruppi di expert — searchsorted senza .item()
+        exp_ids_range  = torch.arange(self.n_routed_experts + 1,
+                                      device=x_flat.device, dtype=sorted_exp.dtype)
+        boundaries     = torch.searchsorted(sorted_exp.contiguous(),
+                                            exp_ids_range.contiguous())  # (E+1,)
+
         for exp_id in range(self.n_routed_experts):
-            exp_mask = (flat_indices_v == exp_id)
-            if not exp_mask.any():
+            s = boundaries[exp_id].item()
+            e = boundaries[exp_id + 1].item()
+            if s == e:
                 continue
-            tok_ids = token_ids_v[exp_mask]
-            x_in    = x_selected[exp_mask]
-            g       = flat_gates_v[exp_mask].unsqueeze(1).to(x_flat.dtype)
+            tok_ids = sorted_tok[s:e]
+            x_in    = sorted_x[s:e]
+            g       = sorted_g[s:e].unsqueeze(1).to(x_flat.dtype)
             exp_out = self.routed_experts[exp_id](x_in)
             output.index_add_(0, tok_ids, (exp_out * g).to(output.dtype))
 
@@ -220,11 +235,11 @@ class DeepSeekMoELayer(nn.Module):
         N       = B * T
         x_flat  = x.view(N, C)
 
-        # [v0.7-OPT7] Router FiLM: calcola t_bias (B, E) una volta,
-        # poi viene broadcastato su N=B*T dentro _affinity senza allocazione.
-        # Elimina il repeat_interleave di t_emb (era (B*T, C) per concat).
-        t_bias = self.router_t(t_emb)                   # (B, E) — una volta per batch
-        t_bias_flat = t_bias.repeat_interleave(T, dim=0) # (B*T, E) — scalare, non C
+        # [v0.7-OPT7b] Router FiLM: t_bias (B, E) → (B*T, E) via expand+reshape.
+        # expand è zero-copy (stride trick), reshape su tensor contiguo è zero-copy.
+        # Su E=16: 112x meno memoria di repeat_interleave su C=1792.
+        t_bias      = self.router_t(t_emb)                              # (B, E)
+        t_bias_flat = t_bias.unsqueeze(1).expand(B, T, -1).reshape(N, -1)  # (B*T, E) zero-copy
 
         # [v0.7-OPT2b] SharedExpert: somma diretta invece di stack+mean.
         if len(self.shared_experts) == 1:
@@ -536,7 +551,8 @@ class Mamba3Block(nn.Module):
             import warnings
             warnings.warn(
                 "Mamba3 non disponibile — fallback su Mamba2. "
-                "Per il full run installare mamba3-release dal branch GitHub."
+                "Per il full run installare mamba3-release dal branch GitHub.",
+                stacklevel=2,
             )
             self.mamba = Mamba2(
                 d_model  = config.d_model,
