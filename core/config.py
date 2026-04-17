@@ -90,7 +90,7 @@ class ModelConfig:
     # Elimina router, topk, searchsorted. Assignment perfettamente bilanciato per costruzione.
     # Incompatibile con use_fp8=True sul router (il router non esiste più).
     # Default False — abilitare per confronto con routing learnable sul nano run.
-    use_hash_moe: bool = False
+    use_hash_moe: bool = True
 
 
 def get_model_config() -> ModelConfig:
