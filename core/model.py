@@ -121,26 +121,33 @@ class FP8Linear(nn.Module):
                 f"fp8={bool(self.fp8_initialized.item())}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        fp8_max = 448.0  # max di float8_e4m3fn
-
-        # Quantizza input: x_fp8 in [-fp8_max, fp8_max], scale_x e il fattore
-        # di de-quantization: output_reale = x_fp8 * scale_x
-        x_amax   = x.float().abs().max().clamp(min=1e-12)
-        in_scale = float(fp8_max / x_amax)          # quantization scale
-        self.scale_x.fill_(float(x_amax / fp8_max)) # de-quantization scale
-        x_fp8 = (x * in_scale).to(torch.float8_e4m3fn)
-
-        # Assicura che i pesi FP8 siano inizializzati
+        # [v0.7-FP8] Straight-through estimator per il backward.
+        # _scaled_mm non ha backward implementato in PyTorch 2.10 —
+        # usiamo F.linear (bf16) per il backward e _scaled_mm (fp8) per il forward.
+        # Il gradiente fluisce attraverso i pesi bf16, non attraverso la matmul FP8.
+        # Questo e il pattern standard per FP8 training senza TransformerEngine.
         if not self.fp8_initialized.item():
             self.update_weight_fp8()
 
-        return torch._scaled_mm(
-            x_fp8,
-            self.weight_fp8.t(),
-            scale_a   = self.scale_x,   # de-quant scale input
-            scale_b   = self.scale_w,   # de-quant scale pesi
-            out_dtype = torch.bfloat16,
-        )
+        with torch.no_grad():
+            fp8_max = 448.0
+            # Detach per evitare che float() rompa il grafo autograd
+            x_amax   = x.detach().float().abs().max().clamp(min=1e-12)
+            in_scale = float(fp8_max / x_amax)
+            self.scale_x.fill_(float(x_amax / fp8_max))
+            x_fp8 = (x.detach() * in_scale).to(torch.float8_e4m3fn)
+            fp8_out = torch._scaled_mm(
+                x_fp8,
+                self.weight_fp8.t(),
+                scale_a   = self.scale_x,
+                scale_b   = self.scale_w,
+                out_dtype = torch.bfloat16,
+            )
+
+        # Straight-through: forward usa fp8_out, backward usa F.linear su bf16
+        # x - x.detach() = 0 ma porta il gradiente; fp8_out.detach() porta il valore
+        bf16_out = F.linear(x, self.weight)
+        return fp8_out + (bf16_out - bf16_out.detach())
 
     @torch.no_grad()
     def update_weight_fp8(self) -> None:
