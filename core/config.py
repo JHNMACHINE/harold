@@ -76,6 +76,11 @@ class ModelConfig:
     mamba_d_state:    int = 128  # dimensione dello stato SSM
     mamba_mimo_rank:  int = 4    # rank MIMO; chunk_size = 64 // mimo_rank (ottimale per bf16)
 
+    # [v0.7-OPT-GC] Gradient checkpointing — riduce attivazioni ~50%, permette batch più grandi.
+    # Costo: ~33% compute extra per il recompute nel backward.
+    # Default False; True per full run su B200 con seq_len=4096.
+    use_gradient_checkpointing: bool = False
+
 
 def get_model_config() -> ModelConfig:
     return ModelConfig()

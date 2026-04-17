@@ -71,6 +71,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as ckpt_fn
 from typing import Optional, Tuple, List, Dict, Callable, cast
 from core.config import ModelConfig
 
@@ -609,6 +610,7 @@ class JambaBlock(nn.Module):
     def __init__(self, config: ModelConfig, is_attn_layer: bool):
         super().__init__()
         self.is_attn_layer = is_attn_layer
+        self.use_gc = getattr(config, "use_gradient_checkpointing", False)
 
         self.ada_ln_1 = AdaLN(config.d_model)
         self.ada_ln_2 = AdaLN(config.d_model)
@@ -651,20 +653,42 @@ class JambaBlock(nn.Module):
         """
         normed = self.ada_ln_1(x, t_emb)
 
+        # [v0.7-OPT-GC] Gradient checkpointing su mixer e MoE.
+        # Le attivazioni intermedie non vengono salvate nel forward —
+        # vengono ricalcolate nel backward. Costo: ~33% compute extra.
+        # Beneficio: ~50% meno VRAM per attivazioni → batch più grande.
+        # Disabilitato in inferenza (use_cache) e con past_kv presente.
+        _gc = self.use_gc and self.training and not use_cache
+
         if self.is_attn_layer:
-            mixer_out, present_kv = cast(
-                Tuple[torch.Tensor, Optional[torch.Tensor]],
-                self.mixer(normed, past_kv=past_kv, use_cache=use_cache, kv_offset=kv_offset),
-            )
+            def _attn(n, pkv):
+                return self.mixer(n, past_kv=pkv, use_cache=use_cache, kv_offset=kv_offset)
+            if _gc and past_kv is None:
+                mixer_out, present_kv = cast(
+                    Tuple[torch.Tensor, Optional[torch.Tensor]],
+                    ckpt_fn(_attn, normed, past_kv, use_reentrant=False),
+                )
+            else:
+                mixer_out, present_kv = cast(
+                    Tuple[torch.Tensor, Optional[torch.Tensor]],
+                    self.mixer(normed, past_kv=past_kv, use_cache=use_cache, kv_offset=kv_offset),
+                )
         else:
-            mixer_out = cast(torch.Tensor, self.mixer(normed))
+            if _gc:
+                mixer_out = cast(torch.Tensor,
+                    ckpt_fn(self.mixer, normed, use_reentrant=False))
+            else:
+                mixer_out = cast(torch.Tensor, self.mixer(normed))
             present_kv = None
 
-        x       = x + mixer_out
-        moe_out = self.moe(self.ada_ln_2(x, t_emb), t_emb, t_normalized=t_normalized)
-        # [v0.7-OPT3b] F.normalize con max_norm semantics invece di norm+clamp+div.
-        # Equivalente: divide solo se norm > 1, lascia invariato altrimenti.
-        # F.normalize è un kernel fused — backward più efficiente della versione manuale.
+        x = x + mixer_out
+
+        def _moe(xi, te):
+            return self.moe(self.ada_ln_2(xi, te), te, t_normalized=t_normalized)
+
+        moe_out = cast(torch.Tensor,
+            ckpt_fn(_moe, x, t_emb, use_reentrant=False) if _gc else _moe(x, t_emb))
+
         norm = moe_out.norm(dim=-1, keepdim=True).clamp(min=1.0)
         moe_out = moe_out / norm
         return x + moe_out, present_kv
@@ -708,6 +732,23 @@ class FlowMatchingSchedule(nn.Module):
         self.sigma_min          = sigma_min
         self.t_sampling         = t_sampling
         self.t_logit_normal_std = t_logit_normal_std
+        self._t_buffer:   Optional[torch.Tensor] = None
+        self._t_buf_idx:  int = 0
+        self._t_buf_size: int = 0
+
+    def warmup_buffer(self, size: int = 4096, device: str = "cuda") -> None:
+        """[v0.7-OPT9] Pre-campiona buffer timestep — elimina allocazioni nel training loop."""
+        dev = torch.device(device)
+        if self.t_sampling == "logit_normal":
+            u = torch.randn(size, device=dev) * self.t_logit_normal_std
+            self._t_buffer = torch.sigmoid(u)
+        elif self.t_sampling == "cosine":
+            u = torch.rand(size, device=dev)
+            self._t_buffer = 0.5 * (1.0 - torch.cos(math.pi * u))
+        else:
+            self._t_buffer = torch.rand(size, device=dev)
+        self._t_buf_idx  = 0
+        self._t_buf_size = size
 
     def sample_t(self, B: int, device: torch.device) -> torch.Tensor:
         r"""sample_t(B, device) -> Tensor
@@ -731,13 +772,23 @@ class FlowMatchingSchedule(nn.Module):
         Returns:
             Tensor: timestep in :math:`[0, 1]`, shape :math:`(B,)`
         """
+        # [v0.7-OPT9] Buffer pre-campionato — zero allocazione nel loop
+        if self._t_buffer is not None and self._t_buffer.device == device:
+            idx = self._t_buf_idx
+            if idx + B <= self._t_buf_size:
+                self._t_buf_idx += B
+                return self._t_buffer[idx:idx + B]
+            self.warmup_buffer(self._t_buf_size, str(device))
+            self._t_buf_idx = B
+            return self._t_buffer[:B]
+        # Fallback on-the-fly
         if self.t_sampling == "logit_normal":
             u = torch.randn(B, device=device) * self.t_logit_normal_std
             return torch.sigmoid(u)
         elif self.t_sampling == "cosine":
             u = torch.rand(B, device=device)
             return 0.5 * (1.0 - torch.cos(math.pi * u))
-        else:  # uniform
+        else:
             return torch.rand(B, device=device)
 
     def interpolate(

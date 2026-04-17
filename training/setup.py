@@ -151,7 +151,11 @@ def build_training_context(
     if main:
         n_params = sum(p.numel() for p in raw_model.parameters()) / 1e6
         label    = f"{n_params/1000:.2f}B" if n_params >= 1000 else f"{n_params:.1f}M"
-        print(f"Harold v0.7 — {label} parametri totali")
+        gc_str   = " + GradCkpt" if getattr(model_cfg, "use_gradient_checkpointing", False) else ""
+        print(f"Harold v0.7 — {label} parametri totali{gc_str}")
+
+    # [v0.7-OPT9] Pre-campiona buffer timestep dopo build — zero allocazioni nel loop
+    raw_model.schedule.warmup_buffer(size=4096, device=device)
 
     # ── Optimizer + scaler ────────────────────────────────────────────────
     optimizer = build_optimizer(active_model, train_cfg)
