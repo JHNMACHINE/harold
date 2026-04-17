@@ -43,9 +43,13 @@ def parse_args() -> argparse.Namespace:
                         help="Step di warmup prima di misurare (default: 5)")
     parser.add_argument("--use_nano",   action="store_true",
                         help="Usa Harold-Nano invece del 3.2B (più veloce)")
-    parser.add_argument("--use_fsdp",   action="store_true",
+    parser.add_argument("--use_fsdp",     action="store_true",
                         help="Attiva FSDP (richiede torchrun con nproc>1)")
-    parser.add_argument("--out_dir",    type=str, default="profile_results")
+    parser.add_argument("--use_fp8",      action="store_true",
+                        help="Abilita FP8 per i linear layers degli expert")
+    parser.add_argument("--use_hash_moe", action="store_true",
+                        help="Abilita Hash MoE invece del routing learnable")
+    parser.add_argument("--out_dir",      type=str, default="profile_results")
     return parser.parse_args()
 
 
@@ -74,15 +78,24 @@ def run_profiler(args: argparse.Namespace) -> None:
     # Carica config e modello
     if args.use_nano:
         from config_nano import NanoTrainConfig, get_nano_model_config
-        model_cfg = get_nano_model_config()
         train_cfg = NanoTrainConfig()
-        train_cfg.use_fsdp = args.use_fsdp
-        label = "Harold-Nano"
+        train_cfg.use_fsdp    = args.use_fsdp
+        train_cfg.use_fp8     = getattr(args, "use_fp8",      False)
+        train_cfg.use_hash_moe = getattr(args, "use_hash_moe", False)
+        model_cfg = get_nano_model_config(train_cfg)  # propaga use_fp8, use_hash_moe
+        fp8_str  = "+FP8"  if train_cfg.use_fp8      else ""
+        hash_str = "+Hash" if train_cfg.use_hash_moe else ""
+        label = f"Harold-Nano{fp8_str}{hash_str}"
     else:
         from core.config import get_model_config, get_train_config
-        model_cfg = get_model_config()
         train_cfg = get_train_config()
-        train_cfg.use_fsdp = args.use_fsdp
+        train_cfg.use_fsdp    = args.use_fsdp
+        model_cfg = get_model_config()
+        # Propaga flag FP8/Hash se presenti
+        if getattr(args, "use_fp8", False):
+            model_cfg.use_fp8 = True
+        if getattr(args, "use_hash_moe", False):
+            model_cfg.use_hash_moe = True
         label = "Harold-3.2B"
 
     device = train_cfg.device

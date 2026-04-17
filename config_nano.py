@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from core.config import ModelConfig, TrainConfig
 
 
-def get_nano_model_config() -> ModelConfig:
+def get_nano_model_config(train_cfg: 'NanoTrainConfig | None' = None) -> ModelConfig:
     """
     Harold-Nano ~300M parametri.
 
@@ -79,6 +79,9 @@ def get_nano_model_config() -> ModelConfig:
         jamba_attn_every = 4,
         mamba_d_state    = 64,     # ridotto da 128
         mamba_mimo_rank  = 4,
+        # [v0.7-FP8] e [v0.7-HASH] — letti da NanoTrainConfig se fornito
+        use_fp8      = getattr(train_cfg, "use_fp8",      False) if train_cfg else False,
+        use_hash_moe = getattr(train_cfg, "use_hash_moe", False) if train_cfg else False,
     )
     return cfg
 
@@ -98,9 +101,9 @@ class NanoTrainConfig(TrainConfig):
 
     # LR scalato con sqrt(d_model/d_model_ref)
     # 1e-4 * sqrt(512/1280) ~ 6.3e-5
-    lr:            float = 3e-4
+    lr:            float = 6e-5
     min_lr:        float = 6e-6
-    warmup_iters:  int   = 200
+    warmup_iters:  int   = 500
 
     stream_buffer_size: int = 1000
 
@@ -111,6 +114,18 @@ class NanoTrainConfig(TrainConfig):
 
     compile_mode: str = "reduce-overhead"  # più veloce da compilare di max-autotune
 
-    self_cond_prob: float = 0.0
-                                  
+    # Override rispetto a TrainConfig — calibrati per 300M
+    self_cond_prob: float = 0.0    # disabilitato: su modello non trained produce
+                                   # segnali casuali che appiattiscono i gradienti
+    warmup_iters:   int   = 200    # warmup più corto — 300M converge più veloce
+    lr:             float = 3e-4   # lr più alto: scaling ~sqrt(3B/300M) ~ 3x rispetto al 3.2B
+
     loss_history_size: int = 20_000
+
+    # [v0.7-FP8] e [v0.7-HASH] — off per default, attivare per test comparativi:
+    # Test 1 baseline:       use_fp8=False, use_hash_moe=False  (default)
+    # Test 2 FP8 only:       use_fp8=True,  use_hash_moe=False
+    # Test 3 Hash MoE only:  use_fp8=False, use_hash_moe=True
+    # Test 4 FP8 + Hash MoE: use_fp8=True,  use_hash_moe=True
+    use_fp8:      bool = False
+    use_hash_moe: bool = False

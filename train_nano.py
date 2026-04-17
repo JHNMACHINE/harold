@@ -134,8 +134,8 @@ def run_validation(
 
 
 def run_nano_training(args: argparse.Namespace) -> dict:
-    model_cfg  = get_nano_model_config()
     train_cfg  = NanoTrainConfig()
+    model_cfg  = get_nano_model_config(train_cfg)
 
     # Override da CLI
     if args.max_iters  is not None: train_cfg.max_iters  = args.max_iters
