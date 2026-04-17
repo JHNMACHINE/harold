@@ -98,6 +98,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
         # - riduce overhead: 40 layer x 16 expert non è gratis ad ogni step
         if iter_num % 10 == 0:
             ctx.model.update_router_biases()
+            ctx.model.update_fp8_weights()  # [v0.7-FP8] no-op se use_fp8=False
 
         avg_loss  = loss_sum  / valid_count
         avg_score = score_sum / valid_count

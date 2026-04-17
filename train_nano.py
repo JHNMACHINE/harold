@@ -226,6 +226,7 @@ def run_nano_training(args: argparse.Namespace) -> dict:
 
         if iter_num % 10 == 0:
             raw_model.update_router_biases()
+            raw_model.update_fp8_weights()  # [v0.7-FP8] no-op se use_fp8=False
 
         avg_loss = loss_sum / valid_count
         train_losses.append(avg_loss)

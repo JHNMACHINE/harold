@@ -81,6 +81,17 @@ class ModelConfig:
     # Default False; True per full run su B200 con seq_len=4096.
     use_gradient_checkpointing: bool = False
 
+    # [v0.7-FP8] FP8 per linear layers — riduce memoria del 50% e aumenta throughput.
+    # Usa _scaled_mm con scale dinamica. Compatibile con PyTorch 2.1+ su Hopper/Blackwell.
+    # Default False — abilitare dopo validazione sul nano run.
+    use_fp8: bool = False
+
+    # [v0.7-HASH] Hash MoE — routing deterministico via hash invece di topk learnable.
+    # Elimina router, topk, searchsorted. Assignment perfettamente bilanciato per costruzione.
+    # Incompatibile con use_fp8=True sul router (il router non esiste più).
+    # Default False — abilitare per confronto con routing learnable sul nano run.
+    use_hash_moe: bool = False
+
 
 def get_model_config() -> ModelConfig:
     return ModelConfig()

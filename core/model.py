@@ -76,13 +76,102 @@ from typing import Optional, Tuple, List, Dict, Callable, cast
 from core.config import ModelConfig
 
 
+class FP8Linear(nn.Module):
+    """FP8 drop-in replacement per nn.Linear con _scaled_mm.
+
+    [v0.7-FP8] Usa float8_e4m3fn per i pesi, scale dinamica per input e pesi.
+    Compatibile con PyTorch 2.1+ su Hopper (SM90) e Blackwell (SM120).
+    Non supporta bias.
+
+    Semantica scale corretta per _scaled_mm:
+      output = (x_fp8 * scale_a) @ (w_fp8 * scale_b).T
+    Quindi x_fp8 e w_fp8 devono essere gia normalizzati in [-1, 1] prima
+    della conversione FP8, e scale_a/scale_b sono i fattori di de-quantization.
+    """
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.in_features  = in_features
+        self.out_features = out_features
+        # Pesi in bf16 — convertiti a FP8 on-the-fly nel forward
+        self.weight = nn.Parameter(
+            torch.empty(out_features, in_features, dtype=torch.bfloat16)
+        )
+        nn.init.normal_(self.weight, std=0.02)
+        # scale_x: de-quantization scale per input (1/in_scale, aggiornata ogni forward)
+        # scale_w: de-quantization scale per i pesi (aggiornata dopo optimizer step)
+        # Annotazioni esplicite per Pylance — register_buffer ritorna None
+        # ma i buffer sono accessibili come Tensor a runtime.
+        self.scale_x:        torch.Tensor
+        self.scale_w:        torch.Tensor
+        self.weight_fp8:     torch.Tensor
+        self.fp8_initialized: torch.Tensor
+        self.register_buffer("scale_x", torch.ones(1, dtype=torch.float32))
+        self.register_buffer("scale_w", torch.ones(1, dtype=torch.float32))
+        # Pesi gia quantizzati in FP8 — aggiornati da update_weight_fp8()
+        self.register_buffer("weight_fp8",
+            torch.zeros(out_features, in_features, dtype=torch.float8_e4m3fn))
+        # Flag come buffer bool — sopravvive a save/load checkpoint.
+        # Dopo resume weight_fp8 e gia popolato, non serve re-inizializzare.
+        self.register_buffer("fp8_initialized",
+            torch.zeros(1, dtype=torch.bool))
+
+    def extra_repr(self) -> str:
+        return (f"in_features={self.in_features}, "
+                f"out_features={self.out_features}, "
+                f"fp8={bool(self.fp8_initialized.item())}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        fp8_max = 448.0  # max di float8_e4m3fn
+
+        # Quantizza input: x_fp8 in [-fp8_max, fp8_max], scale_x e il fattore
+        # di de-quantization: output_reale = x_fp8 * scale_x
+        x_amax   = x.float().abs().max().clamp(min=1e-12)
+        in_scale = float(fp8_max / x_amax)          # quantization scale
+        self.scale_x.fill_(float(x_amax / fp8_max)) # de-quantization scale
+        x_fp8 = (x * in_scale).to(torch.float8_e4m3fn)
+
+        # Assicura che i pesi FP8 siano inizializzati
+        if not self.fp8_initialized.item():
+            self.update_weight_fp8()
+
+        return torch._scaled_mm(
+            x_fp8,
+            self.weight_fp8.t(),
+            scale_a   = self.scale_x,   # de-quant scale input
+            scale_b   = self.scale_w,   # de-quant scale pesi
+            out_dtype = torch.bfloat16,
+        )
+
+    @torch.no_grad()
+    def update_weight_fp8(self) -> None:
+        """Quantizza i pesi bf16 -> FP8 e aggiorna scale_w.
+
+        Deve essere chiamato:
+        1. Una volta dopo init (lazy, al primo forward)
+        2. Dopo ogni optimizer step (i pesi bf16 sono cambiati)
+        """
+        fp8_max  = 448.0
+        w_amax   = self.weight.float().abs().max().clamp(min=1e-12)
+        w_scale  = float(fp8_max / w_amax)             # quantization scale
+        self.scale_w.fill_(float(w_amax / fp8_max))    # de-quantization scale
+        self.weight_fp8.copy_((self.weight * w_scale).to(torch.float8_e4m3fn))
+        self.fp8_initialized.fill_(True)
+
+
+def _maybe_fp8(in_f: int, out_f: int, use_fp8: bool) -> nn.Module:
+    if use_fp8:
+        return FP8Linear(in_f, out_f)
+    return nn.Linear(in_f, out_f, bias=False)
+
+
 class Expert(nn.Module):
-    def __init__(self, n_embd: int, hidden_dim: int, dropout: float = 0.0):
+    def __init__(self, n_embd: int, hidden_dim: int, dropout: float = 0.0,
+                 use_fp8: bool = False):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, hidden_dim, bias=False),
+            _maybe_fp8(n_embd, hidden_dim, use_fp8),
             nn.GELU(),
-            nn.Linear(hidden_dim, n_embd, bias=False),
+            _maybe_fp8(hidden_dim, n_embd, use_fp8),
             nn.Dropout(dropout),
         )
 
@@ -91,11 +180,12 @@ class Expert(nn.Module):
 
 
 class SharedExpert(nn.Module):
-    def __init__(self, n_embd: int, hidden_dim: int, dropout: float = 0.0):
+    def __init__(self, n_embd: int, hidden_dim: int, dropout: float = 0.0,
+                 use_fp8: bool = False):
         super().__init__()
-        self.w1      = nn.Linear(n_embd, hidden_dim, bias=False)
-        self.w3      = nn.Linear(n_embd, hidden_dim, bias=False)
-        self.w2      = nn.Linear(hidden_dim, n_embd, bias=False)
+        self.w1      = _maybe_fp8(n_embd, hidden_dim, use_fp8)
+        self.w3      = _maybe_fp8(n_embd, hidden_dim, use_fp8)
+        self.w2      = _maybe_fp8(hidden_dim, n_embd, use_fp8)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -134,12 +224,15 @@ class DeepSeekMoELayer(nn.Module):
         self.threshold_min     = 0.15
         self.top_k_min         = 1
 
+        _fp8 = getattr(config, "use_fp8", False)
         self.shared_experts = nn.ModuleList([
-            SharedExpert(config.d_model, config.moe_shared_hidden, dropout=config.dropout)
+            SharedExpert(config.d_model, config.moe_shared_hidden,
+                         dropout=config.dropout, use_fp8=_fp8)
             for _ in range(config.ds_moe_n_shared_experts)
         ])
         self.routed_experts = nn.ModuleList([
-            Expert(config.d_model, config.moe_routed_hidden, dropout=config.dropout)
+            Expert(config.d_model, config.moe_routed_hidden,
+                   dropout=config.dropout, use_fp8=_fp8)
             for _ in range(self.n_routed_experts)
         ])
 
@@ -302,6 +395,105 @@ class DeepSeekMoELayer(nn.Module):
         counts = torch.bincount(valid.view(-1), minlength=self.n_routed_experts).float()
         self.router_bias += self.bias_update_gamma * (counts.mean() - counts).sign()
         self.router_indices = None
+
+
+class HashMoELayer(nn.Module):
+    """Hash MoE routing deterministico senza router learnable.
+
+    [v0.7-HASH] Ogni token viene assegnato a top_k expert via hash
+    deterministico del suo indice globale nel batch.
+    Hash: expert_id = (token_idx * prime + k * 7919) % n_routed_experts
+
+    Vantaggi rispetto a DeepSeekMoELayer:
+    - Nessun router da addestrare (elimina router.weight + router_t.weight)
+    - Nessun topk, nessun searchsorted
+    - Load perfettamente bilanciato per costruzione
+
+    Svantaggi:
+    - Nessuna specializzazione semantica degli expert
+    - Interfaccia identica a DeepSeekMoELayer.
+    """
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.n_routed_experts = config.moe_n_routed_experts
+        self.top_k            = config.moe_top_k
+        self.router_indices: Optional[torch.Tensor] = None
+
+        _fp8 = getattr(config, "use_fp8", False)
+        self.shared_experts = nn.ModuleList([
+            SharedExpert(config.d_model, config.moe_shared_hidden,
+                         dropout=config.dropout, use_fp8=_fp8)
+            for _ in range(config.ds_moe_n_shared_experts)
+        ])
+        self.routed_experts = nn.ModuleList([
+            Expert(config.d_model, config.moe_routed_hidden,
+                   dropout=config.dropout, use_fp8=_fp8)
+            for _ in range(self.n_routed_experts)
+        ])
+        self._hash_prime = self._find_prime(self.n_routed_experts + 1)
+
+    @staticmethod
+    def _find_prime(n: int) -> int:
+        def is_prime(x: int) -> bool:
+            if x < 2: return False
+            for i in range(2, int(x**0.5) + 1):
+                if x % i == 0: return False
+            return True
+        while not is_prime(n):
+            n += 1
+        return n
+
+    def forward(
+        self,
+        x:            torch.Tensor,
+        t_emb:        torch.Tensor,
+        t_normalized: Optional[float] = None,
+    ) -> torch.Tensor:
+        B, T, C = x.shape
+        N       = B * T
+        x_flat  = x.view(N, C)
+
+        if len(self.shared_experts) == 1:
+            shared_out = self.shared_experts[0](x_flat)
+        else:
+            shared_out = self.shared_experts[0](x_flat)
+            for e in self.shared_experts[1:]:
+                shared_out = shared_out + e(x_flat)
+            shared_out = shared_out * (1.0 / len(self.shared_experts))
+
+        token_ids = torch.arange(N, device=x.device)
+        output    = torch.zeros(N, C, dtype=x.dtype, device=x.device)
+
+        for k in range(self.top_k):
+            exp_ids = ((token_ids * self._hash_prime + k * 7919) % self.n_routed_experts)
+            self.router_indices = exp_ids.detach()
+            # Sort per expert per sfruttare locality
+            sort_idx   = exp_ids.argsort(stable=True)
+            sorted_exp = exp_ids[sort_idx]
+            sorted_tok = token_ids[sort_idx]
+            sorted_x   = x_flat[sort_idx]
+            boundaries = torch.searchsorted(
+                sorted_exp.contiguous(),
+                torch.arange(self.n_routed_experts + 1, device=x.device,
+                             dtype=sorted_exp.dtype).contiguous()
+            )
+            for exp_id in range(self.n_routed_experts):
+                s = boundaries[exp_id].item()
+                e = boundaries[exp_id + 1].item()
+                if s == e:
+                    continue
+                exp_out = self.routed_experts[exp_id](sorted_x[s:e])
+                output.index_add_(0, sorted_tok[s:e],
+                                  exp_out.to(output.dtype))
+
+        output = output / self.top_k
+        return ((shared_out + output) / (len(self.shared_experts) + 1)).view(B, T, C)
+
+    @torch.no_grad()
+    def update_bias(self) -> None:
+        """No-op -- Hash MoE non ha router bias."""
+        pass
 
 
 class RotaryEmbedding(nn.Module):
@@ -620,7 +812,10 @@ class JambaBlock(nn.Module):
         else:
             self.mixer = Mamba3Block(config)
 
-        self.moe = DeepSeekMoELayer(config)
+        if getattr(config, "use_hash_moe", False):
+            self.moe: nn.Module = HashMoELayer(config)
+        else:
+            self.moe = DeepSeekMoELayer(config)
 
     def forward(
         self,
@@ -1227,12 +1422,25 @@ class Harold(nn.Module):
     def update_router_biases(self):
         r"""Update all MoE router bias terms based on recent expert usage.
 
-        Chiama :meth:`DeepSeekMoELayer.update_bias` su ogni blocco. Deve essere
-        chiamato una volta per optimizer step durante il training.
+        Chiama update_bias() su ogni blocco -- no-op per HashMoELayer.
         """
         for block in self.blocks:
-            if isinstance(block.moe, DeepSeekMoELayer):
-                block.moe.update_bias()
+            moe = block.moe
+            update_fn = getattr(moe, "update_bias", None)
+            if callable(update_fn):
+                update_fn()
+
+    @torch.no_grad()
+    def update_fp8_weights(self) -> None:
+        """Requantizza tutti i FP8Linear dopo un optimizer step.
+
+        [v0.7-FP8] I pesi bf16 vengono aggiornati dall'optimizer ma i buffer
+        weight_fp8 e scale_w rimangono stantii. Riallinea entrambi.
+        No-op se use_fp8=False (nessun FP8Linear nel modello).
+        """
+        for m in self.modules():
+            if isinstance(m, FP8Linear):
+                m.update_weight_fp8()
 
 
 def build_model(model_cfg: ModelConfig) -> Harold:
