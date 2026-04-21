@@ -120,7 +120,7 @@ model     = build_model(model_cfg).cuda().bfloat16()
 model.load_state_dict(state["model_state"])
 model.eval()
 
-tokenizer = AutoTokenizer.from_pretrained("NousResearch/Llama-2-7b-hf")
+tokenizer = AutoTokenizer.from_pretrained("JHN-MACHINE/harold")
 tokenizer.pad_token = tokenizer.eos_token
 
 sampler = build_sampler(model, n_steps=32, freeze_threshold=0.9, cfg_scale=3.0)

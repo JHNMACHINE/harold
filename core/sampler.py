@@ -555,7 +555,7 @@ Esempi:
     parser.add_argument("--device",           type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--tokenizer",        type=str,
-                        default="NousResearch/Llama-2-7b-hf")
+                        default="JHN-MACHINE/harold")
     parser.add_argument("--quiet",            action="store_true")
     return parser.parse_args()
 

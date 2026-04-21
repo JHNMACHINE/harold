@@ -122,7 +122,7 @@ class TrainConfig:
 
     self_cond_prob:     float = 0.5
     ce_loss_weight:     float = 0.1
-    tokenizer_model:    str   = "NousResearch/Llama-2-7b-hf"
+    tokenizer_model:    str   = "JHN-MACHINE/harold"
     stream_buffer_size: int   = 5000
     val_every:          int   = 200
 
@@ -247,7 +247,7 @@ class SFTConfig:
     cfg_scale:     float = 3.0
     ce_loss_weight:  float = 0.1
     self_cond_prob:  float = 0.5
-    tokenizer_model: str   = "NousResearch/Llama-2-7b-hf"
+    tokenizer_model:    str   = "JHN-MACHINE/harold"
     val_every:       int   = 200
     stage2_max_iters: int   = 5000
     stage2_lr:        float = 2e-6
