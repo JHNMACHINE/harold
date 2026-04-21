@@ -7,7 +7,7 @@ import torch
 from typing import Optional
 
 HF_FILENAME:  str = "harold-3B.pt"
-HF_REPO_ID:   str = "JHN-MACHINE/harold"
+HF_REPO_ID:   str = "JHN-MACHINE/harold-v0.7-training"
 MAX_SKIP_RATIO = 10
 
 @dataclass

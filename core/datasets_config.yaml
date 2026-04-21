@@ -18,20 +18,23 @@
 # Pretraining
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Mix aggiornato per Harold v0.7 (3B):
-#   - FineWeb-Edu + Wikipedia + C4: base general-purpose di alta qualità
-#   - SlimPajama: diversità tematica e stilistica
-#   - arxiv: paper scientifici, coerenza long-form su seq_len=4096
-#   - pg19: libri Project Gutenberg, coerenza su sequenze lunghe
-#   - github-code: sostituisce python_code — dataset pubblico, grande e vario
-#                  codeparrot/github-code copre 30+ linguaggi, non si esaurisce
-#                  config=Python per mantenere focus simile al precedente
-#   - open-web-math: sostituisce openmath — matematica da CommonCrawl,
-#                    molto più varia e meno ripetitiva di OpenMathInstruct
+# Mix aggiornato per Harold v0.7 — target: edge/IoT deployment
 #
-# Rimosso: python_code (flytech/python-codes-25k — 25k esempi, troppo piccolo)
-# Rimosso: openmath (nvidia/OpenMathInstruct-1 — troppo strutturato per pretrain)
-# Nota: bigcode/starcoderdata è gated — sostituito con codeparrot/github-code
+# Obiettivo: modello ottimizzato per assistenti embedded su dispositivi
+# piccoli (smartphone, microcontroller, Raspberry Pi, Jetson).
+# Il mix privilegia codice (logica, scripting, sistemi embedded) rispetto
+# a contenuto lungo e letterario (pg19, arxiv ridotti drasticamente).
+#
+# Modifiche rispetto al mix general-purpose precedente:
+#   + github-code: 3% → 25%  (codice Python, JS, C, C++, Rust, Bash)
+#   + the-stack-c-rust: nuovo — linguaggi embedded e sistemi
+#   - pg19: 12% → 2%          (narrativa lunga, non utile per edge)
+#   - arxiv: 9% → 3%          (paper accademici, meno rilevanti)
+#   - slimpajama: 20% → 15%   (diversità mantenuta ma ridotta)
+#   - c4: 13% → 10%           (web text generale ridotto)
+#   - wikipedia: 15% → 10%    (conoscenza fattuale base mantenuta)
+#   - fineweb: 25% → 20%      (qualità alta ma ridotto per fare spazio)
+#   + open-web-math: 3% → 5%  (ragionamento matematico utile per logica IoT)
 
 pretraining:
 
@@ -40,64 +43,101 @@ pretraining:
     config: CC-MAIN-2024-10
     split: train
     text_field: text
-    weight: 0.25
+    weight: 0.20
 
   - name: wikipedia
     path: wikimedia/wikipedia
     config: 20231101.en
     split: train
     text_field: text
-    weight: 0.15
+    weight: 0.10
 
   - name: slimpajama
     path: DKYoon/SlimPajama-6B
     split: train
     text_field: text
-    weight: 0.20
+    weight: 0.15
 
   - name: c4
     path: allenai/c4
     config: en
     split: train
     text_field: text
-    weight: 0.13
+    weight: 0.10
 
   - name: arxiv
     path: ccdv/arxiv-summarization
     split: train
     text_field: article
-    weight: 0.09
+    weight: 0.03
 
   - name: pg19
     path: emozilla/pg19
     split: train
     text_field: text
-    weight: 0.12
+    weight: 0.02
 
-  - name: macrocosm-os
+  # Codice generale — 30+ linguaggi, grande e non esauribile
+  # Focus principale per edge/IoT: logica, scripting, API calls
+  - name: github-code
     path: macrocosm-os/code-parrot-github-code
     split: train
     text_field: content
+    weight: 0.25
+
+  # Linguaggi sistemi/embedded: C, C++, Rust, Bash, Go
+  # Critici per IoT: driver, firmware, microcontroller code
+  - name: the-stack-systems
+    path: bigcode/the-stack-dedup
+    config: C
+    split: train
+    text_field: content
+    weight: 0.05
+
+  - name: the-stack-cpp
+    path: bigcode/the-stack-dedup
+    config: C++
+    split: train
+    text_field: content
     weight: 0.03
+
+  - name: the-stack-rust
+    path: bigcode/the-stack-dedup
+    config: Rust
+    split: train
+    text_field: content
+    weight: 0.02
 
   - name: open_web_math
     path: open-web-math/open-web-math
     split: train
     text_field: text
-    weight: 0.03
+    weight: 0.05
+
+# Totale pesi pretraining: 1.00
+# fineweb(0.20) + wikipedia(0.10) + slimpajama(0.15) + c4(0.10) +
+# arxiv(0.03) + pg19(0.02) + github-code(0.25) + the-stack-c(0.05) +
+# the-stack-cpp(0.03) + the-stack-rust(0.02) + math(0.05) = 1.00
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SFT (Supervised Fine-Tuning)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Mix invariato da v0.6 — già ottimale per 2025-2026.
+# Mix aggiornato per target edge/IoT:
+#   + glaive-code-assistant: nuovo — Q&A su codice, ideale per assistente embedded
+#   + oss-instruct: nuovo — istruzioni su codice open-source reale
+#   - openorca ridotto per fare spazio a dataset code-focused
+#
+# L'obiettivo SFT è un assistente che risponde a domande tecniche,
+# scrive codice per sistemi embedded, e interagisce in modo conciso
+# (importante su device con risorse limitate).
 
 sft:
 
   - name: ultrafeedback
     path: HuggingFaceH4/ultrafeedback_binarized
     split: train_sft
-    weight: 0.35
+    weight: 0.25
     structure: multiturn
     fields:
       messages: messages
@@ -108,7 +148,7 @@ sft:
   - name: tulu3
     path: allenai/tulu-3-sft-mixture
     split: train
-    weight: 0.30
+    weight: 0.25
     structure: multiturn
     fields:
       messages: messages
@@ -119,7 +159,7 @@ sft:
   - name: magpie_ultra
     path: argilla/magpie-ultra-v0.1
     split: train
-    weight: 0.15
+    weight: 0.10
     structure: pairs
     fields:
       context: instruction
@@ -128,9 +168,32 @@ sft:
   - name: openorca
     path: Open-Orca/OpenOrca
     split: train
-    weight: 0.20
+    weight: 0.10
     structure: pairs
     fields:
       context: [system_prompt, question]
       separator: " User: "
       response: response
+
+  # Codice e sistemi — priorità per assistente edge/IoT
+  - name: glaive-code-assistant
+    path: glaiveai/glaive-code-assistant-v3
+    split: train
+    weight: 0.20
+    structure: pairs
+    fields:
+      context: question
+      response: answer
+
+  - name: oss-instruct
+    path: ise-uiuc/Magicoder-OSS-Instruct-75K
+    split: train
+    weight: 0.10
+    structure: pairs
+    fields:
+      context: problem
+      response: solution
+
+# Totale pesi SFT: 1.00
+# ultrafeedback(0.25) + tulu3(0.25) + magpie(0.10) +
+# openorca(0.10) + glaive-code(0.20) + oss-instruct(0.10) = 1.00
