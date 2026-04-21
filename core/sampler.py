@@ -65,11 +65,11 @@ PROBE_STEPS      = 4
 VAR_THRESHOLD_LO = 0.05
 VAR_THRESHOLD_HI = 0.15
 
-HF_REPO_ID      = "JHN-MACHINE/harold-v0.7"
-HF_SFT_PT       = "harold-v0.7-3B-sft.pt"
-HF_SFT_SF       = "harold-v0.7-3B-sft.safetensors"
-DEFAULT_CKPT_SF = "harold-v0.7-3B-sft.safetensors"
-DEFAULT_CKPT_PT = "harold-v0.7-3B-sft.pt"
+HF_REPO_ID      = "JHN-MACHINE/harold-v0.7-training"
+HF_SFT_PT       = "Harold-v0.7-3B-SFT.pt"
+HF_SFT_SF       = "Harold-v0.7-3B-SFT.safetensors"
+DEFAULT_CKPT_SF = "Harold-v0.7-3B-SFT.safetensors"
+DEFAULT_CKPT_PT = "Harold-v0.7-3B-SFT.pt"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
