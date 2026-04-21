@@ -462,7 +462,7 @@ def main() -> int:
         ),
     )
     parser.add_argument(
-        "--tokenizer-source", type=str, default="NousResearch/Llama-2-7b-hf",
+        "--tokenizer-source", type=str, default="JHN-MACHINE/harold",
         help="HuggingFace repo ID to snapshot the tokenizer from.",
     )
     parser.add_argument(

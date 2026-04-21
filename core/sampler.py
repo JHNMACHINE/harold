@@ -65,11 +65,10 @@ PROBE_STEPS      = 4
 VAR_THRESHOLD_LO = 0.05
 VAR_THRESHOLD_HI = 0.15
 
-HF_REPO_ID      = "JHN-MACHINE/harold-v0.7-training"
-HF_SFT_PT       = "Harold-v0.7-3B-SFT.pt"
-HF_SFT_SF       = "Harold-v0.7-3B-SFT.safetensors"
-DEFAULT_CKPT_SF = "Harold-v0.7-3B-SFT.safetensors"
-DEFAULT_CKPT_PT = "Harold-v0.7-3B-SFT.pt"
+HF_REPO_ID      = "JHN-MACHINE/harold"
+HF_TOKENIZER_ID = "JHN-MACHINE/harold"
+CKPT_SF         = "harold-v0.7-3B-base.safetensors"
+CKPT_PT         = "harold-v0.7-3B-base.pt"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,7 +98,7 @@ def _download_from_hf(filename: str, local_path: str) -> bool:
 
 
 def load_model(
-    checkpoint_path: str         = DEFAULT_CKPT_SF,
+    checkpoint_path: str         = CKPT_SF,
     device:          str         = "cuda",
     dtype:           torch.dtype = torch.bfloat16,
 ) -> Harold:
@@ -108,22 +107,22 @@ def load_model(
 
     Ordine di ricerca:
       1. Path locale fornito (se esiste)
-      2. .safetensors locale (DEFAULT_CKPT_SF)
+      2. .safetensors locale (CKPT_SF)
       3. Download .safetensors da HuggingFace
-      4. .pt locale (DEFAULT_CKPT_PT)
+      4. .pt locale (CKPT_PT)
       5. Download .pt da HuggingFace
     """
     path_to_use = checkpoint_path
 
     if not os.path.isfile(path_to_use):
-        if os.path.isfile(DEFAULT_CKPT_SF):
-            path_to_use = DEFAULT_CKPT_SF
-        elif _download_from_hf(HF_SFT_SF, DEFAULT_CKPT_SF):
-            path_to_use = DEFAULT_CKPT_SF
-        elif os.path.isfile(DEFAULT_CKPT_PT):
-            path_to_use = DEFAULT_CKPT_PT
-        elif _download_from_hf(HF_SFT_PT, DEFAULT_CKPT_PT):
-            path_to_use = DEFAULT_CKPT_PT
+        if os.path.isfile(CKPT_SF):
+            path_to_use = CKPT_SF
+        elif _download_from_hf(CKPT_SF, CKPT_SF):
+            path_to_use = CKPT_SF
+        elif os.path.isfile(CKPT_PT):
+            path_to_use = CKPT_PT
+        elif _download_from_hf(CKPT_PT, CKPT_PT):
+            path_to_use = CKPT_PT
         else:
             raise FileNotFoundError(
                 f"Checkpoint non trovato: {checkpoint_path}\n"
@@ -264,16 +263,16 @@ class SamplerConfig:
         use_heun (bool): usa Heun invece di Euler. Default: ``False``
         t_min (float): timestep minimo. Default: ``1e-3``
     """
-    min_steps:        int            = MIN_STEPS
-    max_steps:        int            = MAX_STEPS
-    cfg_scale:        float          = 3.0
-    self_cond:        bool           = True
-    iterative:        bool           = True
-    freeze_threshold: float          = 0.9
+    min_steps:        int             = MIN_STEPS
+    max_steps:        int             = MAX_STEPS
+    cfg_scale:        float           = 3.0
+    self_cond:        bool            = True
+    iterative:        bool            = True
+    freeze_threshold: float           = 0.9
     freeze_ratio:     Optional[float] = None
-    confidence_temp:  float          = 0.5
-    use_heun:         bool           = False
-    t_min:            float          = 1e-3
+    confidence_temp:  float           = 0.5
+    use_heun:         bool            = False
+    t_min:            float           = 1e-3
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -285,12 +284,12 @@ def sample(
     model:        Harold,
     tokenizer,
     prompt:       str,
-    max_len:      int                    = 256,
+    max_len:      int                     = 256,
     cfg:          Optional[SamplerConfig] = None,
-    device:       str                    = "cuda",
-    dtype:        torch.dtype            = torch.bfloat16,
-    pad_token_id: int                    = 0,
-    verbose:      bool                   = True,
+    device:       str                     = "cuda",
+    dtype:        torch.dtype             = torch.bfloat16,
+    pad_token_id: int                     = 0,
+    verbose:      bool                    = True,
 ) -> str:
     r"""sample(model, tokenizer, prompt, max_len=256, ...) -> str
 
@@ -314,7 +313,7 @@ def sample(
     if cfg is None:
         cfg = SamplerConfig()
 
-    t_start        = time.time()
+    t_start         = time.time()
     autocast_device = device.split(":")[0]
 
     # 1. Tokenizza e calcola ctx_emb
@@ -325,8 +324,8 @@ def sample(
     null_emb   = torch.zeros_like(ctx_emb)
 
     # 2. Inizializza x_T ~ N(0, I)
-    B, L, D  = 1, max_len, model.d_model
-    x_t      = torch.randn(B, L, D, device=device, dtype=dtype)
+    B, L, D = 1, max_len, model.d_model
+    x_t     = torch.randn(B, L, D, device=device, dtype=dtype)
 
     # 3. Stato iterative decoding
     frozen   = torch.zeros(B, L, dtype=torch.bool, device=device)
@@ -381,10 +380,10 @@ def sample(
                 for b in range(B):
                     cand_idx = candidate[b].nonzero(as_tuple=False).view(-1)
                     if cand_idx.numel() > max_freeze:
-                        top_idx         = conf[b][cand_idx].topk(max_freeze).indices
-                        mask            = torch.zeros_like(candidate[b])
+                        top_idx                 = conf[b][cand_idx].topk(max_freeze).indices
+                        mask                    = torch.zeros_like(candidate[b])
                         mask[cand_idx[top_idx]] = True
-                        candidate[b]    = mask
+                        candidate[b]            = mask
 
             if candidate.any():
                 best_tokens         = ce_logits.argmax(dim=-1)
@@ -400,8 +399,8 @@ def sample(
                 x_euler = x_t + dt * vel
                 with torch.autocast(device_type=autocast_device, dtype=dtype):
                     x0_2, _, _ = model(x_euler, t_n, self_cond=self_cond, ctx_emb=ctx_emb)
-                vel_2   = x0_to_velocity(x_euler, x0_2, t_n)
-                x_t     = x_t + dt * (0.5 * (vel + vel_2))
+                vel_2 = x0_to_velocity(x_euler, x0_2, t_n)
+                x_t   = x_t + dt * (0.5 * (vel + vel_2))
             else:
                 x_t = x_t + dt * vel
 
@@ -498,10 +497,10 @@ def generate_with_trajectory(
 
         n_frozen = frozen.sum().item()
         trajectory.append({
-            "step":         step,
-            "t":            t_val,
-            "n_frozen":     n_frozen,
-            "pct_frozen":   100.0 * n_frozen / L,
+            "step":          step,
+            "t":             t_val,
+            "n_frozen":      n_frozen,
+            "pct_frozen":    100.0 * n_frozen / L,
             "tokens_so_far": model.decode_tokens(
                 torch.where(frozen.unsqueeze(-1), x_frozen, x_t)
             ).cpu(),
@@ -539,7 +538,7 @@ Esempi:
         """,
     )
     parser.add_argument("--prompt",           type=str,   required=True)
-    parser.add_argument("--checkpoint",       type=str,   default=DEFAULT_CKPT_SF)
+    parser.add_argument("--checkpoint",       type=str,   default=CKPT_SF)
     parser.add_argument("--max_len",          type=int,   default=256)
     parser.add_argument("--cfg_scale",        type=float, default=3.0)
     parser.add_argument("--min_steps",        type=int,   default=MIN_STEPS)
@@ -554,14 +553,13 @@ Esempi:
                         help="Usa ODE solver Heun invece di Euler (2x forward/step)")
     parser.add_argument("--device",           type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--tokenizer",        type=str,
-                        default="JHN-MACHINE/harold")
+    parser.add_argument("--tokenizer",        type=str,   default=HF_TOKENIZER_ID)
     parser.add_argument("--quiet",            action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
-    args  = parse_args()
+    args   = parse_args()
     device = args.device
     dtype  = torch.bfloat16 if device.startswith("cuda") else torch.float32
 

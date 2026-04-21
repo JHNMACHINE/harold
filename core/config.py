@@ -6,7 +6,7 @@ import json
 import torch
 from typing import Optional
 
-HF_FILENAME:  str = "Harold-v0.7-3B-Base.pt"
+HF_FILENAME:  str = "Harold-v0.7-3B-base.pt"
 HF_REPO_ID:   str = "JHN-MACHINE/harold-v0.7-training"
 MAX_SKIP_RATIO = 10
 

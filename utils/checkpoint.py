@@ -1,5 +1,5 @@
 """
-Harold v0.6 — checkpoint.py
+Harold v0.7 — checkpoint.py
 ============================
 Gestione centralizzata dei checkpoint per pretraining e SFT.
 
@@ -17,7 +17,8 @@ SFT:
   stage, iter_num, best_val, train_losses, val_losses = load_checkpoint(..., load_stage=True)
 
 Upload HuggingFace:
-  .pt e .safetensors vengono caricati in parallelo su thread separati.
+  Solo .pt viene caricato sul repository privato di training (JHN-MACHINE/harold-v0.7-training).
+  La conversione e il publish dei .safetensors sul repository pubblico è delegata a publish_release.py.
 """
 
 import glob
@@ -28,9 +29,9 @@ from typing import Union
 
 import torch
 import torch.nn as nn
-from safetensors.torch import save_model
 
 from core.config import HF_FILENAME, HF_REPO_ID
+
 
 def ensure_disk_space(
     required_gb:    float = 20.0,
@@ -43,34 +44,35 @@ def ensure_disk_space(
     cancella checkpoint periodici vecchi e file .tmp corrotti.
     """
     import shutil
- 
+
     def free_gb() -> float:
         return shutil.disk_usage(checkpoint_dir).free / (1024 ** 3)
- 
+
     if free_gb() >= required_gb:
         return
- 
+
     print(f"  WARNING: spazio disco insufficiente ({free_gb():.1f}GB liberi, richiesti {required_gb:.1f}GB)")
- 
+
     pat = (os.path.join(checkpoint_dir, f"{prefix}_s{stage}_[0-9]*.pt")
            if stage is not None else
            os.path.join(checkpoint_dir, f"{prefix}_[0-9]*.pt"))
- 
+
     for ckpt in sorted(glob.glob(pat)):
         if free_gb() >= required_gb:
             break
         sz = os.path.getsize(ckpt) / (1024 ** 3)
         os.remove(ckpt)
         print(f"  Liberato {sz:.1f}GB — rimosso {os.path.basename(ckpt)}")
- 
+
     for tmp in glob.glob(os.path.join(checkpoint_dir, "*.tmp")):
         if free_gb() >= required_gb:
             break
         sz = os.path.getsize(tmp) / (1024 ** 3)
         os.remove(tmp)
         print(f"  Liberato {sz:.1f}GB — rimosso {os.path.basename(tmp)}")
- 
+
     print(f"  Spazio disponibile dopo cleanup: {free_gb():.1f}GB")
+
 
 def cleanup_old_checkpoints(
     checkpoint_dir:    str,
@@ -95,42 +97,23 @@ def cleanup_old_checkpoints(
         print(f"  Rimosso checkpoint vecchio: {os.path.basename(old)}")
 
 
-def _upload_pt(path: str, api: object, hf_repo_id: str, hf_token: str) -> None:
-    """Upload del checkpoint .pt completo su HuggingFace."""
+def _upload_pt(path: str, api: object, hf_token: str) -> None:
+    """Upload del checkpoint .pt su HuggingFace (repo privato di training)."""
     try:
         api.upload_file(                                     # type: ignore[attr-defined]
             path_or_fileobj=path,
             path_in_repo=HF_FILENAME,
-            repo_id=hf_repo_id, repo_type="model", token=hf_token,
+            repo_id=HF_REPO_ID, repo_type="model", token=hf_token,
         )
-        print(f"  OK HuggingFace -> {hf_repo_id}/{HF_FILENAME}")
+        print(f"  OK HuggingFace -> {HF_REPO_ID}/{HF_FILENAME}")
     except BaseException as e:
         print(f"  WARNING Errore upload .pt: {e}")
 
 
-def _upload_safetensors(
-    path: str, model: nn.Module, api: object, hf_repo_id: str, hf_token: str,
-) -> None:
-    """Salva e carica i pesi in .safetensors su HuggingFace, poi rimuove il file locale."""
-    try:
-        sf_filename = HF_FILENAME.replace(".pt", ".safetensors")
-        sf_path     = path.replace(".pt", ".safetensors")
-        save_model(model, sf_path)
-        api.upload_file(                                     # type: ignore[attr-defined]
-            path_or_fileobj=sf_path,
-            path_in_repo=sf_filename,
-            repo_id=hf_repo_id, repo_type="model", token=hf_token,
-        )
-        os.remove(sf_path)
-        print(f"  OK HuggingFace -> {hf_repo_id}/{sf_filename}")
-    except BaseException as e:
-        print(f"  WARNING Errore upload .safetensors: {e}")
-
-
-def _push_to_hf(path: str, model: nn.Module, wait: bool) -> None:
+def _push_to_hf(path: str, wait: bool) -> None:
     """
-    Upload su HuggingFace in thread separati (uno per .pt, uno per .safetensors).
-    I due upload avvengono in parallelo per sfruttare i core CPU disponibili.
+    Upload .pt su HuggingFace in thread separato.
+    Solo repository privato di training — i .safetensors sono gestiti da publish_release.py.
     """
     def _push() -> None:
         try:
@@ -145,22 +128,7 @@ def _push_to_hf(path: str, model: nn.Module, wait: bool) -> None:
                 repo_id=HF_REPO_ID, repo_type="model",
                 exist_ok=True, token=hf_token,
             )
-
-            # Lancia i due upload in parallelo
-            t_pt = threading.Thread(
-                target=_upload_pt,
-                args=(path, api, HF_REPO_ID, hf_token),
-                daemon=True,
-            )
-            t_sf = threading.Thread(
-                target=_upload_safetensors,
-                args=(path, model, api, HF_REPO_ID, hf_token),
-                daemon=True,
-            )
-            t_pt.start()
-            t_sf.start()
-            t_pt.join()
-            t_sf.join()
+            _upload_pt(path, api, hf_token)
 
         except BaseException as e:
             print(f"  WARNING Errore push HuggingFace: {e}")
@@ -197,7 +165,7 @@ def save_checkpoint(
     stage=None -> pretraining (cfg = TrainConfig, chiave "train_cfg")
     stage=int  -> SFT (cfg = SFTConfig, chiave "sft_cfg", aggiunge "stage")
 
-    push_hf / wait_hf -> upload HuggingFace opzionale (.pt e .safetensors in parallelo)
+    push_hf / wait_hf -> upload .pt su HuggingFace (repo privato di training)
     """
     ckpt: dict = {
         "iter_num":     iter_num,
@@ -228,15 +196,10 @@ def save_checkpoint(
     os.replace(tmp, path)
 
     if not full:
-        # Usa il prefix senza il numero di iterazione
-        # es. "harold_v06_sft_s1_0001000.pt" -> prefix="harold_v06_sft", stage=1
-        # es. "harold_v06_0001000.pt"         -> prefix="harold_v06",     stage=None
         basename = os.path.basename(path)
         if stage is not None:
-            # Rimuovi "_s{stage}_{iter}.pt" dalla fine
             prefix = basename.split(f"_s{stage}_")[0]
         else:
-            # Rimuovi "_{iter}.pt" dalla fine
             prefix = "_".join(basename.replace(".pt", "").split("_")[:-1])
         cleanup_old_checkpoints(
             os.path.dirname(path), prefix,
@@ -244,7 +207,7 @@ def save_checkpoint(
         )
 
     if push_hf:
-        _push_to_hf(path, model, wait=wait_hf)
+        _push_to_hf(path, wait=wait_hf)
 
 
 def _default_result(load_stage: bool) -> tuple:
@@ -256,7 +219,7 @@ def _default_result(load_stage: bool) -> tuple:
 
 def _load_from_hf(path: str) -> bool:
     """
-    Scarica il checkpoint da HuggingFace e lo salva in path.
+    Scarica il checkpoint .pt da HuggingFace (repo privato di training).
     Ritorna True se il download è riuscito.
     """
     try:
@@ -292,7 +255,7 @@ def load_checkpoint(
 
     Ordine di ricerca:
       1. File locale in path
-      2. Download da HuggingFace (HF_REPO_ID/HF_FILENAME)
+      2. Download da HuggingFace (HF_REPO_ID/HF_FILENAME) — repo privato di training
       3. Riparte da zero
 
     load_stage=False -> (iter_num, best_val, train_losses, val_losses)
