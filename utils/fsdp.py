@@ -69,7 +69,7 @@ def _get_Harold_wrap_policy():
         # time_emb, self_cond_proj, cfg_proj, x0_pred, ce_head contengono
         # Linear non wrappati che finiscono nel root FSDP — shardati in 1D.
         # F.linear richiede weight 2D -> RuntimeError: mat2 must be matrix.
-        return ModuleWrapPolicy({JambaBlock, nn.Embedding, nn.Linear})
+        return ModuleWrapPolicy({JambaBlock, nn.Embedding, nn.Linear, nn.LayerNorm})
     except ImportError:
         # Fallback: size-based policy se JambaBlock non importabile
         from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
