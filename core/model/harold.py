@@ -170,33 +170,29 @@ class Harold(nn.Module):
         the sequence through :attr:`blocks` (interleaved Mamba3 and
         :class:`BlockCausalAttention`, each followed by a MoE layer).
 
-        The output head predicts :math:`\hat{x}_0` directly. The CE logits
+        The output head predicts :math:`\\hat{x}_0` directly. The CE logits
         are computed from ``ce_head(x0_pred)`` rather than an intermediate
         hidden state, keeping the two predictions consistent.
 
         Args:
-            x_t: noisy embeddings, shape :math:`(B, L, d\_model)`
+            x_t: noisy embeddings, shape :math:`(B, L, d\\_model)`
             t: timesteps in :math:`[0, 1]`, shape :math:`(B,)`
-            self_cond: averaged :math:`\hat{x}_0` from the previous sampling
-                step, shape :math:`(B, d\_model)`, or ``None``.
+            self_cond: averaged :math:`\\hat{x}_0` from the previous sampling
+                step, shape :math:`(B, d\\_model)`, or ``None``.
             ctx_emb: context embedding for classifier-free guidance,
-                shape :math:`(B, d\_model)`, or ``None``.
+                shape :math:`(B, d\\_model)`, or ``None``.
             past_key_values: KV cache per attention layer, or ``None``.
             use_cache: if ``True``, return current KV states.
 
         Returns:
             A tuple ``(x0_pred, ce_logits, present_kvs)`` where:
-                - ``x0_pred`` has shape :math:`(B, L, d\_model)`
+                - ``x0_pred`` has shape :math:`(B, L, d\\_model)`
                 - ``ce_logits`` has shape :math:`(B, L, V+1)`
                 - ``present_kvs`` is a list of KV states or ``None``
         """
-        emb = self.get_timestep_embedding(t)
-        assert emb.dim() == 2, f"emb shape {emb.shape} is not 2D"
-        t_emb = self.time_emb(emb)
         kv_offset = past_key_values[0].shape[1] if past_key_values is not None else 0
-        x = x_t
 
-        t_emb = self.time_emb(self.get_timestep_embedding(t))
+        t_emb = self.time_emb(self.get_timestep_embedding(t))  # (B, d_model)
 
         if self_cond is not None:
             t_emb = t_emb + self.self_cond_proj(self_cond.detach())
@@ -206,6 +202,7 @@ class Harold(nn.Module):
 
         t_normalized = t.float().mean().item() if not self.training else None
 
+        x = x_t
         present_kvs: Optional[List] = [] if use_cache else None
 
         for i, block in enumerate(self.blocks):
@@ -213,8 +210,10 @@ class Harold(nn.Module):
 
             x, present_kv = block(
                 x, t_emb,
-                past_kv=past_kv, use_cache=use_cache,
-                kv_offset=kv_offset, t_normalized=t_normalized,
+                past_kv=past_kv,
+                use_cache=use_cache,
+                kv_offset=kv_offset,
+                t_normalized=t_normalized,
             )
 
             if present_kvs is not None:
