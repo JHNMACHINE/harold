@@ -297,8 +297,16 @@ class Harold(nn.Module):
         # Target is x0_emb itself — target_x0() would be an identity call.
 
         # Self-conditioning on previous x0 prediction (not velocity).
+        # Disabilitato con FSDP: il secondo forward() chiamato direttamente
+        # su self bypassa l unsharding automatico dei parametri FSDP,
+        # causando RuntimeError su pesi 1D shardati.
+        # Soluzione: usare self_cond_prob=0.0 in TrainConfig durante pretraining FSDP.
         self_cond: Optional[torch.Tensor] = None
-        if self_cond_prob > 0 and torch.rand(1).item() < self_cond_prob:
+        _fsdp_active = any(
+            "FullyShardedDataParallel" in type(m).__name__
+            for m in self.modules()
+        )
+        if self_cond_prob > 0 and not _fsdp_active and torch.rand(1).item() < self_cond_prob:
             with torch.no_grad():
                 x0_prev, _, _ = self.forward(x_t, t, self_cond=None, ctx_emb=None)
             self_cond = x0_prev.mean(dim=1).detach()
