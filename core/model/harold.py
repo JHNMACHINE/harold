@@ -357,7 +357,8 @@ class Harold(nn.Module):
             x0_norms = x0_masked.norm(dim=-1)             # (N_valid,)
             x0_norm_mean = x0_norms.mean().item()
             x0_norm_std = x0_norms.std().item() if x0_norms.numel() > 1 else 0.0
-            x0_var_tokens = x0_pred.var(dim=1).mean().item()
+            # var su tutto (B,L,d) e costoso — campiona 1 ogni 4 token
+            x0_var_tokens = x0_pred[:, ::4, :].var(dim=1).mean().item()
 
         return total, {
             "score":         loss_score.item(),
