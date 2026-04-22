@@ -79,7 +79,7 @@ class ModelConfig:
     # [v0.7-OPT-GC] Gradient checkpointing — riduce attivazioni ~50%, permette batch più grandi.
     # Costo: ~33% compute extra per il recompute nel backward.
     # Default False; True per full run su B200 con seq_len=4096.
-    use_gradient_checkpointing: bool = False
+    use_gradient_checkpointing: bool = True
 
     # [v0.7-FP8] FP8 per linear layers — riduce memoria del 50% e aumenta throughput.
     # Usa _scaled_mm con scale dinamica. Compatibile con PyTorch 2.1+ su Hopper/Blackwell.
