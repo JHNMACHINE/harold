@@ -225,7 +225,8 @@ def load_fsdp_checkpoint(
     from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 
     if not os.path.isfile(path):
-        print("  Nessun checkpoint trovato — parto da zero.")
+        if is_main():
+            print("  Nessun checkpoint trovato — parto da zero.")
         return 0, float("inf"), [], []
 
     print(f"  Carico checkpoint FSDP: {path}")

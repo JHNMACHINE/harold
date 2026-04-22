@@ -31,6 +31,7 @@ import torch
 import torch.nn as nn
 
 from core.config import HF_FILENAME, HF_REPO_ID
+from utils.ddp import is_main
 
 
 def ensure_disk_space(
@@ -263,7 +264,8 @@ def load_checkpoint(
     """
     if not os.path.isfile(path):
         if not _load_from_hf(path):
-            print("  Nessun checkpoint trovato — parto da zero.")
+            if is_main():
+                print("  Nessun checkpoint trovato — parto da zero.")
             return _default_result(load_stage)
 
     print(f"Carico checkpoint: {path}")

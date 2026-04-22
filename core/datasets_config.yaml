@@ -30,6 +30,8 @@
 # Sostituzione: bigcode/starcoderdata — supporta data_dir per linguaggio,
 #   campo "content", 86 linguaggi, dedup + PII removal, no gating.
 #   Ref: load_dataset("bigcode/starcoderdata", data_dir="python", split="train")
+#
+# AGGIORNAMENTO v0.7.1: aggiunto C++ tramite data_dir="cpp"
 
 pretraining:
 
@@ -98,7 +100,14 @@ pretraining:
     data_dir: c
     split: train
     text_field: content
-    weight: 0.09
+    weight: 0.05      # Ridotto da 0.09 per fare spazio a C++
+
+  - name: starcoderdata-cpp
+    path: bigcode/starcoderdata
+    data_dir: cpp
+    split: train
+    text_field: content
+    weight: 0.04      # Aggiunto per copertura C++ (edge/IoT)
 
   - name: starcoderdata-rust
     path: bigcode/starcoderdata
@@ -129,10 +138,9 @@ pretraining:
 
 # Totale pesi pretraining: 1.00
 # fineweb(0.20) + wikipedia(0.10) + slimpajama(0.15) + c4(0.10) +
-# arxiv(0.03) + pg19(0.02) + python(0.12) + js(0.05) + c(0.09) +
-# rust(0.03) + go(0.03) + shell(0.03) + math(0.05) = 1.00
-# NOTA: c++ rimosso — data_dir "c++" non funziona su HF Hub (path encoding).
-# Il peso 4% è stato assorbito da C (0.05 → 0.09).
+# arxiv(0.03) + pg19(0.02) +
+# python(0.12) + js(0.05) + c(0.05) + cpp(0.04) + rust(0.03) + go(0.03) + shell(0.03) +
+# math(0.05) = 1.00
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SFT (Supervised Fine-Tuning)
