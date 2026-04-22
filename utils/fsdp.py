@@ -117,10 +117,7 @@ def wrap_model_fsdp(
 
     cpu_offload_policy = CPUOffload(offload_params=cpu_offload)
     wrap_policy        = _get_Harold_wrap_policy()
-    for name, param in model.named_parameters():
-        if param.dtype != torch.bfloat16:
-            #print(f"[FSDP] Casting {name} from {param.dtype} to bfloat16")
-            param.data = param.data.to(torch.bfloat16)
+    model = model.to(torch.bfloat16)
     model = FSDP(
         model,
         auto_wrap_policy     = wrap_policy,
