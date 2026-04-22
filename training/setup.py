@@ -181,7 +181,10 @@ def build_training_context(
     raw_model.schedule.warmup_buffer(size=4096, device=device)
 
     # ── Optimizer + scaler ────────────────────────────────────────────────
-    optimizer = build_optimizer(active_model, train_cfg)
+    # CRITICO: build_optimizer su raw_model, non active_model.
+    # Con FSDP i parametri sono appiattiti (dim==1) dopo il wrap —
+    # _is_muon_eligible richiede dim==2 → zero Muon se si passa active_model.
+    optimizer = build_optimizer(raw_model, train_cfg)
     scaler    = torch.GradScaler("cuda", enabled=train_cfg.use_scaler)
 
     # ── Dataset ───────────────────────────────────────────────────────────
