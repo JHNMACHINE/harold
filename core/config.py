@@ -99,22 +99,17 @@ def get_model_config() -> ModelConfig:
 
 @dataclass
 class TrainConfig:
-    # ── Run di test: 10k iter su H200 NVL (140GB) ────────────────────────────
-    # Modello 3.2B bf16: ~38GB overhead fisso (pesi+opt+grad)
-    # batch_size=4 + grad_accum=16 -> 64 seq/step effettivo (4096 tok/seq)
-    # Per full run 100k iter: max_iters=100_000, rivalutare lr a 1e-4
     batch_size:    int   = 4
     grad_accum:    int   = 16
-    max_iters:     int   = 10_000
+    max_iters:     int   = 10000
     seq_len:       int   = 4096
 
-    # lr scalato con sqrt(d_model/d_model_ref): 1e-4 * sqrt(1792/1280) ~ 1.18e-4
-    # Conservativo per run di test: 8e-5. Full run: rivalutare a 1e-4.
+
     lr:            float = 8e-5
-    min_lr:        float = 8e-6   # ratio min_lr/lr invariato (0.1x)
+    min_lr:        float = 8e-6   
 
     # warmup: 10% del run
-    warmup_iters:  int   = 1000
+    warmup_iters:  int   = 100
 
     eval_interval: int   = 200
     eval_iters:    int   = 20
@@ -129,7 +124,7 @@ class TrainConfig:
     checkpoint_dir:    str = "/workspace/checkpoints/v0.7"
     checkpoint_prefix: str = "harold_v07"
     preload:           str = "latest"
-    save_every:        int = 1000  # [v0.7-P3] un checkpoint ogni 10k iter
+    save_every:        int = 1000
 
     # torch.compile
     use_compile:  bool = True
