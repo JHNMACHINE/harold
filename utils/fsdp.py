@@ -37,7 +37,7 @@ Uso in setup.py:
 """
 
 import os
-from typing import Optional
+from typing import Optional, cast
 
 import torch
 import torch.nn as nn
@@ -141,6 +141,11 @@ def wrap_model_fsdp(
 
     cpu_offload_policy = CPUOffload(offload_params=cpu_offload)
     wrap_policy        = _get_Harold_wrap_policy()
+    # ignored_modules accetta solo nn.Module, non Tensor.
+    # ce_head.weight e tied a token_emb.weight — ignorando token_emb
+    # entrambi i parametri rimangono non-shardati.
+    ignored: set[nn.Module] = {cast(nn.Module, model.token_emb)}
+
     model = FSDP(
         model,
         auto_wrap_policy     = wrap_policy,
@@ -148,8 +153,9 @@ def wrap_model_fsdp(
         sharding_strategy    = ShardingStrategy.FULL_SHARD,
         cpu_offload          = cpu_offload_policy,
         device_id            = torch.device(f"cuda:{device_id}"),
-        sync_module_states   = True,   # broadcast pesi rank0 → tutti al wrap
-        use_orig_params      = True,   # necessario per torch.compile + FSDP
+        sync_module_states   = True,
+        use_orig_params      = True,
+        ignored_modules      = ignored,
     )
 
     return model
