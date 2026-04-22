@@ -115,7 +115,7 @@ class TrainConfig:
     eval_iters:    int   = 20
     max_grad_norm: float = 1.0
 
-    self_cond_prob:     float = 0.5
+    self_cond_prob:     float = 0.0
     ce_loss_weight:     float = 0.1
     tokenizer_model:    str   = "JHN-MACHINE/harold"
     stream_buffer_size: int   = 5000

@@ -192,16 +192,7 @@ class Harold(nn.Module):
         """
         kv_offset = past_key_values[0].shape[1] if past_key_values is not None else 0
 
-        t_emb_input = self.get_timestep_embedding(t)
-        if t_emb_input.dim() != 2:
-            raise RuntimeError(f"get_timestep_embedding output dim={t_emb_input.dim()} shape={t_emb_input.shape}, t shape={t.shape} t dtype={t.dtype}")
-        for i, layer in enumerate(self.time_emb):
-            import torch.nn as _nn
-            if isinstance(layer, _nn.Linear):
-                if layer.weight.dim() != 2:
-                    raise RuntimeError(f"time_emb[{i}].weight is {layer.weight.dim()}D shape={layer.weight.shape} — FSDP not unsharded?")
-            t_emb_input = layer(t_emb_input)
-        t_emb = t_emb_input
+        t_emb = self.time_emb(self.get_timestep_embedding(t))
 
         if self_cond is not None:
             t_emb = t_emb + self.self_cond_proj(self_cond.detach())
