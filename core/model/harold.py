@@ -138,6 +138,8 @@ class Harold(nn.Module):
         Returns:
             Embedding tensor, shape :math:`(B, d\_model)`.
         """
+        if t.dim() == 0:
+            t = t.unsqueeze(0)  # scalare -> (1,)
         args = (t.float() * 1000.0)[:, None] * self.t_freqs[None]   # (B, half)
         emb = torch.stack([torch.cos(args), torch.sin(args)], dim=-1)  # (B, half, 2)
         emb = emb.view(t.shape[0], -1)                               # (B, d_model)
