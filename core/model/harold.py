@@ -190,11 +190,9 @@ class Harold(nn.Module):
                 - ``ce_logits`` has shape :math:`(B, L, V+1)`
                 - ``present_kvs`` is a list of KV states or ``None``
         """
-        # DEBUG
-        print(f"[RANK {os.environ.get('RANK', '?')}] forward: t.shape = {t.shape}, dtype = {t.dtype}")
         emb = self.get_timestep_embedding(t)
-        print(f"[RANK {os.environ.get('RANK', '?')}] emb.shape = {emb.shape}")
-        raise RuntimeError("STOP HERE TO VERIFY CODE IS UPDATED")
+        assert emb.dim() == 2, f"emb shape {emb.shape} is not 2D"
+        t_emb = self.time_emb(emb)
         kv_offset = past_key_values[0].shape[1] if past_key_values is not None else 0
         x = x_t
 
