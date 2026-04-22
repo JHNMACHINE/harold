@@ -95,9 +95,7 @@ class Harold(nn.Module):
             for i in range(config.n_layers)
         ])
 
-        # [v0.7-F3] NormOut come modulo separato — evita che LayerNorm
-        # finisca nel root FSDP e venga shardato in 1D.
-        self.norm_out = nn.Sequential(nn.LayerNorm(config.d_model))
+        self.norm_out = nn.LayerNorm(config.d_model)
 
         # x0 head: predicts x0_emb directly.
         self.x0_pred = nn.Linear(config.d_model, config.d_model, bias=False)

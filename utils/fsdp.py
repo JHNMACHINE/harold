@@ -37,7 +37,6 @@ Uso in setup.py:
 """
 
 import os
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -145,7 +144,7 @@ def wrap_model_fsdp(
         model,
         auto_wrap_policy     = wrap_policy,
         mixed_precision      = mp_policy,
-        sharding_strategy    = ShardingStrategy.FULL_SHARD,
+        sharding_strategy    = ShardingStrategy.SHARD_GRAD_OP,
         cpu_offload          = cpu_offload_policy,
         device_id            = torch.device(f"cuda:{device_id}"),
         sync_module_states   = True,   # broadcast pesi rank0 → tutti al wrap
