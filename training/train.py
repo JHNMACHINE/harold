@@ -66,7 +66,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig) -> dict:
 
     pbar = tqdm(
         range(ctx.initial_iter, train_cfg.max_iters),
-        desc="Harold v0.7" + (" DDP" if ctx.use_ddp else ""),
+        desc="Harold v0.7" + (" FSDP" if getattr(train_cfg, "use_fsdp", False) else " DDP" if ctx.use_ddp else ""),
         disable=not ctx.main,
     )
 
