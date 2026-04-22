@@ -15,6 +15,14 @@ Cambiamenti rispetto a v0.6:
              - active_model e il modello FSDP, raw_model e lo stesso oggetto
                (FSDP non ha .module come DDP)
              Retrocompatibile: use_fsdp=False usa DDP come prima.
+  [v0.7-S4] Tokenizer download solo su rank 0, barrier per gli altri rank.
+             Evita race condition dove tutti i rank scaricano da HuggingFace
+             simultaneamente, causando errori intermittenti di connessione.
+  [v0.7-S5] Cast forzato a bfloat16 prima di FSDP wrapping.
+             FSDP richiede dtype uniforme per il flattening dei parametri.
+             Alcuni parametri (Mamba2 A_log/D, router bias) restano in fp32
+             dopo build_model(). Il cast esplicito evita:
+             ValueError: Must flatten tensors with uniform dtype
 """
 
 import os
@@ -22,6 +30,7 @@ from collections import deque
 from typing import Optional, Union, cast
 
 import torch
+import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoTokenizer
 
@@ -88,10 +97,19 @@ def build_training_context(
         torch.set_float32_matmul_precision("high")
 
     # ── Tokenizer ─────────────────────────────────────────────────────────
+    # [v0.7-S4] Solo rank 0 scarica il tokenizer, gli altri aspettano alla barrier.
+    # Dopo la barrier tutti caricano dalla cache locale.
+    if dist.is_initialized() and dist.get_rank() != 0:
+        dist.barrier()
+
     tokenizer = AutoTokenizer.from_pretrained(
         train_cfg.tokenizer_model,
         token=os.environ.get("HF_TOKEN"),
     )
+
+    if dist.is_initialized() and dist.get_rank() == 0:
+        dist.barrier()
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     pad_token_id = tokenizer.pad_token_id
@@ -108,6 +126,11 @@ def build_training_context(
 
     # ── Wrapping: FSDP / DDP / single-GPU ────────────────────────────────
     if use_fsdp and is_ddp():
+        # [v0.7-S5] FSDP richiede dtype uniforme per il flattening.
+        # Alcuni parametri (Mamba2 A_log/D, router bias) restano in fp32
+        # dopo build_model(). Cast tutto (parametri + buffer) a bf16.
+        model = model.to(torch.bfloat16)
+
         from utils.fsdp import wrap_model_fsdp
         active_model = wrap_model_fsdp(model, local_rank, mixed_precision=True)
         raw_model    = cast(Harold, active_model)
