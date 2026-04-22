@@ -158,6 +158,11 @@ def wrap_model_fsdp(
         ignored_modules      = ignored,
     )
 
+    # [v0.7-F6] ignored_modules non vengono spostati su GPU da FSDP —
+    # spostiamo token_emb manualmente dopo il wrap.
+    device = torch.device(f"cuda:{device_id}")
+    model.token_emb.to(device)
+
     return model
 
 
