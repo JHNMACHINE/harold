@@ -9,6 +9,7 @@
 #   split:      split HF da usare ("train", "train[:10%]", ecc.)
 #   text_field: campo del dataset contenente il testo
 #   weight:     proporzione nel mix (devono sommare a 1.0)
+#   data_dir:   (opzionale) subdirectory del dataset HF (per starcoderdata, ecc.)
 #   format:     (opzionale) handler speciale per formati non-standard
 #               valori: "standard" (default), "codecontests", "oasst2", "openorca"
 #
@@ -20,21 +21,15 @@
 #
 # Mix aggiornato per Harold v0.7 — target: edge/IoT deployment
 #
-# Obiettivo: modello ottimizzato per assistenti embedded su dispositivi
-# piccoli (smartphone, microcontroller, Raspberry Pi, Jetson).
-# Il mix privilegia codice (logica, scripting, sistemi embedded) rispetto
-# a contenuto lungo e letterario (pg19, arxiv ridotti drasticamente).
+# FIX rispetto alla versione precedente:
+#   - macrocosm-os/code-parrot-github-code: rimosso — config per linguaggio
+#     non supportato, campo "code" (non "content"), richiede languages=[] in Python
+#   - bigcode/the-stack-dedup con config "C"/"C++"/"Rust": rimosso — usa
+#     data_dir="data/c" non config, e richiede accettazione licenza gated
 #
-# Modifiche rispetto al mix general-purpose precedente:
-#   + github-code: 3% → 25%  (codice Python, JS, C, C++, Rust, Bash)
-#   + the-stack-c-rust: nuovo — linguaggi embedded e sistemi
-#   - pg19: 12% → 2%          (narrativa lunga, non utile per edge)
-#   - arxiv: 9% → 3%          (paper accademici, meno rilevanti)
-#   - slimpajama: 20% → 15%   (diversità mantenuta ma ridotta)
-#   - c4: 13% → 10%           (web text generale ridotto)
-#   - wikipedia: 15% → 10%    (conoscenza fattuale base mantenuta)
-#   - fineweb: 25% → 20%      (qualità alta ma ridotto per fare spazio)
-#   + open-web-math: 3% → 5%  (ragionamento matematico utile per logica IoT)
+# Sostituzione: bigcode/starcoderdata — supporta data_dir per linguaggio,
+#   campo "content", 86 linguaggi, dedup + PII removal, no gating.
+#   Ref: load_dataset("bigcode/starcoderdata", data_dir="python", split="train")
 
 pretraining:
 
@@ -77,36 +72,61 @@ pretraining:
     text_field: text
     weight: 0.02
 
-  # Codice generale — 30+ linguaggi, grande e non esauribile
-  # Focus principale per edge/IoT: logica, scripting, API calls
-  - name: github-code
-    path: macrocosm-os/code-parrot-github-code
+  # ── Codice (bigcode/starcoderdata) ──
+  # Pulito, dedup, PII-filtered. Usa data_dir per selezionare il linguaggio.
+  # NOTA: il loader deve passare data_dir a load_dataset() se presente nel YAML.
+  #       Se il loader non supporta data_dir, aggiungi in _iter_pretraining_dataset:
+  #         if 'data_dir' in ds_cfg:
+  #             load_kwargs['data_dir'] = ds_cfg['data_dir']
+
+  - name: starcoderdata-python
+    path: bigcode/starcoderdata
+    data_dir: python
     split: train
     text_field: content
-    weight: 0.25
+    weight: 0.12
 
-  # Linguaggi sistemi/embedded: C, C++, Rust, Bash, Go
-  # Critici per IoT: driver, firmware, microcontroller code
-  - name: the-stack-systems
-    path: bigcode/the-stack-dedup
-    config: C
+  - name: starcoderdata-javascript
+    path: bigcode/starcoderdata
+    data_dir: javascript
     split: train
     text_field: content
     weight: 0.05
 
-  - name: the-stack-cpp
-    path: bigcode/the-stack-dedup
-    config: C++
+  - name: starcoderdata-c
+    path: bigcode/starcoderdata
+    data_dir: c
+    split: train
+    text_field: content
+    weight: 0.05
+
+  - name: starcoderdata-cpp
+    path: bigcode/starcoderdata
+    data_dir: c++
+    split: train
+    text_field: content
+    weight: 0.04
+
+  - name: starcoderdata-rust
+    path: bigcode/starcoderdata
+    data_dir: rust
     split: train
     text_field: content
     weight: 0.03
 
-  - name: the-stack-rust
-    path: bigcode/the-stack-dedup
-    config: Rust
+  - name: starcoderdata-go
+    path: bigcode/starcoderdata
+    data_dir: go
     split: train
     text_field: content
-    weight: 0.02
+    weight: 0.03
+
+  - name: starcoderdata-shell
+    path: bigcode/starcoderdata
+    data_dir: shell
+    split: train
+    text_field: content
+    weight: 0.03
 
   - name: open_web_math
     path: open-web-math/open-web-math
@@ -116,21 +136,12 @@ pretraining:
 
 # Totale pesi pretraining: 1.00
 # fineweb(0.20) + wikipedia(0.10) + slimpajama(0.15) + c4(0.10) +
-# arxiv(0.03) + pg19(0.02) + github-code(0.25) + the-stack-c(0.05) +
-# the-stack-cpp(0.03) + the-stack-rust(0.02) + math(0.05) = 1.00
+# arxiv(0.03) + pg19(0.02) + python(0.12) + js(0.05) + c(0.05) +
+# cpp(0.04) + rust(0.03) + go(0.03) + shell(0.03) + math(0.05) = 1.00
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SFT (Supervised Fine-Tuning)
 # ─────────────────────────────────────────────────────────────────────────────
-#
-# Mix aggiornato per target edge/IoT:
-#   + glaive-code-assistant: nuovo — Q&A su codice, ideale per assistente embedded
-#   + oss-instruct: nuovo — istruzioni su codice open-source reale
-#   - openorca ridotto per fare spazio a dataset code-focused
-#
-# L'obiettivo SFT è un assistente che risponde a domande tecniche,
-# scrive codice per sistemi embedded, e interagisce in modo conciso
-# (importante su device con risorse limitate).
 
 sft:
 
@@ -175,7 +186,6 @@ sft:
       separator: " User: "
       response: response
 
-  # Codice e sistemi — priorità per assistente edge/IoT
   - name: glaive-code-assistant
     path: glaiveai/glaive-code-assistant-v3
     split: train
