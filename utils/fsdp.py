@@ -15,6 +15,12 @@ Strategia di sharding per Harold:
     che il modulo sia intero su una GPU durante il forward
   - MixedPrecision: parametri bf16, gradienti bf16, buffer bf16
 
+Cambiamenti rispetto alla versione precedente:
+  [v0.7-F1] nn.Embedding aggiunto alla wrap policy.
+            Senza wrapping esplicito l'embedding finisce nel FSDP root,
+            viene flattenato in 1D, e torch.embedding crasha con:
+            RuntimeError: 'weight' must be 2-D
+
 Avvio:
   torchrun --nproc_per_node=8 main.py --mode pretrain --use_fsdp
 
@@ -48,8 +54,9 @@ def _get_Harold_wrap_policy():
     """
     Ritorna una wrap policy per Harold che wrappa:
     - JambaBlock: modulo principale, uno per layer (40 total)
-    - token_emb: embedding grande (vocab_size * d_model)
-    - norm_out: LayerNorm finale
+    - nn.Embedding: token_emb — DEVE essere wrappato separatamente
+      perché torch.embedding richiede weight 2D. Se finisce nel
+      FSDP root viene flattenato in 1D e crasha.
 
     Mamba3Block NON viene wrappato separatamente perché i kernel CUDA
     Triton/TileLang richiedono che tutti i parametri SSM siano co-locati
@@ -58,7 +65,7 @@ def _get_Harold_wrap_policy():
     from torch.distributed.fsdp.wrap import ModuleWrapPolicy
     try:
         from core.model.blocks import JambaBlock
-        return ModuleWrapPolicy({JambaBlock})
+        return ModuleWrapPolicy({JambaBlock, nn.Embedding})
     except ImportError:
         # Fallback: size-based policy se JambaBlock non importabile
         from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
