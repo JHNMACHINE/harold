@@ -33,22 +33,22 @@ def is_main() -> bool:
 
 def setup() -> tuple[int, int, int]:
     """
-    Inizializza il process group NCCL.
+    Inizializza il process group NCCL senza warning.
     Ritorna (rank, local_rank, world_size).
     """
-    # 1. Ottieni il local_rank (fornito da torchrun / ambiente distribuito)
     local_rank = int(os.environ["LOCAL_RANK"])
     
-    # 2. Imposta il dispositivo CUDA per questo processo
+    # Specifica esplicitamente il device ID per NCCL
+    dist.init_process_group(
+        backend="nccl",
+        device_id=torch.device(f"cuda:{local_rank}")
+    )
+    
+    # Opzionale, ma consigliato per coerenza con altri componenti PyTorch
     torch.cuda.set_device(local_rank)
     
-    # 3. Inizializza il process group (NCCL userà il dispositivo corrente)
-    dist.init_process_group(backend="nccl")
-    
-    # 4. Ora possiamo ottenere rank e world_size
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    
     return rank, local_rank, world_size
 
 
