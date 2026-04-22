@@ -8,26 +8,18 @@ Cambiamenti rispetto a v0.6:
   [v0.7-S1] Stringa versione aggiornata a Harold v0.7.
   [v0.7-S2] os.makedirs per checkpoint_dir al setup.
   [v0.7-S3] Supporto FSDP via TrainConfig.use_fsdp (default False).
-             Quando use_fsdp=True e world_size > 1:
-             - Usa FSDPContext invece di DDPContext
-             - Wrappa il modello con wrap_model_fsdp (JambaBlock policy)
-             - torch.compile abilitato con use_orig_params=True
-             - active_model e il modello FSDP, raw_model e lo stesso oggetto
-               (FSDP non ha .module come DDP)
-             Retrocompatibile: use_fsdp=False usa DDP come prima.
   [v0.7-S4] Tokenizer download solo su rank 0, barrier per gli altri rank.
-             Evita race condition dove tutti i rank scaricano da HuggingFace
-             simultaneamente, causando errori intermittenti di connessione.
   [v0.7-S5] Cast forzato a bfloat16 prima di FSDP wrapping.
-             FSDP richiede dtype uniforme per il flattening dei parametri.
-             Alcuni parametri (Mamba2 A_log/D, router bias) restano in fp32
-             dopo build_model(). Il cast esplicito evita:
-             ValueError: Must flatten tensors with uniform dtype
+  [v0.7-S6] build_optimizer costruito PRIMA del wrap FSDP.
+             Dopo wrap_model_fsdp, raw_model IS active_model (FSDP non ha
+             .module come DDP) e i parametri sono shardati/appiattiti a
+             dim()==1 — _is_muon_eligible richiede dim()==2 => zero Muon.
+             Costruire su modello non-wrapped garantisce le shapes corrette.
 """
 
 import os
 from collections import deque
-from typing import Optional, Union, cast
+from typing import Optional, cast
 
 import torch
 import torch.distributed as dist
@@ -51,7 +43,6 @@ def build_training_context(
 ) -> TrainingContext:
     """
     Inizializza e ritorna tutto il necessario per il training loop.
-
     Gestisce: DDP/FSDP, tokenizer, modello, torch.compile, optimizer,
     dataset, checkpoint resume, logger.
     """
@@ -97,8 +88,7 @@ def build_training_context(
         torch.set_float32_matmul_precision("high")
 
     # ── Tokenizer ─────────────────────────────────────────────────────────
-    # [v0.7-S4] Solo rank 0 scarica il tokenizer, gli altri aspettano alla barrier.
-    # Dopo la barrier tutti caricano dalla cache locale.
+    # [v0.7-S4] Solo rank 0 scarica, gli altri aspettano alla barrier.
     if dist.is_initialized() and dist.get_rank() != 0:
         dist.barrier()
 
@@ -120,16 +110,19 @@ def build_training_context(
 
     # ── Modello ───────────────────────────────────────────────────────────
     if use_fsdp and is_ddp():
-        model = build_model(model_cfg)           # CPU — FSDP sposta su GPU
+        model = build_model(model_cfg)             # CPU — FSDP sposta su GPU
     else:
         model = build_model(model_cfg).to(device)
 
     # ── Wrapping: FSDP / DDP / single-GPU ────────────────────────────────
     if use_fsdp and is_ddp():
-        # [v0.7-S5] FSDP richiede dtype uniforme per il flattening.
-        # Alcuni parametri (Mamba2 A_log/D, router bias) restano in fp32
-        # dopo build_model(). Cast tutto (parametri + buffer) a bf16.
+        # [v0.7-S5] Cast bf16 — FSDP richiede dtype uniforme.
         model = model.to(torch.bfloat16)
+
+        # [v0.7-S6] Optimizer PRIMA del wrap FSDP.
+        # Dopo wrap_model_fsdp i parametri sono shardati (dim==1) —
+        # _is_muon_eligible richiede dim==2 => zero Muon se costruito dopo.
+        optimizer = build_optimizer(model, train_cfg)
 
         from utils.fsdp import wrap_model_fsdp
         active_model = wrap_model_fsdp(model, local_rank, mixed_precision=True)
@@ -151,6 +144,7 @@ def build_training_context(
     elif use_ddp:
         active_model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         raw_model    = cast(Harold, active_model.module)
+        optimizer    = build_optimizer(raw_model, train_cfg)
         if main:
             print("torch.compile() disabilitato (DDP)")
 
@@ -170,6 +164,7 @@ def build_training_context(
             print("torch.compile() disabilitato")
         active_model = model
         raw_model    = cast(Harold, model)
+        optimizer    = build_optimizer(raw_model, train_cfg)
 
     if main:
         n_params = sum(p.numel() for p in raw_model.parameters()) / 1e6
@@ -177,15 +172,10 @@ def build_training_context(
         gc_str   = " + GradCkpt" if getattr(model_cfg, "use_gradient_checkpointing", False) else ""
         print(f"Harold v0.7 — {label} parametri totali{gc_str}")
 
-    # [v0.7-OPT9] Pre-campiona buffer timestep dopo build — zero allocazioni nel loop
+    # [v0.7-OPT9] Pre-campiona buffer timestep — zero allocazioni nel loop
     raw_model.schedule.warmup_buffer(size=4096, device=device)
 
-    # ── Optimizer + scaler ────────────────────────────────────────────────
-    # CRITICO: build_optimizer su raw_model, non active_model.
-    # Con FSDP i parametri sono appiattiti (dim==1) dopo il wrap —
-    # _is_muon_eligible richiede dim==2 → zero Muon se si passa active_model.
-    optimizer = build_optimizer(raw_model, train_cfg)
-    scaler    = torch.GradScaler("cuda", enabled=train_cfg.use_scaler)
+    scaler = torch.GradScaler("cuda", enabled=train_cfg.use_scaler)
 
     # ── Dataset ───────────────────────────────────────────────────────────
     if use_ddp or (use_fsdp and is_ddp()):
