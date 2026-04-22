@@ -168,8 +168,12 @@ def build_training_context(
 
     if main:
         n_params = sum(p.numel() for p in raw_model.parameters()) / 1e6
-        label    = f"{n_params/1000:.2f}B" if n_params >= 1000 else f"{n_params:.1f}M"
-        gc_str   = " + GradCkpt" if getattr(model_cfg, "use_gradient_checkpointing", False) else ""
+        # Con FSDP FULL_SHARD ogni rank vede 1/world_size dei parametri —
+        # moltiplica per world_size per ottenere il conteggio reale.
+        if use_fsdp and world_size > 1:
+            n_params *= world_size
+        label  = f"{n_params/1000:.2f}B" if n_params >= 1000 else f"{n_params:.1f}M"
+        gc_str = " + GradCkpt" if getattr(model_cfg, "use_gradient_checkpointing", False) else ""
         print(f"Harold v0.7 — {label} parametri totali{gc_str}")
 
     # [v0.7-OPT9] Pre-campiona buffer timestep — zero allocazioni nel loop
