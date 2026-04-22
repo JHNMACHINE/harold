@@ -21,10 +21,6 @@ Cambiamenti rispetto a v0.6:
 
   [v0.7-D4] persistent_workers rimosso (sempre False con num_workers=0).
 
-  [v0.7-D6] Supporto data_dir nel YAML per dataset come bigcode/starcoderdata
-             che usano subdirectory per linguaggio (data_dir="python", "c", ecc.)
-             invece di config/name. Passato a load_dataset() come kwarg.
-
 Invariato da v0.6:
   [OPT-D2] deque + popleft O(1) invece di list slicing
   [OPT-D5] worker_init_fn a livello modulo per Python 3.14
@@ -86,8 +82,8 @@ def _build_load_kwargs(ds_cfg: dict) -> dict:
     """Costruisce i kwargs per load_dataset() dal config YAML.
 
     Supporta:
-      - config → name (es. config: "CC-MAIN-2024-10")
-      - data_dir → data_dir (es. data_dir: "python" per starcoderdata)
+      - config -> name (es. config: "CC-MAIN-2024-10")
+      - data_dir -> data_dir (es. data_dir: "python" per starcoderdata)
     """
     load_kwargs: dict = {"path": ds_cfg["path"], "split": ds_cfg["split"]}
     if "config" in ds_cfg:
@@ -191,6 +187,8 @@ def _iter_pretraining_dataset(
     buffer_size: int,
     seed:        int,
 ) -> Iterator[list[int]]:
+    import time
+    import random
     from datasets import load_dataset
 
     # [v0.7-D6] Usa helper centralizzato per config + data_dir
@@ -199,13 +197,31 @@ def _iter_pretraining_dataset(
     text_field = ds_cfg.get("text_field", "text")
     fmt        = ds_cfg.get("format", "standard")
 
-    # [v0.7-D5] Loop infinito — evita che StopIteration risalga a MixedStreamingDataset
-    # e causi la ricreazione dell'iteratore con relativa chiamata HTTP HuggingFace
-    # (risoluzione file shard) che blocca la GPU per secondi.
-    # Il dataset viene ricaricato con seed incrementato per variare l'ordine.
+    # [v0.7-D7] Stagger iniziale per rank diversi.
+    # Con 8 rank che chiamano load_dataset simultaneamente HF Hub va in
+    # timeout/rate limit. seed e' diverso per rank (42 + rank*1000 in
+    # build_loaders_ddp) — usiamo seed // 1000 come indice rank per il delay.
+    rank_idx = (seed // 1000) % 8
+    if rank_idx > 0:
+        time.sleep(rank_idx * 2.0 + random.uniform(0, 1.0))
+
+    # [v0.7-D5] Loop infinito con retry su timeout HF Hub.
+    # Evita che StopIteration risalga a MixedStreamingDataset e causi la
+    # ricreazione dell'iteratore. Il dataset viene ricaricato con seed
+    # incrementato per variare l'ordine tra epoch.
     epoch = 0
     while True:
-        ds = load_dataset(**load_kwargs, streaming=True)
+        for attempt in range(5):
+            try:
+                ds = load_dataset(**load_kwargs, streaming=True)
+                break
+            except Exception as e:
+                if attempt == 4:
+                    raise
+                wait = 2 ** attempt + random.uniform(0, 1)
+                print(f"  [dataset rank={rank_idx}] load_dataset fallito "
+                      f"(tentativo {attempt+1}/5), retry in {wait:.1f}s: {e}")
+                time.sleep(wait)
         ds = ds.shuffle(buffer_size=buffer_size, seed=seed + epoch * 31337)
 
         # [v0.7-D3] Controlla split PRIMA di tokenizzare
@@ -253,9 +269,9 @@ def _iter_sft_dataset(
     split_map = ds_cfg.get("split_map", {})
     hf_split  = split_map.get(split, ds_cfg.get("split", "train"))
 
-    # [v0.7-D6] Usa helper centralizzato per config + data_dir
-    load_kwargs = _build_load_kwargs(ds_cfg)
-    load_kwargs["split"] = hf_split  # override split per SFT split_map
+    load_kwargs: dict = {"path": ds_cfg["path"], "split": hf_split}
+    if "config" in ds_cfg:
+        load_kwargs["name"] = ds_cfg["config"]
 
     ds = load_dataset(**load_kwargs, streaming=True)
     ds = ds.shuffle(buffer_size=1000, seed=seed)
