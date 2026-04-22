@@ -21,6 +21,10 @@ Cambiamenti rispetto a v0.6:
 
   [v0.7-D4] persistent_workers rimosso (sempre False con num_workers=0).
 
+  [v0.7-D6] Supporto data_dir nel YAML per dataset come bigcode/starcoderdata
+             che usano subdirectory per linguaggio (data_dir="python", "c", ecc.)
+             invece di config/name. Passato a load_dataset() come kwarg.
+
 Invariato da v0.6:
   [OPT-D2] deque + popleft O(1) invece di list slicing
   [OPT-D5] worker_init_fn a livello modulo per Python 3.14
@@ -72,6 +76,25 @@ def _first_token_id(val) -> int | None:
     if isinstance(val, list):
         return int(val[0]) if val else None
     return int(val)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [v0.7-D6] Helper per costruire load_kwargs da config YAML
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_load_kwargs(ds_cfg: dict) -> dict:
+    """Costruisce i kwargs per load_dataset() dal config YAML.
+
+    Supporta:
+      - config → name (es. config: "CC-MAIN-2024-10")
+      - data_dir → data_dir (es. data_dir: "python" per starcoderdata)
+    """
+    load_kwargs: dict = {"path": ds_cfg["path"], "split": ds_cfg["split"]}
+    if "config" in ds_cfg:
+        load_kwargs["name"] = ds_cfg["config"]
+    if "data_dir" in ds_cfg:
+        load_kwargs["data_dir"] = ds_cfg["data_dir"]
+    return load_kwargs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -170,9 +193,8 @@ def _iter_pretraining_dataset(
 ) -> Iterator[list[int]]:
     from datasets import load_dataset
 
-    load_kwargs: dict = {"path": ds_cfg["path"], "split": ds_cfg["split"]}
-    if "config" in ds_cfg:
-        load_kwargs["name"] = ds_cfg["config"]
+    # [v0.7-D6] Usa helper centralizzato per config + data_dir
+    load_kwargs = _build_load_kwargs(ds_cfg)
 
     text_field = ds_cfg.get("text_field", "text")
     fmt        = ds_cfg.get("format", "standard")
@@ -231,9 +253,9 @@ def _iter_sft_dataset(
     split_map = ds_cfg.get("split_map", {})
     hf_split  = split_map.get(split, ds_cfg.get("split", "train"))
 
-    load_kwargs: dict = {"path": ds_cfg["path"], "split": hf_split}
-    if "config" in ds_cfg:
-        load_kwargs["name"] = ds_cfg["config"]
+    # [v0.7-D6] Usa helper centralizzato per config + data_dir
+    load_kwargs = _build_load_kwargs(ds_cfg)
+    load_kwargs["split"] = hf_split  # override split per SFT split_map
 
     ds = load_dataset(**load_kwargs, streaming=True)
     ds = ds.shuffle(buffer_size=1000, seed=seed)
