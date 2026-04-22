@@ -134,23 +134,19 @@ class Harold(nn.Module):
         two intermediate allocations. The view is a zero-copy reshape.
 
         Args:
-            t: timesteps in :math:`[0, 1]`, shape :math:`(B,)`
+            t: timesteps in :math:`[0, 1]`, shape :math:`(B,)` — scalars or 1-D
 
         Returns:
             Embedding tensor, shape :math:`(B, d\_model)`.
         """
+        # Normalizza shape — detach per sicurezza (t non deve avere grad)
+        t = t.detach().float().reshape(-1)      # sempre (B,), sempre float, no grad
         if t.numel() == 0:
-            # Batch vuoto: restituisci embedding vuoto
             return torch.empty(0, self.d_model, device=t.device, dtype=torch.float32)
-        if t.dim() == 0:
-            t = t.view(1)                     # scalare -> (1,)
-        elif t.dim() > 1:
-            t = t.view(-1)                    # appiattisci se ha più dimensioni
 
-        # Ora t ha sicuramente forma (B,)
-        args = (t.float() * 1000.0).unsqueeze(1) * self.t_freqs.unsqueeze(0)  # (B, half)
-        emb = torch.stack([torch.cos(args), torch.sin(args)], dim=-1)         # (B, half, 2)
-        emb = emb.view(t.shape[0], -1)                                        # (B, d_model)
+        args = (t * 1000.0).unsqueeze(1) * self.t_freqs.unsqueeze(0)  # (B, half)
+        emb  = torch.stack([torch.cos(args), torch.sin(args)], dim=-1)  # (B, half, 2)
+        emb  = emb.view(t.shape[0], -1)                                  # (B, d_model)
         if self.d_model % 2:
             emb = F.pad(emb, (0, 1))
         return emb
