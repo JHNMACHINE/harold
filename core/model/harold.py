@@ -140,6 +140,9 @@ class Harold(nn.Module):
         """
         if t.dim() == 0:
             t = t.unsqueeze(0)  # scalare -> (1,)
+        elif t.dim() == 1 and t.shape[0] == 0:
+            # Batch vuoto: restituisci embedding vuoto
+            return torch.empty(0, self.d_model, device=t.device, dtype=torch.bfloat16)
         args = (t.float() * 1000.0)[:, None] * self.t_freqs[None]   # (B, half)
         emb = torch.stack([torch.cos(args), torch.sin(args)], dim=-1)  # (B, half, 2)
         emb = emb.view(t.shape[0], -1)                               # (B, d_model)
@@ -182,6 +185,8 @@ class Harold(nn.Module):
                 - ``ce_logits`` has shape :math:`(B, L, V+1)`
                 - ``present_kvs`` is a list of KV states or ``None``
         """
+        assert t.dim() == 1, f"Expected t with shape (B,), got {t.shape}"
+        assert x_t.dim() == 3, f"Expected x_t with shape (B, L, D), got {x_t.shape}"
         kv_offset = past_key_values[0].shape[1] if past_key_values is not None else 0
         x = x_t
 

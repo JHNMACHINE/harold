@@ -239,7 +239,7 @@ def compute_moe_load_stats(model: Harold) -> Dict[str, float]:
         - **moe_dominant_layer** (*int*) — indice del layer più squilibrato,
           ``-1`` se nessun dato disponibile
     """
-    from core.model import DeepSeekMoELayer
+    from core.model.moe import DeepSeekMoELayer
     ratios = []
     for i, block in enumerate(model.blocks):
         moe = block.moe
