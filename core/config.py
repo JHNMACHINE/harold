@@ -129,7 +129,7 @@ class TrainConfig:
     checkpoint_dir:    str = "/workspace/checkpoints/v0.7"
     checkpoint_prefix: str = "harold_v07"
     preload:           str = "latest"
-    save_every:        int = 10_000  # [v0.7-P3] un checkpoint ogni 10k iter
+    save_every:        int = 1000  # [v0.7-P3] un checkpoint ogni 10k iter
 
     # torch.compile
     use_compile:  bool = True
