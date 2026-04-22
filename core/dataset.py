@@ -189,7 +189,12 @@ def _iter_pretraining_dataset(
 ) -> Iterator[list[int]]:
     import time
     import random
+    import datasets as _hf_datasets
     from datasets import load_dataset
+
+    # Silenzia "Resolving data files" e progress bar HF su tutti i rank
+    _hf_datasets.logging.set_verbosity_error()
+    _hf_datasets.disable_progress_bar()
 
     # [v0.7-D6] Usa helper centralizzato per config + data_dir
     load_kwargs = _build_load_kwargs(ds_cfg)
