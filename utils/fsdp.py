@@ -62,16 +62,29 @@ def _get_Harold_wrap_policy():
     Triton/TileLang richiedono che tutti i parametri SSM siano co-locati
     sulla stessa GPU durante il forward pass.
     """
-    from torch.distributed.fsdp.wrap import ModuleWrapPolicy
     try:
         from core.model.blocks import JambaBlock
-        # [v0.7-F2] Aggiunto nn.Linear alla wrap policy.
-        # time_emb, self_cond_proj, cfg_proj, x0_pred, ce_head contengono
-        # Linear non wrappati che finiscono nel root FSDP — shardati in 1D.
-        # F.linear richiede weight 2D -> RuntimeError: mat2 must be matrix.
-        return ModuleWrapPolicy({JambaBlock, nn.Embedding, nn.Linear, nn.LayerNorm})
+        from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+        import functools
+
+        # [v0.7-F3] Policy combinata: ModuleWrapPolicy + size_based fallback.
+        # ModuleWrapPolicy con lista esplicita non e robusta — ogni nuovo tipo
+        # di modulo non nella lista finisce nel root FSDP e viene shardato in 1D.
+        # Soluzione: wrappa JambaBlock e Embedding esplicitamente, poi usa
+        # size_based per catturare tutto il resto >= 10k parametri.
+        # Questo garantisce che norm_out, time_emb, self_cond_proj, x0_pred
+        # vengano tutti wrappati separatamente.
+        size_policy = functools.partial(
+            size_based_auto_wrap_policy, min_num_params=10_000
+        )
+
+        def harold_wrap_policy(module, recurse, nonwrapped_numel):
+            if isinstance(module, (JambaBlock, nn.Embedding)):
+                return True
+            return size_policy(module, recurse, nonwrapped_numel)
+
+        return harold_wrap_policy
     except ImportError:
-        # Fallback: size-based policy se JambaBlock non importabile
         from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
         import functools
         return functools.partial(size_based_auto_wrap_policy, min_num_params=1_000_000)
