@@ -131,13 +131,11 @@ class JambaBlock(nn.Module):
                     ),
                 )
         else:
-            if _gc:
-                mixer_out = cast(
-                    torch.Tensor,
-                    ckpt_fn(self.mixer, normed, use_reentrant=False),
-                )
-            else:
-                mixer_out = cast(torch.Tensor, self.mixer(normed))
+            # [v0.7-GC-fix] Gradient checkpointing disabilitato su Mamba3Block.
+            # Mamba3 ha gia il suo checkpoint interno nei kernel Triton —
+            # sovrapporre ckpt_fn causa CheckpointError nel backward
+            # (unpack triggered twice su ctx.saved_tensors).
+            mixer_out = cast(torch.Tensor, self.mixer(normed))
             present_kv = None
 
         x = x + mixer_out
