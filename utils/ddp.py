@@ -38,8 +38,8 @@ def setup() -> tuple[int, int, int]:
     """
     rank       = dist.get_rank()
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
     world_size = dist.get_world_size()
+    dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
     torch.cuda.set_device(local_rank)
     return rank, local_rank, world_size
 
