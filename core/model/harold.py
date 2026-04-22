@@ -7,6 +7,7 @@ and an auxiliary cross-entropy term.
 """
 
 import math
+import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -189,8 +190,11 @@ class Harold(nn.Module):
                 - ``ce_logits`` has shape :math:`(B, L, V+1)`
                 - ``present_kvs`` is a list of KV states or ``None``
         """
-        assert t.dim() == 1, f"Expected t with shape (B,), got {t.shape}"
-        assert x_t.dim() == 3, f"Expected x_t with shape (B, L, D), got {x_t.shape}"
+        # DEBUG
+        print(f"[RANK {os.environ.get('RANK', '?')}] forward: t.shape = {t.shape}, dtype = {t.dtype}")
+        emb = self.get_timestep_embedding(t)
+        print(f"[RANK {os.environ.get('RANK', '?')}] emb.shape = {emb.shape}")
+        raise RuntimeError("STOP HERE TO VERIFY CODE IS UPDATED")
         kv_offset = past_key_values[0].shape[1] if past_key_values is not None else 0
         x = x_t
 
