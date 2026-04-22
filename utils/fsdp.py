@@ -75,7 +75,7 @@ def _get_Harold_wrap_policy():
         # Questo garantisce che norm_out, time_emb, self_cond_proj, x0_pred
         # vengano tutti wrappati separatamente.
         size_policy = functools.partial(
-            size_based_auto_wrap_policy, min_num_params=10_000
+            size_based_auto_wrap_policy, min_num_params=100
         )
 
         def harold_wrap_policy(module, recurse, nonwrapped_numel):
