@@ -134,13 +134,17 @@ class Harold(nn.Module):
         two intermediate allocations. The view is a zero-copy reshape.
 
         Args:
-            t: timesteps in :math:`[0, 1]`, shape :math:`(B,)` — scalars or 1-D
+            t: timesteps in :math:`[0, 1]`, any shape — always normalized to (B,)
 
         Returns:
-            Embedding tensor, shape :math:`(B, d\_model)`.
+            Embedding tensor, shape :math:`(B, d\\_model)`.
         """
-        # Normalizza shape — detach per sicurezza (t non deve avere grad)
-        t = t.detach().float().reshape(-1)      # sempre (B,), sempre float, no grad
+        # Normalizza shape in modo robusto per FSDP:
+        # - detach: t non deve portare gradienti nell embedding sinusoidale
+        # - float: evita problemi di stride con bf16 reshape
+        # - reshape(-1): garantisce (B,) indipendentemente da shape in ingresso
+        # - contiguous: richiesto da unsqueeze su tensori FSDP shardati
+        t = t.detach().float().reshape(-1).contiguous()
         if t.numel() == 0:
             return torch.empty(0, self.d_model, device=t.device, dtype=torch.float32)
 
